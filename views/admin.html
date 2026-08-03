@@ -71,7 +71,9 @@
             <div class="tab" data-tab="pricing">Pricing</div>
             <div class="tab" data-tab="quotes">Quotes</div>
             <div class="tab" data-tab="employees">Employees</div>
+            <div class="tab" data-tab="timeoff">Vacation <span class="nav-count" id="voNavCount" style="display:none">0</span></div>
             <div class="tab" data-tab="tasks">My Tasks</div>
+            <div class="tab" data-tab="messages">Messages</div>
             <div class="tab" data-tab="access" id="devAccessTab" style="display:none">Client access</div>
           </nav>
 
@@ -338,6 +340,28 @@
           <div class="pager" id="empPager"></div>
         </section>
 
+        <!-- TIME OFF (employee vacation requests to approve or decline) -->
+        <section class="section" id="tab-timeoff">
+          <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:14px">
+            <h2 style="margin:0">Vacation requests</h2>
+            <div class="field" style="max-width:200px;margin:0">
+              <select id="voFilter">
+                <option value="pending">Pending</option>
+                <option value="approved">Approved</option>
+                <option value="declined">Declined</option>
+                <option value="">All</option>
+              </select>
+            </div>
+          </div>
+          <div class="card">
+            <table>
+              <thead><tr><th>Employee</th><th>Dates</th><th>Days</th><th>Reason</th><th>Requested</th><th>Status</th><th></th></tr></thead>
+              <tbody id="voAdminBody"></tbody>
+            </table>
+            <p class="status-sub" id="voAdminEmpty" style="display:none">No requests to show.</p>
+          </div>
+        </section>
+
         <!-- MY TASKS (kanban board) -->
         <section class="section" id="tab-tasks">
           <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:14px">
@@ -360,6 +384,101 @@
             <div class="tk-count" id="tkCount">0 tasks</div>
           </div>
           <div class="task-board" id="taskBoard"></div>
+        </section>
+
+        <!-- MESSAGES (bulletin board employees see after signing in) -->
+        <section class="section" id="tab-messages">
+          <!-- Read view: published bulletins as cards -->
+          <div id="msgReadView">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+              <h2 style="margin:0">Messages</h2>
+              <button class="btn gold sm" id="msgManageBtn">Manage</button>
+            </div>
+            <div id="msgReadList"></div>
+            <p class="status-sub" id="msgReadEmpty" style="display:none">No published messages yet.</p>
+          </div>
+
+          <!-- Manage view: table of every bulletin -->
+          <div id="msgManageView" style="display:none">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+              <h2 style="margin:0">Manage Messages</h2>
+              <div>
+                <button class="btn gold sm" id="msgNewBtn">New message</button>
+                <button class="btn ghost sm" id="msgBackBtn">Back to messages</button>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:16px">
+              <div class="field" style="max-width:320px;margin:0">
+                <label>Search</label>
+                <input id="msgSearch" placeholder="Search messages..." />
+              </div>
+            </div>
+            <div class="card">
+              <table>
+                <thead><tr><th>Title</th><th>Author</th><th>Target</th><th>Date</th><th>Status</th><th>Read</th></tr></thead>
+                <tbody id="msgManageBody"></tbody>
+              </table>
+              <p class="status-sub" id="msgManageEmpty" style="display:none">No messages match your search.</p>
+            </div>
+            <div class="pager" id="msgPager"></div>
+          </div>
+
+          <!-- Editor view: new / edit bulletin -->
+          <div id="msgEditView" style="display:none">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+              <h2 style="margin:0" id="msgEditTitle">New Bulletin</h2>
+              <div>
+                <button class="btn gold sm" id="msgPublishBtn">Publish now</button>
+                <button class="btn ghost sm" id="msgDraftBtn">Save draft</button>
+                <button class="btn ghost sm" id="msgCancelBtn">Cancel</button>
+                <button class="btn danger-solid sm" id="msgDeleteBtn" style="display:none">Delete</button>
+              </div>
+            </div>
+
+            <div class="card" style="margin-bottom:16px">
+              <div class="field" style="max-width:260px">
+                <label>Schedule publish date (optional)</label>
+                <input type="date" id="msgDate" />
+                <p class="status-sub" style="text-align:left;margin:6px 0 0;font-size:12px">
+                  Leave blank to publish manually. If set, the message publishes automatically on this date.
+                </p>
+              </div>
+              <div class="field" style="margin-top:14px">
+                <label>Title</label>
+                <input id="msgTitle" placeholder="Bulletin title" />
+              </div>
+              <div class="field" style="margin-top:14px">
+                <label>Target Audience</label>
+                <div class="msg-audience">
+                  <label class="radio-inline"><input type="radio" name="msgAudience" value="all" checked /> All Employees</label>
+                  <label class="radio-inline"><input type="radio" name="msgAudience" value="employees" /> Specific Employees</label>
+                </div>
+                <div id="msgEmpPick" class="msg-emp-pick" style="display:none"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="msg-edit-cols">
+                <div class="field" style="margin:0">
+                  <label>Content (Markdown)</label>
+                  <textarea id="msgContent" rows="16" placeholder="Write your bulletin content using Markdown..."></textarea>
+                </div>
+                <div class="field" style="margin:0">
+                  <label>Preview</label>
+                  <div class="msg-preview md-body" id="msgPreview"><span class="status-sub" style="text-align:left">Preview will appear here...</span></div>
+                </div>
+              </div>
+              <div class="msg-tips">
+                <strong>Markdown tips:</strong>
+                <code># Heading 1</code> <code>## Heading 2</code>
+                <code>**bold**</code> <code>*italic*</code>
+                <code>- bullet list</code> <code>1. numbered list</code>
+                <code>[text](url) link</code> <code>![alt](url) image</code>
+                <code>--- horizontal rule</code>
+              </div>
+              <div class="msg err" id="msgEditMsg"></div>
+            </div>
+          </div>
         </section>
 
         <!-- CLIENT ACCESS (dev only) -->
@@ -605,11 +724,13 @@
       </div>
     </div>
 
+    <script src="/md.js"></script>
     <script src="/admin.js"></script>
     <script src="/quotes.js"></script>
     <script src="/pricing.js"></script>
     <script src="/schedule.js"></script>
     <script src="/tasks.js"></script>
+    <script src="/messages.js"></script>
     <script src="/account.js"></script>
     <script src="/theme.js"></script>
   </body>

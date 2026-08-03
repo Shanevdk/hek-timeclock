@@ -565,6 +565,16 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .badge.status-sent { background: rgba(200, 155, 92, .18); color: var(--gold); }
 .badge.status-accepted { background: rgba(63, 174, 106, .18); color: var(--green); }
 .badge.status-declined { background: rgba(209, 91, 82, .18); color: var(--red); }
+/* Time-off request statuses */
+.badge.status-pending { background: rgba(200, 155, 92, .18); color: var(--gold); }
+.badge.status-approved { background: rgba(63, 174, 106, .18); color: var(--green); }
+
+/* Small count badge on a sidebar nav tab (e.g. pending time-off requests) */
+.nav-count {
+  display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 6px;
+  border-radius: 20px; font-size: 12px; line-height: 18px; text-align: center;
+  background: var(--gold); color: #1a1205; font-weight: 600;
+}
 
 /* ---- Signed-in user + settings (sidebar footer) ---- */
 .user-area { margin-top: 6px; }
@@ -1007,4 +1017,192 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 }
 
 /* Clock-in locations map */
-#map { width: 100%; height: 65vh; min-height: 360px; background: var(--panel-2); }
+/* isolation + z-index:0 keep Leaflet's own stacking (panes 400, controls 800)
+   inside the map, so tiles and the zoom buttons can't paint over the sidebar
+   drawer, its backdrop, the mobile bar, or a modal. */
+#map {
+  width: 100%; height: 65vh; min-height: 360px; background: var(--panel-2);
+  position: relative; z-index: 0; isolation: isolate;
+}
+
+/* ===================== Messages / bulletin board ===================== */
+/* A published bulletin, shown as a card on both the admin read board and the
+   employee portal. */
+.msg-card { margin-bottom: 16px; }
+.msg-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+}
+.msg-card-title { margin: 0; font-size: 18px; }
+.msg-card-meta {
+  text-align: right;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* Rendered Markdown body (shared by cards and the editor preview). */
+.md-body { color: var(--text); font-size: 15px; line-height: 1.6; }
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
+.md-body h1 { font-size: 22px; margin: 18px 0 10px; }
+.md-body h2 { font-size: 19px; margin: 16px 0 8px; }
+.md-body h3 { font-size: 16px; margin: 14px 0 8px; }
+.md-body p { margin: 0 0 10px; }
+.md-body ul, .md-body ol { margin: 0 0 10px; padding-left: 22px; }
+.md-body li { margin: 2px 0; }
+.md-body a { color: var(--gold); }
+.md-body hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+.md-body code {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 13px;
+}
+.md-body .md-img { max-width: 100%; border-radius: 8px; margin: 6px 0; }
+
+/* Editor: target-audience radios + specific-employee picker. */
+.msg-audience { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.radio-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 14px;
+  margin: 0;
+  cursor: pointer;
+}
+.msg-emp-pick {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px 14px;
+  margin-top: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.msg-emp-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 14px;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Editor: side-by-side Markdown input and live preview. */
+.msg-edit-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.msg-edit-cols textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+.msg-preview {
+  min-height: 320px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-y: auto;
+}
+.msg-tips {
+  margin-top: 16px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 2;
+}
+.msg-tips code {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 6px;
+  margin: 0 4px;
+  color: var(--text);
+}
+@media (max-width: 720px) {
+  .msg-edit-cols { grid-template-columns: 1fr; }
+  .msg-card-head { flex-direction: column; }
+  .msg-card-meta { text-align: left; }
+}
+
+/* ===================== In-app clock (portal) ===================== */
+.clock-widget { padding: 4px 10px 12px; }
+.clock-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--green);
+  background: rgba(63, 174, 106, 0.12);
+  color: var(--green);
+  font-weight: 700;
+  font-size: 15px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.clock-btn:hover { background: rgba(63, 174, 106, 0.2); }
+.clock-btn .clock-ic { font-size: 20px; line-height: 1; }
+/* Clocked in -> the button becomes a "Clock Out" action. */
+.clock-btn.on {
+  border-color: var(--red);
+  background: rgba(209, 91, 82, 0.12);
+  color: var(--red);
+}
+.clock-btn.on:hover { background: rgba(209, 91, 82, 0.2); }
+.clock-status {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Clock in / out modal */
+.clock-modal { max-width: 400px; }
+.cm-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.cm-head h3 { margin: 0; }
+.cm-who { display: flex; align-items: center; gap: 8px; }
+.cm-who .cm-clock-ic { font-size: 18px; }
+.cm-who-text { text-align: right; }
+.cm-name { font-weight: 600; font-size: 14px; color: var(--text); }
+.cm-sub { font-size: 12px; color: var(--muted); }
+.cm-time {
+  margin-bottom: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.cm-time .cm-now { margin-left: 6px; font-weight: 700; color: var(--gold); }
+.clock-modal textarea { width: 100%; resize: vertical; }
+.cm-foot {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.cm-foot .btn { min-width: 110px; }

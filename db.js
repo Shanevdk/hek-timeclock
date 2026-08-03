@@ -21,6 +21,8 @@ const store = {
   quotes: null,
   schedules: null,
   tasks: null,
+  vacations: null,
+  bulletins: null,
   settings: null,
   nextId,
 };
@@ -63,6 +65,12 @@ async function doConnect() {
   // lightweight metadata is mirrored onto the task doc so the board can list
   // attachments without loading the file data.
   store.taskAttachments = store.db.collection('task_attachments');
+  // Time-off requests: an employee asks for a date range; the admin approves or
+  // declines it. Statuses: pending / approved / declined.
+  store.vacations = store.db.collection('vacations');
+  // Bulletin board / "Messages" — an admin-posted notice. Every signed-in
+  // employee sees the ones targeted to them; the admin tracks who has read each.
+  store.bulletins = store.db.collection('bulletins');
   // Small key/value collection for app config — currently the admin login
   // credentials (doc _id: 'admin'), seeded from env on first run.
   store.settings = store.db.collection('settings');
@@ -82,6 +90,10 @@ async function doConnect() {
   await store.tasks.createIndex({ status: 1, order: 1 });
   await store.tasks.createIndex({ assignee_id: 1 });
   await store.taskAttachments.createIndex({ task_id: 1 });
+  await store.vacations.createIndex({ employee_id: 1 });
+  await store.vacations.createIndex({ status: 1, created_at: -1 });
+  await store.bulletins.createIndex({ status: 1, published_at: -1 });
+  await store.bulletins.createIndex({ status: 1, publish_at: 1 });
   // Auto-remove stale rate-limit records an hour after they were last touched.
   await store.rateLimits.createIndex({ windowStart: 1 }, { expireAfterSeconds: 3600 });
 }

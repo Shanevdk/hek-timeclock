@@ -55,9 +55,19 @@
       <div class="admin-layout">
         <aside class="sidebar">
           <div class="side-brand">HEK <small>PORTAL</small></div>
+          <!-- In-app clock (only shown when the employee's clock-in method allows the app) -->
+          <div class="clock-widget" id="clockWidget" style="display:none">
+            <button class="clock-btn" id="clockBtn" type="button" aria-label="Clock in">
+              <span class="clock-ic" aria-hidden="true">🕐</span>
+              <span class="clock-label" id="clockLabel">Clock In</span>
+            </button>
+            <div class="clock-status" id="clockStatus"></div>
+          </div>
           <nav class="side-nav">
             <div class="tab active" data-tab="hours">My hours</div>
+            <div class="tab" data-tab="messages" id="navMessages">Messages <span class="nav-count" id="msgNavCount" style="display:none">0</span></div>
             <div class="tab" data-tab="schedule">My schedule</div>
+            <div class="tab" data-tab="timeoff">Vacation</div>
             <div class="tab" data-tab="quotes" id="navQuotes" style="display:none">Quotes</div>
           </nav>
           <div class="theme-toggle" role="group" aria-label="Color theme">
@@ -92,11 +102,44 @@
           </div>
         </section>
 
+        <!-- MESSAGES (the bulletin board the admin posts to) -->
+        <section class="section" id="tab-messages">
+          <h2 style="margin:0 0 16px">Messages</h2>
+          <div id="msgList"></div>
+          <p class="status-sub" id="msgEmpty" style="display:none">No messages right now.</p>
+        </section>
+
         <!-- MY SCHEDULE (jobs the admin assigned to this employee) -->
         <section class="section" id="tab-schedule">
           <h2 style="margin:0 0 16px">My schedule</h2>
           <div id="mySchedList"></div>
           <p class="status-sub" id="mySchedEmpty" style="display:none">No jobs assigned to you yet.</p>
+        </section>
+
+        <!-- TIME OFF (request vacation days; admin approves or declines) -->
+        <section class="section" id="tab-timeoff">
+          <div class="card" style="margin-bottom:16px">
+            <h3 style="margin-top:0">Request vacation</h3>
+            <div class="row">
+              <div class="field"><label>From</label><input type="date" id="voFrom" /></div>
+              <div class="field"><label>To</label><input type="date" id="voTo" /></div>
+            </div>
+            <div class="field" style="margin-top:12px">
+              <label>Reason (optional)</label>
+              <textarea id="voReason" rows="2" placeholder="e.g. family vacation"></textarea>
+            </div>
+            <div class="msg err" id="voMsg"></div>
+            <div class="row" style="justify-content:flex-end;margin-top:12px">
+              <button class="btn gold sm" id="voSubmit">Submit request</button>
+            </div>
+          </div>
+          <div class="card">
+            <table>
+              <thead><tr><th>Dates</th><th>Days</th><th>Reason</th><th>Status</th><th></th></tr></thead>
+              <tbody id="voBody"></tbody>
+            </table>
+            <p class="status-sub" id="voEmpty" style="display:none">No vacation requests yet.</p>
+          </div>
         </section>
 
         <!-- QUOTES (only shown when the admin grants the "quotes" permission) -->
@@ -190,8 +233,34 @@
       </div>
     </div>
 
+    <!-- Clock in / out modal (matches the shared-clock experience for app users) -->
+    <div class="modal-back" id="clockModalBack">
+      <div class="modal clock-modal">
+        <div class="cm-head">
+          <h3 id="cmTitle">Clock In</h3>
+          <div class="cm-who">
+            <span class="cm-clock-ic" aria-hidden="true">🕐</span>
+            <div class="cm-who-text">
+              <div class="cm-name" id="cmName">—</div>
+              <div class="cm-sub" id="cmSub">(Not Clocked In)</div>
+            </div>
+          </div>
+        </div>
+        <button class="btn ghost sm cm-time" id="cmTime" type="button">
+          Current Time <span class="cm-now" id="cmNow"></span>
+        </button>
+        <textarea id="cmRemarks" rows="3" placeholder="Remarks (optional)"></textarea>
+        <div class="msg err" id="cmMsg"></div>
+        <div class="cm-foot">
+          <button class="btn gold" id="cmConfirm" type="button">Clock In</button>
+          <button class="btn ghost" id="cmCancel" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <!-- portal.js must load before quotes.js: it exposes window.HEKAdmin, the
          shared auth-aware API helper that quotes.js expects. -->
+    <script src="/md.js"></script>
     <script src="/portal.js"></script>
     <script src="/quotes.js"></script>
     <script src="/schedule.js"></script>

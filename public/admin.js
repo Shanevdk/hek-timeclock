@@ -84,6 +84,7 @@
     $('app').style.display = 'block';
     loadPermissions();
     loadEmployees();
+    refreshVacationCount();
     if (isDev) applyDevRestrictions();
     else {
       applyEntitlements(currentFeatures);
@@ -219,11 +220,14 @@
       if (t.dataset.tab === 'employees') loadEmployees();
       if (t.dataset.tab === 'sheets') loadTimesheet().catch((e) => alert(e.message));
       if (t.dataset.tab === 'map') showMap();
+      if (t.dataset.tab === 'timeoff') loadVacations().catch((e) => alert(e.message));
       if (t.dataset.tab === 'quotes' && window.Quotes) window.Quotes.load();
       if (t.dataset.tab === 'schedule' && window.Schedule)
         window.Schedule.loadAdmin().catch((e) => alert(e.message));
       if (t.dataset.tab === 'tasks' && window.Tasks)
         window.Tasks.loadAdmin().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'messages' && window.Messages)
+        window.Messages.load().catch((e) => alert(e.message));
       if (t.dataset.tab === 'access') loadDevFeatures().catch((e) => alert(e.message));
       setMenu(false); // close the popout after choosing a tab
     });
@@ -262,7 +266,11 @@
 
   // ---- Employees ----
   // Permission keys come from the server; labels are friendly names for the UI.
-  const PERM_LABELS = { quotes: 'Quotes / estimates', tasks: 'My Tasks' };
+  const PERM_LABELS = {
+    admin: 'Admin (full dashboard access)',
+    quotes: 'Quotes / estimates',
+    tasks: 'My Tasks',
+  };
   let permKeys = [];
 
   async function loadPermissions() {
@@ -852,6 +860,93 @@
   // so a build without the map section doesn't break the whole dashboard.
   if ($('mapLoad'))
     $('mapLoad').addEventListener('click', () => loadMap().catch((e) => alert(e.message)));
+
+  // ---- Time off (employee vacation requests) ----
+  // Format a plain 'YYYY-MM-DD' as a local date (parsed as local, not UTC).
+  const fmtDay = (s) => {
+    if (!s) return '—';
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString([], {
+      month: 'short', day: 'numeric', year: 'numeric',
+    });
+  };
+
+  // Update the little pending-count badge on the "Time off" nav tab.
+  function setVacationCount(n) {
+    const el = $('voNavCount');
+    if (!el) return;
+    el.textContent = n;
+    el.style.display = n > 0 ? '' : 'none';
+  }
+
+  async function refreshVacationCount() {
+    try {
+      const d = await api('/api/admin/vacations?status=pending');
+      setVacationCount(d.pending || 0);
+    } catch (e) {
+      /* non-fatal: the badge just stays hidden */
+    }
+  }
+
+  async function loadVacations() {
+    const status = $('voFilter') ? $('voFilter').value : 'pending';
+    const d = await api('/api/admin/vacations?status=' + encodeURIComponent(status));
+    setVacationCount(d.pending || 0);
+    const rows = d.requests || [];
+    $('voAdminEmpty').style.display = rows.length ? 'none' : 'block';
+    $('voAdminBody').innerHTML = rows
+      .map(
+        (r) => `<tr>
+          <td>${esc(r.employee_name)}</td>
+          <td>${fmtDay(r.start_date)}${r.end_date !== r.start_date ? ' – ' + fmtDay(r.end_date) : ''}</td>
+          <td>${r.days}</td>
+          <td>${r.reason ? esc(r.reason) : '<span style="color:var(--muted)">—</span>'}${
+            r.admin_note
+              ? `<div style="font-size:12px;color:var(--muted)">Note: ${esc(r.admin_note)}</div>`
+              : ''
+          }</td>
+          <td>${fmtDateTime(r.created_at)}</td>
+          <td><span class="badge status-${r.status}">${r.status}</span></td>
+          <td>${
+            r.status === 'pending'
+              ? `<div class="row" style="gap:6px;flex-wrap:nowrap">
+                  <button class="btn gold sm vo-approve" data-id="${r.id}">Approve</button>
+                  <button class="btn ghost sm vo-decline" data-id="${r.id}">Decline</button>
+                </div>`
+              : ''
+          }</td>
+        </tr>`
+      )
+      .join('');
+  }
+
+  if ($('voFilter'))
+    $('voFilter').addEventListener('change', () => loadVacations().catch((e) => alert(e.message)));
+
+  if ($('voAdminBody'))
+    $('voAdminBody').addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('.vo-approve, .vo-decline');
+      if (!btn) return;
+      const approve = btn.classList.contains('vo-approve');
+      // A note is optional on approve, offered on decline so the employee sees why.
+      const note = prompt(
+        approve ? 'Add a note (optional):' : 'Reason for declining (optional):',
+        ''
+      );
+      if (note === null) return; // cancelled
+      try {
+        await api('/api/admin/vacations/' + btn.dataset.id, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            status: approve ? 'approved' : 'declined',
+            admin_note: note,
+          }),
+        });
+        await loadVacations();
+      } catch (e) {
+        alert(e.message);
+      }
+    });
 
   // ---- utils ----
   function esc(s) {

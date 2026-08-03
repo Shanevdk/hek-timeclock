@@ -115,6 +115,7 @@ const ADMIN_FEATURES = [
   { key: 'pricing', label: 'Pricing calculator' },
   { key: 'map', label: 'Clock-in map' },
   { key: 'tasks', label: 'My Tasks' },
+  { key: 'messages', label: 'Message board' },
 ];
 // Which request paths belong to each feature (used to block them when disabled).
 const FEATURE_MATCH = {
@@ -126,6 +127,7 @@ const FEATURE_MATCH = {
   pricing: () => false, // client-only calculator; no endpoints to guard
   map: (p) => p.startsWith('/api/admin/locations'),
   tasks: (p) => p.startsWith('/api/admin/tasks'),
+  messages: (p) => p.startsWith('/api/admin/bulletins') || p.startsWith('/api/my/bulletins'),
 };
 
 let _entitlements = null; // cached; reloaded on write and on cold start
@@ -200,7 +202,9 @@ function validEmail(e) {
 
 // The features an admin can grant an employee. "My hours" is always available
 // and is not listed here. Add new permission keys here as features are built.
-const ALL_PERMISSIONS = ['quotes', 'tasks'];
+// "admin" is special: an employee with it signs straight into the full admin
+// dashboard instead of the employee portal (see the login handlers).
+const ALL_PERMISSIONS = ['admin', 'quotes', 'tasks'];
 function cleanPermissions(list) {
   if (!Array.isArray(list)) return [];
   return [...new Set(list.filter((p) => ALL_PERMISSIONS.includes(p)))];
@@ -271,12 +275,20 @@ async function checkDev(email, password) {
 }
 
 // Shape an employee document for the current session (never leaks the hash).
+// True when an employee's clock-in method lets them punch in from the portal
+// (their computer/phone) rather than only the shared PIN clock.
+function appClockAllowed(method) {
+  return method === 'App only' || method === 'Timeclock & App';
+}
+
 function selfView(emp) {
   return {
     id: emp._id,
     name: emp.name,
     email: emp.email || null,
     permissions: emp.permissions || [],
+    clock_in_method: emp.clock_in_method || '',
+    can_app_clock: appClockAllowed(emp.clock_in_method || ''),
   };
 }
 
@@ -630,7 +642,15 @@ app.post(
       return res.status(401).json({ error: 'Wrong email or password.' });
     }
     await clearFails(req._rlKey);
+    // An employee granted the "admin" role signs into the full dashboard.
+    if ((emp.permissions || []).includes('admin')) {
+      req.session.admin = true;
+      req.session.role = 'admin';
+      req.session.employeeId = emp._id;
+      return res.json({ role: 'admin', redirect: ADMIN_PATH });
+    }
     req.session.admin = false;
+    req.session.role = null;
     req.session.employeeId = emp._id;
     res.json({ role: 'employee', ...selfView(emp) });
   })
@@ -676,6 +696,83 @@ app.get(
 
 // The jobs assigned to the signed-in employee — always available, no permission
 // needed. Sorted soonest-first so the next job is at the top.
+// ---------------------------------------------------------------------------
+// Employee self-service clock — the portal "Clock in / Clock out" button, for
+// employees whose clock-in method includes the app. No PIN needed (they are
+// already signed in).
+// ---------------------------------------------------------------------------
+
+// Guard: block the action unless this employee is allowed to clock via the app.
+function requireAppClock(req, res, next) {
+  if (!appClockAllowed(req.employee.clock_in_method || ''))
+    return res.status(403).json({ error: 'App clock-in is not turned on for your account.' });
+  next();
+}
+
+app.get(
+  '/api/my/clock-status',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const open = await getOpenPunch(req.employee._id);
+    let missed = null;
+    if (open && localDay(open.clock_in) < localDay(new Date()))
+      missed = { punchId: open._id, clockIn: iso(open.clock_in), day: localDay(open.clock_in) };
+    res.json({
+      canClockIn: appClockAllowed(req.employee.clock_in_method || ''),
+      clockedIn: !!open,
+      since: open ? iso(open.clock_in) : null,
+      missed,
+    });
+  })
+);
+
+app.post(
+  '/api/my/clock-in',
+  requireEmployee,
+  requireAppClock,
+  wrap(async (req, res) => {
+    const open = await getOpenPunch(req.employee._id);
+    if (open) {
+      if (localDay(open.clock_in) < localDay(new Date()))
+        return res.status(409).json({ error: 'You have a missed clock-out to resolve first.' });
+      return res.status(409).json({ error: 'You are already clocked in.' });
+    }
+    const now = new Date();
+    const remarks = String(req.body?.remarks || '').trim().slice(0, 1000) || null;
+    const { lat, lng } = cleanLatLng(req.body?.lat, req.body?.lng);
+    await store.punches.insertOne({
+      _id: await store.nextId('punches'),
+      employee_id: req.employee._id,
+      clock_in: now,
+      clock_out: null,
+      work_done: null,
+      missed_reason: null,
+      note: remarks,
+      edited: false,
+      clock_in_lat: lat,
+      clock_in_lng: lng,
+    });
+    res.json({ clockedIn: true, since: iso(now) });
+  })
+);
+
+app.post(
+  '/api/my/clock-out',
+  requireEmployee,
+  requireAppClock,
+  wrap(async (req, res) => {
+    const open = await getOpenPunch(req.employee._id);
+    if (!open) return res.status(409).json({ error: 'You are not clocked in.' });
+    const now = new Date();
+    const remarks = String(req.body?.remarks || '').trim().slice(0, 2000);
+    await store.punches.updateOne(
+      { _id: open._id },
+      { $set: { clock_out: now, work_done: remarks || open.work_done || null } }
+    );
+    res.json({ clockedIn: false, since: iso(open.clock_in), until: iso(now) });
+  })
+);
+
 app.get(
   '/api/my/schedules',
   requireEmployee,
@@ -709,6 +806,21 @@ app.post(
       req.session.email = email;
       return res.json({ ok: true, email, role: 'dev' });
     }
+    // An employee granted the "admin" role may also sign in on the admin form.
+    const emp = await store.employees.findOne({ email });
+    if (
+      emp &&
+      emp.active &&
+      verifyPassword(password, emp.password_salt, emp.password_hash) &&
+      (emp.permissions || []).includes('admin')
+    ) {
+      await clearFails(req._rlKey);
+      req.session.admin = true;
+      req.session.role = 'admin';
+      req.session.employeeId = emp._id;
+      req.session.email = email;
+      return res.json({ ok: true, email, role: 'admin' });
+    }
     await recordFail(req._rlKey);
     res.status(401).json({ error: 'Wrong email or password.' });
   })
@@ -728,7 +840,13 @@ app.get(
     let features = null;
     if (admin) {
       try {
-        email = (role === 'dev' ? await getDevRecord() : await getAdminRecord()).email;
+        if (req.session.employeeId) {
+          // An employee granted the "admin" role — show their own identity.
+          const emp = await store.employees.findOne({ _id: req.session.employeeId });
+          email = emp ? emp.email || emp.name : null;
+        } else {
+          email = (role === 'dev' ? await getDevRecord() : await getAdminRecord()).email;
+        }
       } catch (e) {
         /* fall back to no email if the settings doc can't be read */
       }
@@ -841,10 +959,22 @@ app.get(
 );
 
 // Also tell the admin UI which permission keys exist, so it can render the
-// right checkboxes without hard-coding the list in two places.
-app.get('/api/admin/permissions', requireAdmin, (req, res) => {
-  res.json({ permissions: ALL_PERMISSIONS });
-});
+// right checkboxes without hard-coding the list in two places. Only offer a
+// role whose underlying feature is turned on for this org — no point granting
+// an employee "Quotes" when the org doesn't have Quotes. Permission keys map
+// 1:1 to feature keys; a permission with no matching feature is always offered.
+app.get(
+  '/api/admin/permissions',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const ent = await getEntitlements();
+    const featureKeys = new Set(ADMIN_FEATURES.map((f) => f.key));
+    const permissions = ALL_PERMISSIONS.filter(
+      (p) => !featureKeys.has(p) || ent[p] !== false
+    );
+    res.json({ permissions });
+  })
+);
 
 app.post(
   '/api/admin/employees',
@@ -1856,6 +1986,382 @@ app.delete(
       { _id: id },
       { $pull: { attachments: { id: attId } }, $set: { updated_at: new Date() } }
     );
+    res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Time-off / vacation requests — an employee requests a date range; the admin
+// approves or declines it. Available to every signed-in employee (no special
+// permission), like their hours and schedule.
+// ---------------------------------------------------------------------------
+
+const VACATION_STATUSES = ['pending', 'approved', 'declined'];
+const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+// Whole days covered by an inclusive date range (both ends counted).
+function dayCount(start, end) {
+  const ms = new Date(end + 'T00:00:00Z') - new Date(start + 'T00:00:00Z');
+  return Math.floor(ms / 86400000) + 1;
+}
+
+// Shape a request for the UI, resolving the employee's name.
+function vacationView(v, name) {
+  return {
+    id: v._id,
+    employee_id: v.employee_id,
+    employee_name: name || '(deleted)',
+    start_date: v.start_date,
+    end_date: v.end_date,
+    days: dayCount(v.start_date, v.end_date),
+    reason: v.reason || '',
+    status: VACATION_STATUSES.includes(v.status) ? v.status : 'pending',
+    admin_note: v.admin_note || '',
+    created_at: iso(v.created_at),
+    decided_at: iso(v.decided_at),
+    decided_by: v.decided_by || null,
+  };
+}
+
+// Validate the { start_date, end_date, reason } an employee submits.
+function readVacationFields(body) {
+  const start_date = String((body && body.start_date) || '').trim();
+  const end_date = String((body && body.end_date) || '').trim();
+  if (!isDate(start_date) || !isDate(end_date))
+    return { error: 'Pick a start and end date.' };
+  if (end_date < start_date)
+    return { error: 'The end date must be on or after the start date.' };
+  const reason = String((body && body.reason) || '').trim().slice(0, 1000);
+  return { set: { start_date, end_date, reason } };
+}
+
+// An employee's own time-off requests, newest first.
+app.get(
+  '/api/my/vacations',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const rows = await store.vacations
+      .find({ employee_id: req.employee._id })
+      .sort({ created_at: -1 })
+      .toArray();
+    res.json({ requests: rows.map((v) => vacationView(v, req.employee.name)) });
+  })
+);
+
+// Submit a new request (always starts pending).
+app.post(
+  '/api/my/vacations',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const { set, error } = readVacationFields(req.body || {});
+    if (error) return res.status(400).json({ error });
+    const doc = {
+      _id: await store.nextId('vacations'),
+      employee_id: req.employee._id,
+      start_date: set.start_date,
+      end_date: set.end_date,
+      reason: set.reason,
+      status: 'pending',
+      admin_note: '',
+      created_at: new Date(),
+      updated_at: new Date(),
+      decided_at: null,
+      decided_by: null,
+    };
+    await store.vacations.insertOne(doc);
+    res.json(vacationView(doc, req.employee.name));
+  })
+);
+
+// Cancel one of my own requests — only while it is still pending.
+app.delete(
+  '/api/my/vacations/:id',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const v = await store.vacations.findOne({ _id: id, employee_id: req.employee._id });
+    if (!v) return res.status(404).json({ error: 'Request not found.' });
+    if (v.status !== 'pending')
+      return res.status(400).json({ error: 'That request has already been decided.' });
+    await store.vacations.deleteOne({ _id: id });
+    res.json({ ok: true });
+  })
+);
+
+// Admin: every time-off request, with employee names. Optional ?status= filter.
+app.get(
+  '/api/admin/vacations',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const filter = {};
+    if (VACATION_STATUSES.includes(req.query.status)) filter.status = req.query.status;
+    const rows = await store.vacations
+      .find(filter)
+      .sort({ status: 1, start_date: 1 })
+      .toArray();
+    const ids = [...new Set(rows.map((v) => v.employee_id))];
+    const emps = ids.length ? await store.employees.find({ _id: { $in: ids } }).toArray() : [];
+    const nameById = Object.fromEntries(emps.map((e) => [e._id, e.name]));
+    const pending = await store.vacations.countDocuments({ status: 'pending' });
+    res.json({
+      requests: rows.map((v) => vacationView(v, nameById[v.employee_id])),
+      pending,
+    });
+  })
+);
+
+// Admin: approve or decline a request (optionally with a note).
+app.patch(
+  '/api/admin/vacations/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const status = req.body && req.body.status;
+    if (status !== 'approved' && status !== 'declined')
+      return res.status(400).json({ error: 'Choose approve or decline.' });
+    const v = await store.vacations.findOne({ _id: id });
+    if (!v) return res.status(404).json({ error: 'Request not found.' });
+    const admin_note = String((req.body && req.body.admin_note) || '').trim().slice(0, 1000);
+    await store.vacations.updateOne(
+      { _id: id },
+      {
+        $set: {
+          status,
+          admin_note,
+          decided_at: new Date(),
+          decided_by: actorName(req),
+          updated_at: new Date(),
+        },
+      }
+    );
+    const emp = await store.employees.findOne({ _id: v.employee_id });
+    res.json(vacationView({ ...v, status, admin_note, decided_at: new Date(), decided_by: actorName(req) }, emp && emp.name));
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Bulletins / "Messages" — an admin-posted notice board. Every signed-in
+// employee sees the messages targeted to them; the admin writes, schedules and
+// tracks who has read each one. Content is Markdown, rendered on the client.
+// ---------------------------------------------------------------------------
+
+const BULLETIN_AUDIENCES = ['all', 'employees'];
+
+// The display status of a bulletin: published now, scheduled for later, or a
+// draft that hasn't been sent.
+function bulletinStatus(b) {
+  if (b.status === 'published') return 'published';
+  if (b.publish_at && new Date(b.publish_at) > new Date()) return 'scheduled';
+  return 'draft';
+}
+
+// True if this bulletin is meant for the given employee.
+function bulletinMatchesEmployee(b, empId) {
+  if (b.audience === 'all') return true;
+  return Array.isArray(b.employee_ids) && b.employee_ids.includes(empId);
+}
+
+// There is no background job on serverless hosting, so a bulletin scheduled for
+// a past time is promoted to "published" lazily, whenever the board is listed.
+async function promoteScheduledBulletins() {
+  const now = new Date();
+  await store.bulletins.updateMany(
+    { status: { $ne: 'published' }, publish_at: { $ne: null, $lte: now } },
+    [{ $set: { status: 'published', published_at: { $ifNull: ['$published_at', '$publish_at'] } } }]
+  );
+}
+
+// Validate the fields the admin submits for a new/edited bulletin.
+function readBulletinFields(body, { partial }) {
+  const set = {};
+  if (!partial || body.title != null) {
+    const title = String((body && body.title) || '').trim();
+    if (!title) return { error: 'A title is required.' };
+    set.title = title.slice(0, 200);
+  }
+  if (!partial || body.content != null) set.content = String((body && body.content) || '').slice(0, 20000);
+  if (!partial || body.audience != null)
+    set.audience = BULLETIN_AUDIENCES.includes(body && body.audience) ? body.audience : 'all';
+  if (body && body.employee_ids != null) {
+    set.employee_ids = Array.isArray(body.employee_ids)
+      ? [...new Set(body.employee_ids.map(Number).filter(Number.isInteger))]
+      : [];
+  }
+  if (body && body.publish_at !== undefined) {
+    const s = String(body.publish_at || '').trim();
+    if (!s) {
+      set.publish_at = null;
+      set.publish_date = '';
+    } else if (isDate(s)) {
+      // Publishes at 8 AM on the chosen day (server time). Close enough for a
+      // notice board; the important thing is the day it appears.
+      set.publish_at = new Date(s + 'T08:00:00');
+      set.publish_date = s;
+    }
+  }
+  return { set };
+}
+
+// Shape a bulletin for the admin management screen (includes the full content so
+// the editor can open it without a second request).
+function bulletinAdminView(b, empCount, nameById) {
+  let target = 'All Employees';
+  if (b.audience === 'employees') {
+    const names = (b.employee_ids || []).map((id) => nameById[id] || '(removed)');
+    target = names.length ? (names.length <= 2 ? names.join(', ') : `${names.length} employees`) : 'No one';
+  }
+  return {
+    id: b._id,
+    title: b.title,
+    content: b.content || '',
+    author: b.author || 'admin',
+    audience: b.audience || 'all',
+    employee_ids: b.employee_ids || [],
+    target,
+    status: bulletinStatus(b),
+    date: iso(b.published_at || b.publish_at || b.created_at),
+    publish_date: b.publish_date || '',
+    read_count: (b.reads || []).length,
+    audience_size: b.audience === 'all' ? empCount : (b.employee_ids || []).length,
+  };
+}
+
+// Admin: every bulletin, newest first, with read counts and audience labels.
+app.get(
+  '/api/admin/bulletins',
+  requireAdmin,
+  wrap(async (req, res) => {
+    await promoteScheduledBulletins();
+    const rows = await store.bulletins.find({}).toArray();
+    rows.sort(
+      (a, b) =>
+        new Date(b.published_at || b.publish_at || b.created_at) -
+        new Date(a.published_at || a.publish_at || a.created_at)
+    );
+    const empCount = await store.employees.countDocuments({ active: true });
+    const ids = [...new Set(rows.flatMap((b) => (b.audience === 'employees' ? b.employee_ids || [] : [])))];
+    const emps = ids.length ? await store.employees.find({ _id: { $in: ids } }).toArray() : [];
+    const nameById = Object.fromEntries(emps.map((e) => [e._id, e.name]));
+    const activeEmps = await store.employees
+      .find({ active: true }, { sort: { name: 1 } })
+      .toArray();
+    res.json({
+      bulletins: rows.map((b) => bulletinAdminView(b, empCount, nameById)),
+      employees: activeEmps.map((e) => ({ id: e._id, name: e.name })),
+    });
+  })
+);
+
+app.post(
+  '/api/admin/bulletins',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const { set, error } = readBulletinFields(req.body || {}, { partial: false });
+    if (error) return res.status(400).json({ error });
+    const action = req.body && req.body.action; // 'publish' | 'draft'
+    const now = new Date();
+    let status = 'draft';
+    let published_at = null;
+    if (action === 'publish') {
+      status = 'published';
+      published_at = now;
+    } else if (set.publish_at && set.publish_at <= now) {
+      status = 'published';
+      published_at = set.publish_at;
+    }
+    const doc = {
+      _id: await store.nextId('bulletins'),
+      title: set.title,
+      content: set.content || '',
+      audience: set.audience || 'all',
+      employee_ids: set.audience === 'employees' ? set.employee_ids || [] : [],
+      status,
+      publish_at: set.publish_at || null,
+      publish_date: set.publish_date || '',
+      published_at,
+      author: actorName(req),
+      reads: [],
+      created_at: now,
+      updated_at: now,
+    };
+    await store.bulletins.insertOne(doc);
+    res.json({ id: doc._id });
+  })
+);
+
+app.patch(
+  '/api/admin/bulletins/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const b = await store.bulletins.findOne({ _id: id });
+    if (!b) return res.status(404).json({ error: 'Message not found.' });
+    const { set, error } = readBulletinFields(req.body || {}, { partial: true });
+    if (error) return res.status(400).json({ error });
+    if (set.audience === 'all') set.employee_ids = [];
+
+    const action = req.body && req.body.action; // 'publish' | 'draft'
+    const now = new Date();
+    if (action === 'publish') {
+      set.status = 'published';
+      if (!b.published_at) set.published_at = now;
+    } else if (action === 'draft') {
+      set.status = 'draft';
+      set.published_at = null;
+    }
+    set.updated_at = now;
+    await store.bulletins.updateOne({ _id: id }, { $set: set });
+    res.json({ ok: true });
+  })
+);
+
+app.delete(
+  '/api/admin/bulletins/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    await store.bulletins.deleteOne({ _id: Number(req.params.id) });
+    res.json({ ok: true });
+  })
+);
+
+// Employee: the published messages meant for me, newest first.
+app.get(
+  '/api/my/bulletins',
+  requireEmployee,
+  wrap(async (req, res) => {
+    await promoteScheduledBulletins();
+    const rows = await store.bulletins.find({ status: 'published' }).toArray();
+    const mine = rows
+      .filter((b) => bulletinMatchesEmployee(b, req.employee._id))
+      .sort(
+        (a, b) =>
+          new Date(b.published_at || b.created_at) - new Date(a.published_at || a.created_at)
+      );
+    res.json({
+      bulletins: mine.map((b) => ({
+        id: b._id,
+        title: b.title,
+        content: b.content || '',
+        author: b.author || 'admin',
+        published_at: iso(b.published_at || b.created_at),
+        read: (b.reads || []).includes(req.employee._id),
+      })),
+      unread: mine.filter((b) => !(b.reads || []).includes(req.employee._id)).length,
+    });
+  })
+);
+
+// Employee: mark a message as read (idempotent).
+app.post(
+  '/api/my/bulletins/:id/read',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const b = await store.bulletins.findOne({ _id: id, status: 'published' });
+    if (!b) return res.status(404).json({ error: 'Message not found.' });
+    if (!bulletinMatchesEmployee(b, req.employee._id))
+      return res.status(403).json({ error: 'Not permitted.' });
+    await store.bulletins.updateOne({ _id: id }, { $addToSet: { reads: req.employee._id } });
     res.json({ ok: true });
   })
 );
