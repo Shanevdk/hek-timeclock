@@ -120,15 +120,11 @@
     ['live', 'sheets'].forEach((t) => setTabVisible(t, false));
     const devTab = $('devAccessTab');
     if (devTab) devTab.style.display = '';
-    // Dev can't change the admin's own login — hide that editor.
-    ['acEmail', 'acPass', 'acSave', 'acMsg'].forEach((id) => {
+    // The dev account's login comes from the environment — hide that editor.
+    ['acLabel', 'acEmail', 'acPass', 'acSave', 'acMsg'].forEach((id) => {
       const el = $(id);
       if (el) el.style.display = 'none';
     });
-    const acLabel = [...document.querySelectorAll('.menu-label')].find((l) =>
-      /admin login/i.test(l.textContent)
-    );
-    if (acLabel) acLabel.style.display = 'none';
     // Label the signed-in account and open the first available tab.
     const ue = $('userEmail');
     if (ue) ue.textContent = 'dev';
@@ -265,20 +261,23 @@
   }
 
   // ---- Employees ----
-  // Permission keys come from the server; labels are friendly names for the UI.
-  const PERM_LABELS = {
-    admin: 'Admin (full dashboard access)',
-    quotes: 'Quotes / estimates',
-    tasks: 'My Tasks',
+  // Permissions come from the server as { key, label, note } — derived there
+  // from the admin feature list, so a newly built feature appears here on its
+  // own without this file needing a matching entry.
+  let perms = [];
+  const permLabel = (k) => {
+    const p = perms.find((x) => x.key === k);
+    return p ? p.label : k;
   };
-  let permKeys = [];
 
   async function loadPermissions() {
     try {
       const d = await api('/api/admin/permissions');
-      permKeys = d.permissions || [];
+      perms = (d.permissions || []).map((p) =>
+        typeof p === 'string' ? { key: p, label: p, note: '' } : p
+      );
     } catch (e) {
-      permKeys = [];
+      perms = [];
     }
     // The quick-add form was replaced by the profile editor; render only if present.
     const np = $('newPerms');
@@ -286,24 +285,101 @@
   }
 
   // Render permission checkboxes into a container, checking those in `selected`.
+  // Ticked boxes are held in the container's dataset rather than read off the
+  // DOM, so a permission filtered out by a search is still submitted.
   function renderPermChecks(container, selected) {
-    const sel = new Set(selected || []);
-    container.innerHTML = permKeys.length
-      ? permKeys
+    container.dataset.selected = JSON.stringify([...new Set(selected || [])]);
+    // Reopening the editor should start from the full list, not the last search.
+    const search = $('eaPermSearch');
+    if (search && container.id === 'eaPerms') search.value = '';
+    filterPermChecks(container, '');
+  }
+
+  const permSelection = (container) => {
+    try {
+      return new Set(JSON.parse(container.dataset.selected || '[]'));
+    } catch (e) {
+      return new Set();
+    }
+  };
+
+  // Bold the matched run inside a label so it's obvious why a row survived.
+  function markHit(text, term) {
+    const safe = esc(text);
+    if (!term) return safe;
+    const i = text.toLowerCase().indexOf(term);
+    if (i < 0) return safe;
+    return (
+      esc(text.slice(0, i)) +
+      '<span class="perm-hit">' + esc(text.slice(i, i + term.length)) + '</span>' +
+      esc(text.slice(i + term.length))
+    );
+  }
+
+  // Show only the permissions matching `term`, matched against both the label
+  // and its note so searching "map" or "locations" both land.
+  function filterPermChecks(container, term) {
+    const q = String(term || '').trim().toLowerCase();
+    const sel = permSelection(container);
+    const shown = perms.filter(
+      (p) =>
+        !q ||
+        p.label.toLowerCase().includes(q) ||
+        p.key.toLowerCase().includes(q) ||
+        (p.note || '').toLowerCase().includes(q)
+    );
+    container.innerHTML = perms.length
+      ? shown
           .map(
-            (k) =>
-              `<label class="perm"><input type="checkbox" value="${k}"${
-                sel.has(k) ? ' checked' : ''
-              } /> ${esc(PERM_LABELS[k] || k)}</label>`
+            (p) => `<label class="perm${p.key === 'admin' ? ' perm-admin' : ''}">
+              <input type="checkbox" value="${esc(p.key)}"${sel.has(p.key) ? ' checked' : ''} />
+              <span>
+                <span class="perm-label">${markHit(p.label, q)}${
+                  p.off ? '<span class="perm-off">off for this account</span>' : ''
+                }</span>
+                ${p.note ? `<span class="perm-note">${markHit(p.note, q)}</span>` : ''}
+              </span>
+            </label>`
           )
           .join('')
       : '<span style="color:var(--muted);font-size:13px">No optional features yet.</span>';
+
+    const empty = $('eaPermEmpty');
+    if (empty && container.id === 'eaPerms')
+      empty.style.display = perms.length && !shown.length ? 'block' : 'none';
+    const count = $('eaPermCount');
+    if (count && container.id === 'eaPerms')
+      count.textContent = sel.size ? sel.size + ' granted' : 'None granted';
   }
-  const collectPerms = (container) =>
-    [...container.querySelectorAll('input[type="checkbox"]:checked')].map((c) => c.value);
-  const permSummary = (perms) =>
-    perms && perms.length
-      ? perms.map((k) => esc(PERM_LABELS[k] || k)).join(', ')
+
+  // Keep the dataset in step as boxes are ticked, so the selection survives
+  // being filtered out of view.
+  function wirePermContainer(container) {
+    if (!container || container.dataset.wired) return;
+    container.dataset.wired = '1';
+    container.addEventListener('change', (e) => {
+      const cb = e.target.closest('input[type="checkbox"]');
+      if (!cb) return;
+      const sel = permSelection(container);
+      if (cb.checked) sel.add(cb.value);
+      else sel.delete(cb.value);
+      container.dataset.selected = JSON.stringify([...sel]);
+      const count = $('eaPermCount');
+      if (count && container.id === 'eaPerms')
+        count.textContent = sel.size ? sel.size + ' granted' : 'None granted';
+    });
+  }
+  wirePermContainer($('eaPerms'));
+  wirePermContainer($('newPerms'));
+
+  const permSearch = $('eaPermSearch');
+  if (permSearch)
+    permSearch.addEventListener('input', () => filterPermChecks($('eaPerms'), permSearch.value));
+
+  const collectPerms = (container) => [...permSelection(container)];
+  const permSummary = (list) =>
+    list && list.length
+      ? list.map((k) => esc(permLabel(k))).join(', ')
       : '<span style="color:var(--muted)">Hours only</span>';
 
   // ---- Employees list: filters, sort, pagination ----
@@ -458,10 +534,10 @@
         const s = String(v == null ? '' : v);
         return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
       };
-      const lines = [['First Name', 'Last Name', 'Position', 'Email', 'PIN', 'Active'].join(',')];
+      const lines = [['First Name', 'Last Name', 'Position', 'Email', 'Active'].join(',')];
       filteredEmployees().forEach((e) =>
         lines.push(
-          [empFirst(e), empLast(e), e.job_title || '', e.email || '', e.pin || '', e.active ? 'yes' : 'no']
+          [empFirst(e), empLast(e), e.job_title || '', e.email || '', e.active ? 'yes' : 'no']
             .map(cell)
             .join(',')
         )
@@ -490,7 +566,7 @@
     'first_name', 'last_name', 'initials', 'phone',
     'address1', 'address2', 'city', 'province', 'postal', 'country',
     'birth_date', 'employment_type', 'vacation_weeks', 'job_title',
-    'start_date', 'termination_date', 'clock_in_method',
+    'start_date', 'termination_date', 'pay_type', 'pay_rate',
   ];
   // Profile field key -> the input/select element id in the editor.
   const PF = {
@@ -498,8 +574,20 @@
     address1: 'peAddr1', address2: 'peAddr2', city: 'peCity', province: 'peProvince',
     postal: 'pePostal', country: 'peCountry', birth_date: 'peBirth',
     employment_type: 'peEmpType', vacation_weeks: 'peVacation', job_title: 'peJobTitle',
-    start_date: 'peStart', termination_date: 'peTerm', clock_in_method: 'peClockMethod',
+    start_date: 'peStart', termination_date: 'peTerm',
+    pay_type: 'pePayType', pay_rate: 'pePayRate',
   };
+
+  // The pay rate means different things depending on the pay type, so the label
+  // and placeholder follow the dropdown ($/hour vs $/year).
+  function syncPayLabel() {
+    const type = $('pePayType').value;
+    $('pePayRateLabel').textContent =
+      type === 'Salary' ? 'Salary ($/year)' : type === 'Hourly' ? 'Rate ($/hour)' : 'Pay Rate';
+    $('pePayRate').placeholder =
+      type === 'Salary' ? 'e.g. 65000' : type === 'Hourly' ? 'e.g. 28.50' : '—';
+  }
+  $('pePayType').addEventListener('change', syncPayLabel);
 
   function setProfileTab(name) {
     document.querySelectorAll('.ptab').forEach((t) => t.classList.toggle('active', t.dataset.ptab === name));
@@ -518,13 +606,13 @@
     setProfileTab('general');
     $('peId').value = emp ? emp.id : '';
     $('eaEmail').value = emp ? emp.email || '' : '';
-    $('eaPin').value = emp ? emp.pin || '' : '';
     $('eaPass').value = '';
     $('peActive').checked = emp ? !!emp.active : true;
     PROFILE_FIELDS.forEach((k) => {
       const el = $(PF[k]);
       if (el) el.value = emp ? emp[k] || '' : '';
     });
+    syncPayLabel();
     // Reports To: pick from every other employee (their manager).
     const rt = $('peReportsTo');
     if (rt) {
@@ -558,7 +646,6 @@
     const next = { ...emp };
     PROFILE_FIELDS.forEach((k) => { if (payload[k] != null) next[k] = payload[k]; });
     if (payload.email != null) next.email = payload.email;
-    if (payload.pin != null) next.pin = payload.pin;
     if (payload.active != null) next.active = !!payload.active && payload.active !== 0;
     if (payload.reports_to != null) next.reports_to = payload.reports_to;
     if (payload.permissions) next.permissions = payload.permissions;
@@ -570,7 +657,6 @@
     $('empModalMsg').textContent = '';
     const payload = {
       email: $('eaEmail').value.trim(),
-      pin: $('eaPin').value.trim(),
       active: $('peActive').checked ? 1 : 0,
       permissions: collectPerms($('eaPerms')),
     };
@@ -656,6 +742,18 @@
   }
 
   const tsCache = new Map(); // query string -> last timesheet response (SWR)
+
+  // Jobs the employee ticked off at clock-out, shown as chips above their note.
+  const jobChips = (r) =>
+    (r.jobs || []).length
+      ? `<div class="job-chips">${r.jobs
+          .map(
+            (j) =>
+              `<span class="job-chip"${j.description ? ` title="${esc(j.description)}"` : ''}>${esc(j.address)}</span>`
+          )
+          .join('')}</div>`
+      : '';
+
   function renderTimesheet(data) {
     const entries = data.entries || [];
     $('tsTotal').textContent = (data.totalHours || 0).toFixed(2);
@@ -668,7 +766,7 @@
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
           <td>${r.hours != null ? r.hours.toFixed(2) : '—'}</td>
-          <td>${r.work_done ? esc(r.work_done) : '<span style="color:var(--muted)">—</span>'}${
+          <td>${jobChips(r)}${r.work_done ? esc(r.work_done) : '<span style="color:var(--muted)">—</span>'}${
             r.missed_reason
               ? `<div style="font-size:12px;color:var(--red)">missed: ${esc(r.missed_reason)}</div>`
               : ''

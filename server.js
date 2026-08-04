@@ -1,8 +1,7 @@
 // HEK Fencing Inc. timeclock server.
-// - Public:   shared PIN clock-in page at "/timeclock".
 // - Employee: personal login (email + password) at "/" — an employee portal
-//             that always shows the employee their own hours, plus any extra
-//             features the admin has granted them (permissions).
+//             where they clock in / out and always see their own hours, plus
+//             any extra features the admin has granted them (permissions).
 // - Admin:    dashboard at ADMIN_PATH protected by an email + password. The
 //             admin can also sign in from "/" and is redirected to ADMIN_PATH.
 //
@@ -125,8 +124,8 @@ const FEATURE_MATCH = {
     p === '/api/admin/geocode' ||
     p.startsWith('/api/my/schedules'),
   pricing: () => false, // client-only calculator; no endpoints to guard
-  map: (p) => p.startsWith('/api/admin/locations'),
-  tasks: (p) => p.startsWith('/api/admin/tasks'),
+  map: (p) => p.startsWith('/api/admin/locations') || p.startsWith('/api/my/locations'),
+  tasks: (p) => p.startsWith('/api/admin/tasks') || p.startsWith('/api/my/tasks'),
   messages: (p) => p.startsWith('/api/admin/bulletins') || p.startsWith('/api/my/bulletins'),
 };
 
@@ -192,19 +191,35 @@ function requireDev(req, res, next) {
   return res.status(401).json({ error: 'Not authorized' });
 }
 
-function validPin(pin) {
-  return typeof pin === 'string' && /^\d{4}$/.test(pin);
-}
-
 function validEmail(e) {
   return typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 }
 
-// The features an admin can grant an employee. "My hours" is always available
-// and is not listed here. Add new permission keys here as features are built.
+// The features an admin can grant an employee, derived from ADMIN_FEATURES so
+// every feature the admin has is grantable and a newly added feature shows up
+// in the picker automatically. Hours, messages, their own schedule and time-off
+// are baseline — every employee gets those, so they are not permissions.
+//
 // "admin" is special: an employee with it signs straight into the full admin
 // dashboard instead of the employee portal (see the login handlers).
-const ALL_PERMISSIONS = ['admin', 'quotes', 'tasks'];
+const PERMISSION_NOTES = {
+  admin: 'Full dashboard access — everything below, plus employees, timesheets and payroll export.',
+  quotes: 'Build and send customer quotes from the portal.',
+  schedule: 'Baseline: everyone already sees their own jobs. Grants nothing extra in the portal yet.',
+  pricing: 'Use the rate-book calculator to price a job.',
+  map: 'See their own clock-in locations on a map.',
+  tasks: 'See the tasks assigned to them, move them along and comment.',
+  messages: 'Baseline: everyone already reads the message board. Grants nothing extra in the portal yet.',
+};
+const GRANTABLE_PERMISSIONS = [
+  { key: 'admin', label: 'Admin (full dashboard access)', note: PERMISSION_NOTES.admin },
+  ...ADMIN_FEATURES.map((f) => ({
+    key: f.key,
+    label: f.label,
+    note: PERMISSION_NOTES[f.key] || '',
+  })),
+];
+const ALL_PERMISSIONS = GRANTABLE_PERMISSIONS.map((p) => p.key);
 function cleanPermissions(list) {
   if (!Array.isArray(list)) return [];
   return [...new Set(list.filter((p) => ALL_PERMISSIONS.includes(p)))];
@@ -275,20 +290,12 @@ async function checkDev(email, password) {
 }
 
 // Shape an employee document for the current session (never leaks the hash).
-// True when an employee's clock-in method lets them punch in from the portal
-// (their computer/phone) rather than only the shared PIN clock.
-function appClockAllowed(method) {
-  return method === 'App only' || method === 'Timeclock & App';
-}
-
 function selfView(emp) {
   return {
     id: emp._id,
     name: emp.name,
     email: emp.email || null,
     permissions: emp.permissions || [],
-    clock_in_method: emp.clock_in_method || '',
-    can_app_clock: appClockAllowed(emp.clock_in_method || ''),
   };
 }
 
@@ -336,23 +343,73 @@ function requirePermission(perm) {
 }
 const requireQuotes = requirePermission('quotes');
 
+// Employee-scoped feature access for the /api/my routes. Unlike
+// requirePermission, this always loads the employee record — every "my" route
+// needs to know whose data to return, so a bare admin session (which has no
+// employee record behind it) gets a clean 401 rather than crashing on a missing
+// req.employee. The "admin" permission satisfies any feature check.
+function requireMyFeature(perm) {
+  return (req, res, next) =>
+    requireEmployee(req, res, () => {
+      const held = req.employee.permissions || [];
+      if (!held.includes(perm) && !held.includes('admin'))
+        return res.status(403).json({ error: 'Not permitted.' });
+      next();
+    });
+}
+
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
     console.error(err);
     if (!res.headersSent) res.status(500).json({ error: 'Server error.' });
   });
 
-const NO_USER = 'No user found for that PIN.';
-
-async function getEmployeeByPin(pin) {
-  return store.employees.findOne({ pin, active: true });
-}
-
 async function getOpenPunch(employeeId) {
   return store.punches.findOne(
     { employee_id: employeeId, clock_out: null },
     { sort: { clock_in: -1 } }
   );
+}
+
+// ---- Jobs worked (scheduled jobs tagged onto a punch) ---------------------
+// At clock-out the employee ticks off which of their scheduled jobs they were
+// on that day. `day` is a local YYYY-MM-DD, which is exactly how schedule dates
+// are stored, so they compare directly.
+//
+// Undated jobs are included too: a job with no date is ongoing work rather than
+// work fixed to one day, so it stays on offer every day. ({ date: null } also
+// matches docs where the field is missing.) scheduleSort puts them last.
+async function jobsOnDay(employeeId, day) {
+  const docs = await store.schedules
+    .find({
+      employee_ids: employeeId,
+      ...(day ? { $or: [{ date: day }, { date: null }] } : { date: null }),
+    })
+    .toArray();
+  return docs.sort(scheduleSort);
+}
+
+// Resolve submitted job ids against what was actually on that employee's
+// schedule that day, then snapshot the address/description onto the punch —
+// the timesheet must still read correctly if the schedule is later edited or
+// deleted. Unknown ids are dropped rather than rejected: a stale modal should
+// not block someone from clocking out.
+async function pickJobs(employeeId, day, rawIds) {
+  if (!Array.isArray(rawIds) || !rawIds.length) return [];
+  const ids = new Set(
+    rawIds.map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 50)
+  );
+  if (!ids.size) return [];
+  const jobs = await jobsOnDay(employeeId, day);
+  return jobs
+    .filter((d) => ids.has(d._id))
+    .map((d) => ({ id: d._id, address: d.address, description: d.description || null }));
+}
+
+// One-line label for a snapshotted job, used in the CSV export and elsewhere
+// a job list has to collapse to text.
+function jobLabel(j) {
+  return j.description ? `${j.address} (${j.description})` : j.address;
 }
 
 // Attach employee names to a set of punch docs (app-side join).
@@ -367,7 +424,7 @@ async function withNames(punches) {
 // Rate limiting — after RL_LIMIT failed attempts from one IP within RL_WINDOW,
 // further attempts are blocked until the window passes. Stored in MongoDB so it
 // works across serverless invocations. Only *failed* attempts count, so a whole
-// crew clocking in from one office IP with correct PINs is never locked out.
+// crew signing in from one office IP with correct passwords is never locked out.
 // ---------------------------------------------------------------------------
 
 const RL_LIMIT = 10;
@@ -446,161 +503,8 @@ const limiter = (scope) => async (req, res, next) => {
   next();
 };
 
-const pinLimiter = limiter('pin');
 const adminLimiter = limiter('admin');
 const loginLimiter = limiter('login');
-
-// Look up an employee by PIN, recording a failed attempt (for rate limiting) if
-// the PIN is unknown and clearing the counter on success.
-async function resolvePin(req, res, pin) {
-  const emp = await getEmployeeByPin(pin);
-  if (!emp) {
-    await recordFail(req._rlKey);
-    res.status(404).json({ error: NO_USER });
-    return null;
-  }
-  await clearFails(req._rlKey);
-  return emp;
-}
-
-// ---------------------------------------------------------------------------
-// Employee (public) API
-// ---------------------------------------------------------------------------
-
-app.post(
-  '/api/status',
-  pinLimiter,
-  wrap(async (req, res) => {
-    const { pin } = req.body || {};
-    if (!validPin(pin)) return res.status(400).json({ error: 'Enter your 4-digit PIN.' });
-
-    const emp = await resolvePin(req, res, pin);
-    if (!emp) return;
-
-    const open = await getOpenPunch(emp._id);
-    // A still-open punch that started on an earlier day = a missed clock-out.
-    let missed = null;
-    if (open && localDay(open.clock_in) < localDay(new Date())) {
-      missed = { punchId: open._id, clockIn: iso(open.clock_in), day: localDay(open.clock_in) };
-    }
-    res.json({
-      id: emp._id,
-      name: emp.name,
-      clockedIn: !!open,
-      since: open ? iso(open.clock_in) : null,
-      missed,
-    });
-  })
-);
-
-app.post(
-  '/api/clock-in',
-  pinLimiter,
-  wrap(async (req, res) => {
-    const { pin } = req.body || {};
-    if (!validPin(pin)) return res.status(400).json({ error: 'Enter your 4-digit PIN.' });
-
-    const emp = await resolvePin(req, res, pin);
-    if (!emp) return;
-
-    const open = await getOpenPunch(emp._id);
-    if (open) {
-      if (localDay(open.clock_in) < localDay(new Date()))
-        return res
-          .status(409)
-          .json({ error: 'Please resolve your missed clock-out first.' });
-      return res.status(409).json({ error: `${emp.name} is already clocked in.` });
-    }
-
-    const now = new Date();
-    const { lat, lng } = cleanLatLng(req.body?.lat, req.body?.lng);
-    await store.punches.insertOne({
-      _id: await store.nextId('punches'),
-      employee_id: emp._id,
-      clock_in: now,
-      clock_out: null,
-      work_done: null,
-      missed_reason: null,
-      note: null,
-      edited: false,
-      clock_in_lat: lat,
-      clock_in_lng: lng,
-    });
-    res.json({ name: emp.name, clockedIn: true, since: iso(now) });
-  })
-);
-
-app.post(
-  '/api/clock-out',
-  pinLimiter,
-  wrap(async (req, res) => {
-    const { pin } = req.body || {};
-    const workDone = (req.body?.workDone || '').trim();
-    if (!validPin(pin)) return res.status(400).json({ error: 'Enter your 4-digit PIN.' });
-    if (!workDone)
-      return res.status(400).json({ error: 'Please enter what you worked on today.' });
-
-    const emp = await resolvePin(req, res, pin);
-    if (!emp) return;
-
-    const open = await getOpenPunch(emp._id);
-    if (!open) return res.status(409).json({ error: `${emp.name} is not clocked in.` });
-
-    // Clock-out defaults to now, but the employee may supply an earlier time.
-    let co = new Date();
-    if (req.body?.clockOut) {
-      co = new Date(req.body.clockOut);
-      if (isNaN(co)) return res.status(400).json({ error: 'Invalid clock-out time.' });
-      if (co.getTime() > Date.now() + 60000)
-        return res.status(400).json({ error: "Clock-out time can't be in the future." });
-      if (co < new Date(open.clock_in))
-        return res.status(400).json({ error: 'Clock-out must be after your clock-in.' });
-    }
-    await store.punches.updateOne(
-      { _id: open._id },
-      { $set: { clock_out: co, work_done: workDone } }
-    );
-    res.json({ name: emp.name, clockedIn: false, since: iso(open.clock_in), until: iso(co) });
-  })
-);
-
-// Resolve a missed clock-out from a previous day: the employee supplies the time
-// they actually finished, what they did, and why they forgot to clock out.
-app.post(
-  '/api/resolve-missed',
-  pinLimiter,
-  wrap(async (req, res) => {
-    const { pin, punchId, clockOut, workDone, reason } = req.body || {};
-    if (!validPin(pin)) return res.status(400).json({ error: 'Enter your 4-digit PIN.' });
-
-    const emp = await resolvePin(req, res, pin);
-    if (!emp) return;
-
-    const p = await store.punches.findOne({
-      _id: Number(punchId),
-      employee_id: emp._id,
-      clock_out: null,
-    });
-    if (!p) return res.status(404).json({ error: 'Nothing to resolve.' });
-
-    const work = (workDone || '').trim();
-    const why = (reason || '').trim();
-    if (!clockOut) return res.status(400).json({ error: 'Enter the time you finished.' });
-    if (!work) return res.status(400).json({ error: 'Enter what you worked on that day.' });
-    if (!why) return res.status(400).json({ error: 'Enter why you did not clock out.' });
-
-    const co = new Date(clockOut);
-    if (isNaN(co)) return res.status(400).json({ error: 'Invalid finish time.' });
-    if (co < new Date(p.clock_in))
-      return res.status(400).json({ error: 'Finish time must be after your clock-in.' });
-
-    await store.punches.updateOne(
-      { _id: p._id },
-      { $set: { clock_out: co, work_done: work, missed_reason: why, edited: true } }
-    );
-    res.json({ ok: true, name: emp.name });
-  })
-);
 
 // ---------------------------------------------------------------------------
 // Employee / unified auth (used by the login page at "/")
@@ -697,31 +601,30 @@ app.get(
 // The jobs assigned to the signed-in employee — always available, no permission
 // needed. Sorted soonest-first so the next job is at the top.
 // ---------------------------------------------------------------------------
-// Employee self-service clock — the portal "Clock in / Clock out" button, for
-// employees whose clock-in method includes the app. No PIN needed (they are
-// already signed in).
+// Employee self-service clock — the portal "Clock In / Clock Out" button. This
+// is the only way to punch in: every signed-in employee can use it, and no PIN
+// is needed (they are already signed in).
 // ---------------------------------------------------------------------------
-
-// Guard: block the action unless this employee is allowed to clock via the app.
-function requireAppClock(req, res, next) {
-  if (!appClockAllowed(req.employee.clock_in_method || ''))
-    return res.status(403).json({ error: 'App clock-in is not turned on for your account.' });
-  next();
-}
 
 app.get(
   '/api/my/clock-status',
   requireEmployee,
   wrap(async (req, res) => {
     const open = await getOpenPunch(req.employee._id);
+    // A still-open punch that started on an earlier day = a missed clock-out.
     let missed = null;
     if (open && localDay(open.clock_in) < localDay(new Date()))
       missed = { punchId: open._id, clockIn: iso(open.clock_in), day: localDay(open.clock_in) };
+    // The day the clock-out will be recorded against — the day the open punch
+    // started, or today if they are about to clock in. The server owns this so
+    // the browser's own timezone can't disagree about which day it is.
+    const day = open ? localDay(open.clock_in) : localDay(new Date());
     res.json({
-      canClockIn: appClockAllowed(req.employee.clock_in_method || ''),
       clockedIn: !!open,
       since: open ? iso(open.clock_in) : null,
       missed,
+      day,
+      jobs: (await jobsOnDay(req.employee._id, day)).map(publicScheduleView),
     });
   })
 );
@@ -729,7 +632,6 @@ app.get(
 app.post(
   '/api/my/clock-in',
   requireEmployee,
-  requireAppClock,
   wrap(async (req, res) => {
     const open = await getOpenPunch(req.employee._id);
     if (open) {
@@ -746,6 +648,7 @@ app.post(
       clock_in: now,
       clock_out: null,
       work_done: null,
+      jobs: [],
       missed_reason: null,
       note: remarks,
       edited: false,
@@ -759,17 +662,79 @@ app.post(
 app.post(
   '/api/my/clock-out',
   requireEmployee,
-  requireAppClock,
   wrap(async (req, res) => {
     const open = await getOpenPunch(req.employee._id);
     if (!open) return res.status(409).json({ error: 'You are not clocked in.' });
+    if (localDay(open.clock_in) < localDay(new Date()))
+      return res.status(409).json({ error: 'You have a missed clock-out to resolve first.' });
+    // What they worked on is required — it is the only record of the day's work.
+    const workDone = String(req.body?.remarks || '').trim().slice(0, 2000);
+    if (!workDone)
+      return res.status(400).json({ error: 'Please enter what you worked on today.' });
+    const jobs = await pickJobs(req.employee._id, localDay(open.clock_in), req.body?.jobIds);
     const now = new Date();
-    const remarks = String(req.body?.remarks || '').trim().slice(0, 2000);
+
+    // They may finish the punch at an earlier time than "now" — e.g. they left
+    // the site at 4pm and only remembered to clock out at 6. It must still be
+    // after they clocked in, not in the future, and on the same day, since an
+    // earlier day would have to go through the missed-clock-out flow instead.
+    let out = now;
+    let backdated = false;
+    if (req.body?.clockOut) {
+      out = new Date(req.body.clockOut);
+      if (isNaN(out)) return res.status(400).json({ error: 'Invalid finish time.' });
+      if (out.getTime() > now.getTime() + 60000)
+        return res.status(400).json({ error: "Finish time can't be in the future." });
+      if (out < new Date(open.clock_in))
+        return res.status(400).json({ error: 'Finish time must be after your clock-in.' });
+      if (localDay(out) !== localDay(open.clock_in))
+        return res.status(400).json({ error: 'Finish time must be on the same day you clocked in.' });
+      // Within a minute of now is just the default value coming back — not a
+      // deliberate correction, so don't flag the punch for it.
+      backdated = now.getTime() - out.getTime() > 60000;
+    }
+
     await store.punches.updateOne(
       { _id: open._id },
-      { $set: { clock_out: now, work_done: remarks || open.work_done || null } }
+      { $set: { clock_out: out, work_done: workDone, jobs, ...(backdated ? { edited: true } : {}) } }
     );
-    res.json({ clockedIn: false, since: iso(open.clock_in), until: iso(now) });
+    res.json({ clockedIn: false, since: iso(open.clock_in), until: iso(out) });
+  })
+);
+
+// Resolve a missed clock-out from a previous day: the employee supplies the time
+// they actually finished, what they did, and why they forgot to clock out.
+app.post(
+  '/api/my/resolve-missed',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const { punchId, clockOut, workDone, reason } = req.body || {};
+    const p = await store.punches.findOne({
+      _id: Number(punchId),
+      employee_id: req.employee._id,
+      clock_out: null,
+    });
+    if (!p) return res.status(404).json({ error: 'Nothing to resolve.' });
+
+    const work = String(workDone || '').trim().slice(0, 2000);
+    const why = String(reason || '').trim().slice(0, 1000);
+    if (!clockOut) return res.status(400).json({ error: 'Enter the time you finished.' });
+    if (!work) return res.status(400).json({ error: 'Enter what you worked on that day.' });
+    if (!why) return res.status(400).json({ error: 'Enter why you did not clock out.' });
+
+    const co = new Date(clockOut);
+    if (isNaN(co)) return res.status(400).json({ error: 'Invalid finish time.' });
+    if (co.getTime() > Date.now() + 60000)
+      return res.status(400).json({ error: "Finish time can't be in the future." });
+    if (co < new Date(p.clock_in))
+      return res.status(400).json({ error: 'Finish time must be after your clock-in.' });
+
+    const jobs = await pickJobs(req.employee._id, localDay(p.clock_in), req.body?.jobIds);
+    await store.punches.updateOne(
+      { _id: p._id },
+      { $set: { clock_out: co, work_done: work, jobs, missed_reason: why, edited: true } }
+    );
+    res.json({ ok: true });
   })
 );
 
@@ -779,6 +744,99 @@ app.get(
   wrap(async (req, res) => {
     const docs = await store.schedules.find({ employee_ids: req.employee._id }).toArray();
     res.json({ jobs: docs.map(publicScheduleView).sort(scheduleSort) });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Employee-side feature endpoints (unlocked by a granted permission)
+// ---------------------------------------------------------------------------
+
+// Their own clock-in pins, for the portal map. Deliberately scoped to the
+// signed-in employee: the admin map shows the whole crew, but one employee has
+// no business seeing where everyone else clocked in.
+app.get(
+  '/api/my/locations',
+  requireMyFeature('map'),
+  wrap(async (req, res) => {
+    const q = { employee_id: req.employee._id, clock_in_lat: { $ne: null } };
+    const { from, to } = req.query;
+    if (from || to) {
+      q.clock_in = {};
+      if (from) q.clock_in.$gte = new Date(from + 'T00:00:00');
+      if (to) q.clock_in.$lte = new Date(to + 'T23:59:59.999');
+    }
+    const rows = await store.punches.find(q, { sort: { clock_in: -1 } }).toArray();
+    res.json(
+      rows.map((p) => ({
+        id: p._id,
+        name: req.employee.name,
+        clock_in: iso(p.clock_in),
+        lat: p.clock_in_lat,
+        lng: p.clock_in_lng,
+      }))
+    );
+  })
+);
+
+// Tasks assigned to them. Read-only apart from moving a card between columns
+// and commenting — creating, assigning, deleting and re-pricing stay with the
+// admin, so a granted employee can work their queue but not reshape the board.
+app.get(
+  '/api/my/tasks',
+  requireMyFeature('tasks'),
+  wrap(async (req, res) => {
+    const rows = await store.tasks
+      .find({ assignee_id: req.employee._id }, { sort: { order: 1, _id: 1 } })
+      .toArray();
+    const nameById = { [req.employee._id]: req.employee.name };
+    res.json({ tasks: rows.map((t) => taskView(t, nameById)) });
+  })
+);
+
+app.patch(
+  '/api/my/tasks/:id',
+  requireMyFeature('tasks'),
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const t = await store.tasks.findOne({ _id: id, assignee_id: req.employee._id });
+    if (!t) return res.status(404).json({ error: 'Task not found.' });
+    const status = req.body?.status;
+    if (!TASK_STATUSES.includes(status))
+      return res.status(400).json({ error: 'Unknown status.' });
+    if (status === t.status) return res.json({ ok: true });
+    const history = (t.history || []).concat({
+      id: (t.history || []).length + 1,
+      text: `Moved to ${status.replace('_', ' ')} by ${req.employee.name}`,
+      at: new Date(),
+    });
+    await store.tasks.updateOne(
+      { _id: id },
+      { $set: { status, completed: status === 'done', history, updated_at: new Date() } }
+    );
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/my/tasks/:id/comment',
+  requireMyFeature('tasks'),
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const t = await store.tasks.findOne({ _id: id, assignee_id: req.employee._id });
+    if (!t) return res.status(404).json({ error: 'Task not found.' });
+    const text = String(req.body?.text || '').trim();
+    if (!text) return res.status(400).json({ error: 'Write a comment first.' });
+    const comment = {
+      id: (t.comments || []).length + 1,
+      author: req.employee.name,
+      text: text.slice(0, 2000),
+      at: new Date(),
+    };
+    await store.tasks.updateOne(
+      { _id: id },
+      { $push: { comments: comment }, $set: { updated_at: new Date() } }
+    );
+    res.json({ comment: { ...comment, at: iso(comment.at) } });
   })
 );
 
@@ -884,30 +942,57 @@ app.patch(
   })
 );
 
-// Change the admin login (email and/or password), stored in MongoDB. Requires
-// an already-signed-in admin session.
+// Change the login of whoever is signed in — only ever their own account, never
+// anyone else's. An employee granted the "admin" role edits their own employee
+// record; the built-in admin and dev accounts edit their own settings doc.
 app.patch(
   '/api/admin/credentials',
   requireAdmin,
   wrap(async (req, res) => {
-    await getAdminRecord(); // ensure the doc exists before updating
-    const set = {};
+    let email = null;
     if (req.body?.email != null) {
-      const email = String(req.body.email).trim().toLowerCase();
-      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
-        return res.status(400).json({ error: 'Enter a valid email.' });
-      set.email = email;
+      email = String(req.body.email).trim().toLowerCase();
+      if (!validEmail(email)) return res.status(400).json({ error: 'Enter a valid email.' });
     }
+    let password = null;
     if (req.body?.password) {
-      const password = String(req.body.password);
+      password = String(req.body.password);
       if (password.length < 6)
         return res.status(400).json({ error: 'Password must be at least 6 characters.' });
-      Object.assign(set, hashPassword(password));
     }
-    if (!Object.keys(set).length)
+    if (!email && !password)
       return res.status(400).json({ error: 'Enter a new email or password.' });
 
-    set.updated_at = new Date();
+    const set = { updated_at: new Date() };
+    if (password) Object.assign(set, hashPassword(password));
+
+    // An employee who signs into the dashboard via the "admin" role: this is
+    // their employee record, so changing it here must not touch the built-in
+    // admin account (which is how the whole company gets in).
+    if (req.session.employeeId) {
+      const id = req.session.employeeId;
+      if (email) {
+        if (await store.employees.findOne({ email, _id: { $ne: id } }))
+          return res.status(409).json({ error: 'That email is already in use.' });
+        // Taking the built-in admin's address would shadow that login.
+        const taken = await Promise.all([getAdminRecord(), getDevRecord()]);
+        if (taken.some((d) => d && (d.email || '').toLowerCase() === email))
+          return res.status(409).json({ error: 'That email is already in use.' });
+        set.email = email;
+      }
+      await store.employees.updateOne({ _id: id }, { $set: set });
+      const emp = await store.employees.findOne({ _id: id });
+      return res.json({ ok: true, email: emp.email || emp.name });
+    }
+
+    // The built-in admin account, stored in the settings collection. (The dev
+    // account never gets here — DEV_BLOCKED refuses this path outright.)
+    await getAdminRecord(); // ensure the doc exists before updating
+    if (email) {
+      if (await store.employees.findOne({ email }))
+        return res.status(409).json({ error: 'That email is already in use.' });
+      set.email = email;
+    }
     await store.settings.updateOne({ _id: 'admin' }, { $set: set });
     const updated = await getAdminRecord();
     if (set.email) req.session.email = updated.email;
@@ -925,19 +1010,41 @@ const PROFILE_FIELDS = [
   'first_name', 'last_name', 'initials', 'phone',
   'address1', 'address2', 'city', 'province', 'postal', 'country',
   'birth_date', 'employment_type', 'vacation_weeks', 'job_title',
-  'start_date', 'termination_date', 'clock_in_method',
+  'start_date', 'termination_date', 'pay_type', 'pay_rate',
 ];
 function pickProfile(body) {
   const out = {};
   for (const f of PROFILE_FIELDS) if (body && body[f] != null) out[f] = String(body[f]).trim();
   return out;
 }
+
+// How an employee is paid. pay_rate means dollars per hour when pay_type is
+// "Hourly" and dollars per year when it is "Salary"; both are admin-only (they
+// are never part of selfView, so they never reach the employee portal).
+const PAY_TYPES = ['', 'Hourly', 'Salary'];
+// Validate + tidy the pay fields on a $set object, in place. Returns an error
+// message for the client, or null when everything is fine.
+function checkPay(set) {
+  if (set.pay_type != null && !PAY_TYPES.includes(set.pay_type))
+    return 'Pay type must be Hourly or Salary.';
+  if (set.pay_rate != null) {
+    const raw = set.pay_rate.replace(/[$,\s]/g, '');
+    if (!raw) {
+      set.pay_rate = '';
+      return null;
+    }
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0)
+      return 'Enter the pay as a number, e.g. 28.50.';
+    set.pay_rate = String(Math.round(n * 100) / 100);
+  }
+  return null;
+}
 // Shape an employee for the admin UI (never leaks the password hash).
 function employeeView(e) {
   const v = {
     id: e._id,
     name: e.name,
-    pin: e.pin,
     email: e.email || null,
     permissions: e.permissions || [],
     hasPassword: !!e.password_hash,
@@ -959,19 +1066,22 @@ app.get(
 );
 
 // Also tell the admin UI which permission keys exist, so it can render the
-// right checkboxes without hard-coding the list in two places. Only offer a
-// role whose underlying feature is turned on for this org — no point granting
-// an employee "Quotes" when the org doesn't have Quotes. Permission keys map
-// 1:1 to feature keys; a permission with no matching feature is always offered.
+// right checkboxes without hard-coding the list in two places. Every grantable
+// role is offered, including features currently switched off for this org — an
+// employee can be set up ahead of time — but each one is flagged with `off` so
+// the picker can say the grant is inert until the feature is turned back on.
+// Dev-only tools (the "Client access" panel) are not in GRANTABLE_PERMISSIONS
+// and so are never offered here.
 app.get(
   '/api/admin/permissions',
   requireAdmin,
   wrap(async (req, res) => {
     const ent = await getEntitlements();
     const featureKeys = new Set(ADMIN_FEATURES.map((f) => f.key));
-    const permissions = ALL_PERMISSIONS.filter(
-      (p) => !featureKeys.has(p) || ent[p] !== false
-    );
+    const permissions = GRANTABLE_PERMISSIONS.map((p) => ({
+      ...p,
+      off: featureKeys.has(p.key) && ent[p.key] === false,
+    }));
     res.json({ permissions });
   })
 );
@@ -984,19 +1094,19 @@ app.post(
     const last = (req.body?.last_name || '').trim();
     let name = (req.body?.name || '').trim();
     if (!name) name = [first, last].filter(Boolean).join(' ').trim();
-    const pin = (req.body?.pin || '').trim();
     const email = (req.body?.email || '').trim().toLowerCase();
     const password = req.body?.password || '';
     const permissions = cleanPermissions(req.body?.permissions);
     if (!name) return res.status(400).json({ error: 'Name is required.' });
-    if (!validPin(pin)) return res.status(400).json({ error: 'PIN must be 4 digits.' });
     if (email && !validEmail(email))
       return res.status(400).json({ error: 'Enter a valid email address.' });
 
-    if (await store.employees.findOne({ pin }))
-      return res.status(409).json({ error: 'That PIN is already in use.' });
     if (email && (await store.employees.findOne({ email })))
       return res.status(409).json({ error: 'That email is already in use.' });
+
+    const profile = pickProfile(req.body);
+    const payError = checkPay(profile);
+    if (payError) return res.status(400).json({ error: payError });
 
     const _id = await store.nextId('employees');
     // reports_to: the id of another employee (their manager).
@@ -1009,13 +1119,12 @@ app.post(
     const doc = {
       _id,
       name,
-      pin,
       email: email || null,
       permissions,
       active: true,
       created_at: new Date(),
       reports_to: reportsTo,
-      ...pickProfile(req.body),
+      ...profile,
     };
     if (email && password) Object.assign(doc, hashPassword(password));
     await store.employees.insertOne(doc);
@@ -1039,17 +1148,14 @@ app.patch(
       const combined = [first, last].filter(Boolean).join(' ').trim();
       if (!req.body?.name && combined) name = combined;
     }
-    const pin = req.body?.pin != null ? String(req.body.pin).trim() : emp.pin;
     const active =
       req.body?.active != null ? !!req.body.active && req.body.active !== 0 : emp.active;
 
     if (!name) return res.status(400).json({ error: 'Name is required.' });
-    if (!validPin(pin)) return res.status(400).json({ error: 'PIN must be 4 digits.' });
 
-    if (await store.employees.findOne({ pin, _id: { $ne: id } }))
-      return res.status(409).json({ error: 'That PIN is already in use.' });
-
-    const set = { name, pin, active, ...pickProfile(req.body) };
+    const set = { name, active, ...pickProfile(req.body) };
+    const payError = checkPay(set);
+    if (payError) return res.status(400).json({ error: payError });
 
     // Email: allow setting/changing, or clearing with an empty string.
     if (req.body?.email != null) {
@@ -1342,6 +1448,7 @@ async function timesheetRows({ employeeId, from, to }) {
     clock_in: r.clock_in,
     clock_out: r.clock_out,
     work_done: r.work_done,
+    jobs: r.jobs || [],
     missed_reason: r.missed_reason,
     note: r.note,
     edited: r.edited,
@@ -1488,6 +1595,7 @@ app.get(
       'Clock In',
       'Clock Out',
       'Hours',
+      'Jobs',
       'Work Done',
       'Missed Clock-out Reason',
       'Edited',
@@ -1501,6 +1609,7 @@ app.get(
           csvCell(iso(r.clock_in)),
           csvCell(iso(r.clock_out) || ''),
           csvCell(hoursOf(r) ?? ''),
+          csvCell((r.jobs || []).map(jobLabel).join('; ')),
           csvCell(r.work_done || ''),
           csvCell(r.missed_reason || ''),
           csvCell(r.edited ? 'yes' : ''),
@@ -2372,16 +2481,10 @@ app.post(
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Shared PIN clock-in page. Served explicitly (not just as /timeclock.html) so
-// the clean "/timeclock" URL works on hosts that route everything through this
-// app (e.g. Vercel). "/" is the employee login/portal, served by static above.
-app.get('/timeclock', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'timeclock.html'));
-});
-
-// Old admin URLs now live behind the main-page login — send any stale bookmarks
-// to the login page instead of 404ing.
-for (const legacy of ['/fence', '/office']) {
+// Old URLs that no longer exist (the shared PIN clock, old admin paths) — send
+// any stale bookmarks to the login page instead of 404ing. Employees now clock
+// in from the portal at "/" after signing in.
+for (const legacy of ['/timeclock', '/fence', '/office']) {
   if (legacy !== ADMIN_PATH) app.get(legacy, (req, res) => res.redirect('/'));
 }
 
@@ -2428,8 +2531,7 @@ if (require.main === module) {
       await getDevRecord().catch(() => {}); // ensure the dev account exists in the DB
       app.listen(PORT, () => {
         console.log(`HEK Timeclock running on http://localhost:${PORT}`);
-        console.log(`  Employee login:     http://localhost:${PORT}/`);
-        console.log(`  Shared PIN clock:   http://localhost:${PORT}/timeclock`);
+        console.log(`  Employee portal:    http://localhost:${PORT}/`);
         console.log(`  Admin dashboard:    http://localhost:${PORT}${ADMIN_PATH}`);
       });
     })

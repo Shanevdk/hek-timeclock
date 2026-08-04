@@ -45,7 +45,7 @@
                autocapitalize="none" autocorrect="off" spellcheck="false" />
         <button class="btn gold" id="loginBtn" style="margin-top:14px">Sign in</button>
         <div class="msg err" id="loginMsg"></div>
-        <div class="footer-link"><a href="/">← Back to clock-in</a></div>
+        <div class="footer-link"><a href="/">← Back to the employee portal</a></div>
       </div>
     </div>
 
@@ -87,9 +87,9 @@
                 <button type="button" class="tip" data-tip="Dark" data-theme-choice="dark" aria-label="Dark theme">☾</button>
               </div>
 
-              <div class="menu-label" style="margin-top:14px">Admin login</div>
+              <div class="menu-label" id="acLabel" style="margin-top:14px">Your login</div>
               <input id="acEmail" type="email" autocomplete="username" autocapitalize="none" autocorrect="off"
-                     spellcheck="false" placeholder="admin email" style="width:100%;margin-bottom:8px" />
+                     spellcheck="false" placeholder="your email" style="width:100%;margin-bottom:8px" />
               <input id="acPass" type="password" autocomplete="new-password" placeholder="new password (optional)"
                      style="width:100%;margin-bottom:8px" />
               <button class="btn gold sm" id="acSave" style="width:100%">Save login</button>
@@ -580,12 +580,10 @@
                   <div class="field wide"><label>Job Title</label><input id="peJobTitle" /></div>
                   <div class="field"><label>Start Date</label><input id="peStart" type="date" /></div>
                   <div class="field"><label>Termination Date</label><input id="peTerm" type="date" /></div>
-                  <div class="field"><label>Clock In Method</label>
-                    <select id="peClockMethod"><option value="">—</option><option>Timeclock &amp; App</option><option>Timeclock only</option><option>App only</option></select></div>
-                  <div class="field"><label>Pin</label><input id="eaPin" inputmode="numeric" maxlength="4" /></div>
-                  <div class="field wide muted-field"><label>Groups</label><input disabled placeholder="Coming soon" /></div>
-                  <div class="field wide muted-field"><label>Default Team</label><input disabled placeholder="Coming soon" /></div>
-                  <div class="field wide muted-field"><label>Work Location</label><input disabled placeholder="Coming soon" /></div>
+                  <div class="field"><label>Pay Type</label>
+                    <select id="pePayType"><option value="">—</option><option>Hourly</option><option>Salary</option></select></div>
+                  <div class="field"><label id="pePayRateLabel">Pay Rate</label>
+                    <input id="pePayRate" inputmode="decimal" placeholder="—" /></div>
                   <div class="field wide"><label>Reports To</label><select id="peReportsTo"><option value="">— None —</option></select></div>
                 </div>
               </div>
@@ -599,9 +597,22 @@
             <div class="profile-access">
               <h4>Role permissions</h4>
               <p class="status-sub" style="text-align:left;margin:0 0 12px">
-                Extra features this employee can use after they sign in — their own hours is always on.
+                Extra features this employee can use after they sign in — their own hours,
+                message board, schedule and time off are always on.
               </p>
+              <div class="perm-search">
+                <input
+                  type="search"
+                  id="eaPermSearch"
+                  placeholder="Search permissions…"
+                  autocomplete="off"
+                />
+                <span class="perm-count" id="eaPermCount"></span>
+              </div>
               <div class="perm-list" id="eaPerms"></div>
+              <p class="perm-empty" id="eaPermEmpty" style="display:none">
+                No permission matches that search.
+              </p>
             </div>
           </div>
 

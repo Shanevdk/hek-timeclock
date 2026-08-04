@@ -2,27 +2,26 @@
 
 A simple employee time clock:
 
-- **Employees** clock in/out from their phone using a **4-digit PIN** — no app to install, just open the web page. When clocking out they must enter **what they worked on** that day. If they forget to clock out, the next time they enter their PIN they're asked **when they finished and why** before they can start again.
+- **Employees** sign in with an **email + password** on their own phone and clock in/out with the **Clock In** button in the portal sidebar — no app to install, just open the web page. When clocking out they must enter **what they worked on** that day. If they forget to clock out, the same button asks **when they finished and why** before they can start again.
 - **Admins** sign in with an **email + password** to see who's on the clock, view/total hours (including each day's work notes and missed-clock-out reasons), fix mistakes, add employees, and export to CSV for payroll.
 
 ## Screens
 
 | URL | Who | What |
 | --- | --- | --- |
-| `/` | Everyone | Sign in with email + password → employee portal, or (admin) the dashboard |
-| `/timeclock` | Crew | Shared 4-digit PIN clock (in / out) for a shop tablet |
+| `/` | Everyone | Sign in with email + password → employee portal (clock in/out + hours), or (admin) the dashboard |
 | `/admin` | Admin | Dashboard — reached automatically after an admin signs in on `/` |
 
-> Everyone signs in on the main page (`/`). Employees land on a portal that always
-> shows their own hours (plus any features the admin grants them); admins are
-> redirected to the dashboard at `ADMIN_PATH` (default `/admin`). The shared PIN
-> keypad for punching in on one device lives at `/timeclock`.
+> Everyone signs in on the main page (`/`). Employees land on a portal where they
+> punch in and out and always see their own hours (plus any features the admin
+> grants them); admins are redirected to the dashboard at `ADMIN_PATH`
+> (default `/admin`).
 
 ## Admin dashboard
 
 - **On the clock** — live list of who is currently clocked in.
 - **Timesheets** — filter by employee and date range, see total hours, edit any entry, add a manual entry, **Export CSV**.
-- **Employees** — add employees (name + 4-digit PIN), reset PINs, deactivate, or delete.
+- **Employees** — add employees (name + login email + password), edit their profile, deactivate, or delete. An employee needs an email and password to sign in and clock in.
 
 ---
 
@@ -55,8 +54,7 @@ $env:ADMIN_PASSWORD="yourpassword"
 npm start
 ```
 
-Open http://localhost:3000 (sign in) — admins are taken to the dashboard, and the
-shared PIN clock is at http://localhost:3000/timeclock.
+Open http://localhost:3000 (sign in) — admins are taken to the dashboard.
 The first thing to do after signing in is add your employees under the **Employees** tab.
 
 ## Deploy to Netlify
@@ -103,4 +101,4 @@ Render pick **New + → Blueprint** and set the same environment variables above
 ## Notes
 
 - Times are stored in UTC and displayed in each viewer's local timezone.
-- PINs are stored as-is so an admin can look them up and remind employees; keep the admin password private.
+- Clocking in asks the browser for the device location (best effort). If the employee allows it, the spot is saved with the punch and shown on the admin **Map**; if they decline, clocking in still works.

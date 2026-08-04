@@ -75,9 +75,8 @@ async function doConnect() {
   // credentials (doc _id: 'admin'), seeded from env on first run.
   store.settings = store.db.collection('settings');
 
-  await store.employees.createIndex({ pin: 1 });
   // Unique login email, but only for employees that actually have one set
-  // (existing PIN-only employees have no email and must not collide on null).
+  // (older records may have no email and must not collide on null).
   await store.employees.createIndex(
     { email: 1 },
     { unique: true, partialFilterExpression: { email: { $type: 'string' } } }

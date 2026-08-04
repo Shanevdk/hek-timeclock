@@ -97,64 +97,6 @@ body {
 
 h1, h2 { font-weight: 700; }
 
-/* ---- PIN entry ---- */
-.pin-display {
-  display: flex;
-  justify-content: center;
-  gap: 14px;
-  margin: 8px 0 20px;
-}
-.pin-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 2px solid var(--gold-dim);
-  background: transparent;
-  transition: background 0.15s;
-}
-.pin-dot.filled { background: var(--gold); border-color: var(--gold); }
-
-/* While the PIN is being checked: pulse the filled dots and lock the keypad. */
-.pin-display.loading .pin-dot { animation: pin-pulse 0.9s ease-in-out infinite; }
-.pin-display.loading .pin-dot:nth-child(2) { animation-delay: 0.15s; }
-.pin-display.loading .pin-dot:nth-child(3) { animation-delay: 0.3s; }
-.pin-display.loading .pin-dot:nth-child(4) { animation-delay: 0.45s; }
-@keyframes pin-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.25; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .pin-display.loading .pin-dot { animation: none; }
-}
-
-.keypad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-}
-.key {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 18px 0;
-  font-size: 26px;
-  font-weight: 600;
-  background: var(--panel-2);
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  cursor: pointer;
-  user-select: none;
-  text-align: center;
-  -webkit-tap-highlight-color: transparent;
-}
-.key:active { background: var(--gold); color: var(--black); }
-.key.wide { grid-column: span 1; }
-.key.ghost { background: transparent; border-color: transparent; }
-.keypad.loading { pointer-events: none; opacity: 0.45; transition: opacity 0.15s; }
-
-.status-title { text-align: center; margin: 4px 0 2px; }
-.status-title .name { color: var(--gold); }
 .status-sub { text-align: center; color: var(--muted); margin: 0 0 18px; }
 
 .btn {
@@ -168,8 +110,6 @@ h1, h2 { font-weight: 700; }
   cursor: pointer;
   color: #fff;
 }
-.btn.in { background: var(--green); }
-.btn.out { background: var(--red); }
 .btn.gold { background: var(--gold); color: var(--black); }
 .btn.ghost {
   background: transparent;
@@ -183,15 +123,6 @@ h1, h2 { font-weight: 700; }
 .msg { text-align: center; min-height: 22px; margin: 14px 0 0; font-size: 15px; }
 .msg.err { color: var(--red); }
 .msg.ok { color: var(--green); }
-
-.big-clock {
-  text-align: center;
-  font-size: 40px;
-  font-weight: 700;
-  letter-spacing: 1px;
-  margin: 6px 0 2px;
-}
-.big-date { text-align: center; color: var(--muted); margin-bottom: 18px; }
 
 .footer-link { text-align: center; margin-top: 22px; }
 .footer-link a { color: var(--gold-dim); font-size: 13px; text-decoration: none; }
@@ -314,6 +245,24 @@ h1, h2 { font-weight: 700; }
   }
   .sidebar-backdrop.open { opacity: 1; pointer-events: auto; }
 
+  /* The clock button moves out of the drawer and into the top bar, so punching
+     in on a phone is one tap. The sidebar keeps the full status line. The
+     .mobile-bar prefix is needed to outrank the .clock-btn base rule below.
+     (On desktop the whole bar is display:none, which hides this button too.) */
+  .mobile-bar .bar-clock {
+    display: inline-flex;
+    width: auto;
+    margin-left: auto;
+    flex-shrink: 0;
+    gap: 7px;
+    padding: 8px 14px;
+    border-radius: 20px;
+    font-size: 14px;
+  }
+  .mobile-bar .bar-clock .clock-ic { font-size: 16px; }
+  .clock-widget .clock-btn { display: none; }
+  .clock-widget .clock-status { margin-top: 0; padding-bottom: 4px; }
+
   /* Turn the hamburger into an X while the drawer is open */
   .hamburger[aria-expanded="true"] span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
   .hamburger[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
@@ -391,37 +340,6 @@ input, select, textarea {
 }
 textarea { width: 100%; resize: vertical; }
 
-/* Big touch-friendly clock-out time selector */
-.cot-options { display: flex; gap: 12px; }
-.cot-option {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  min-height: 68px;
-  padding: 14px 10px;
-  background: var(--panel-2);
-  border: 2px solid var(--line);
-  border-radius: 14px;
-  color: var(--text);
-  cursor: pointer;
-  text-align: center;
-  user-select: none;
-  -webkit-tap-highlight-color: transparent;
-}
-.cot-option input { display: none; }
-.cot-option .cot-title { font-size: 18px; font-weight: 700; }
-.cot-option .cot-sub { font-size: 14px; color: var(--muted); }
-.cot-option.active { border-color: var(--gold); background: rgba(200, 155, 92, 0.16); }
-.cot-option.active .cot-sub { color: var(--gold); }
-.cot-input {
-  width: 100%;
-  margin-top: 12px;
-  font-size: 18px;
-  padding: 14px 12px;
-}
 label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
 .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
 .field { display: flex; flex-direction: column; }
@@ -440,9 +358,11 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .stat .n { font-size: 30px; font-weight: 800; color: var(--gold); }
 .stat .l { color: var(--muted); font-size: 13px; }
 
+/* Above the mobile sidebar drawer (z-index 60), so a modal opened from the
+   drawer — e.g. the clock button — is never buried under it. */
 .modal-back {
   position: fixed; inset: 0; background: rgba(0,0,0,.7);
-  display: none; align-items: center; justify-content: center; padding: 16px; z-index: 50;
+  display: none; align-items: center; justify-content: center; padding: 16px; z-index: 70;
 }
 .modal-back.open { display: flex; }
 .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 22px; max-width: 420px; width: 100%; }
@@ -466,14 +386,27 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 
 .profile-cols { display: grid; grid-template-columns: 1fr 1fr auto; gap: 28px; }
 .pcol { min-width: 0; }
-.pcol-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
-.pcol-head h4 { margin: 0; color: var(--gold); font-size: 16px; }
+/* A gold rule under each column heading, so Contact / Profile read as distinct
+   groups instead of two columns of fields running together. */
+.pcol-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.pcol-head h4 {
+  margin: 0; color: var(--gold); font-size: 12px;
+  font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase;
+}
 .pcol-photo { width: 220px; }
-.pgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.pgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 14px; }
 .pgrid .field { min-width: 0; }
 .pgrid .field.wide { grid-column: 1 / -1; }
+.pgrid .field label { font-size: 12px; margin-bottom: 5px; }
 .pgrid .field input, .pgrid .field select { width: 100%; }
-.pgrid .field input:disabled, .muted-field input:disabled { opacity: 0.6; }
+/* Read-only values (e.g. Employee ID) read as information, not a dead input. */
+.pgrid .field input:disabled {
+  opacity: 1; color: var(--muted); background: var(--panel-2);
+  border-style: dashed; cursor: default;
+}
 
 .photo-box {
   width: 100%; aspect-ratio: 1 / 1; border: 2px dashed var(--line); border-radius: 12px;
@@ -499,8 +432,11 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .empty-tab { color: var(--muted); padding: 40px 8px; text-align: center; font-size: 15px; }
 
 /* Role permissions block on the General tab */
-.profile-access { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
-.profile-access h4 { margin: 0 0 4px; color: var(--gold); font-size: 16px; }
+.profile-access { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--line); }
+.profile-access h4 {
+  margin: 0 0 6px; color: var(--gold); font-size: 12px;
+  font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase;
+}
 
 .profile-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .profile-foot .foot-right { display: flex; gap: 8px; }
@@ -617,12 +553,41 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .pill { display:inline-block; background: var(--panel-2); border:1px solid var(--line); border-radius: 20px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
 
 /* ---- Permission checkboxes (admin employee access) ---- */
-.perm-list { display: flex; flex-wrap: wrap; gap: 10px 18px; }
+/* One row per permission (rather than wrapping chips) so each can carry a
+   plain-English note about what granting it actually does. */
+.perm-list { display: flex; flex-direction: column; gap: 2px; }
 .perm-list .perm {
-  display: flex; align-items: center; gap: 8px;
-  margin: 0; color: var(--text); font-size: 14px; cursor: pointer;
+  display: flex; align-items: flex-start; gap: 10px;
+  margin: 0; padding: 9px 10px; border-radius: 8px;
+  color: var(--text); font-size: 14px; cursor: pointer;
 }
-.perm-list .perm input { width: auto; padding: 0; }
+.perm-list .perm:hover { background: var(--panel-2); }
+.perm-list .perm input { width: auto; padding: 0; margin: 2px 0 0; flex-shrink: 0; accent-color: var(--gold); }
+.perm-label { display: block; font-weight: 600; }
+.perm-note { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
+/* A feature that is switched off for this org: still grantable, but inert until
+   it is turned back on. */
+.perm-off {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: none;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+/* The granted-everything row reads as a warning, not a peer of the others. */
+.perm-list .perm.perm-admin .perm-label { color: var(--gold); }
+
+.perm-search { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.perm-search input { flex: 1; min-width: 0; }
+.perm-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.perm-empty { margin: 6px 0 0; padding: 10px; font-size: 13px; color: var(--muted); }
+/* Highlight the part of a label that matched the search. */
+.perm-hit { background: rgba(200, 155, 92, .28); border-radius: 3px; }
 
 /* ---- Client access toggles (dev panel) ---- */
 .feature-row {
@@ -1198,7 +1163,85 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   font-variant-numeric: tabular-nums;
 }
 .cm-time .cm-now { margin-left: 6px; font-weight: 700; color: var(--gold); }
-.clock-modal textarea { width: 100%; resize: vertical; }
+.cm-time .cm-elapsed { margin-left: 8px; font-weight: 600; color: var(--muted); font-size: 13px; }
+.clock-modal textarea { width: 100%; resize: vertical; margin-bottom: 12px; }
+
+.cm-hint { margin: -6px 0 12px; font-size: 12px; color: var(--muted); }
+
+/* ---- Portal "My Tasks" list (the granted-permission view of the board) ---- */
+.mt-card { margin-bottom: 14px; }
+.mt-card.mt-done { opacity: .68; }
+.mt-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.mt-title { margin: 0; font-size: 17px; }
+.mt-desc { margin: 10px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; white-space: pre-wrap; }
+.mt-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.mt-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.mt-actions label { margin: 0; font-size: 13px; color: var(--muted); }
+.mt-actions select { width: auto; min-width: 150px; }
+.mt-comments {
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.mt-comment { font-size: 13px; color: var(--text); }
+.mt-comment b { color: var(--gold); margin-right: 4px; }
+.mt-add { display: flex; gap: 8px; margin-top: 12px; }
+.mt-add input { flex: 1; min-width: 0; }
+.mt-add .btn { width: auto; flex-shrink: 0; }
+.badge.prio-low { background: var(--panel-2); color: var(--muted); }
+.badge.prio-medium { background: rgba(200, 155, 92, .18); color: var(--gold); }
+.badge.prio-high { background: rgba(209, 91, 82, .16); color: var(--red); }
+.badge.prio-urgent { background: rgba(209, 91, 82, .28); color: var(--red); }
+
+/* "What job did you work on today?" — the day's scheduled jobs as checkboxes. */
+.cm-jobs {
+  margin-bottom: 12px;
+  max-height: 190px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 4px;
+}
+.cm-job {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+}
+.cm-job:hover { background: var(--panel); }
+.cm-job input { margin: 2px 0 0; flex-shrink: 0; accent-color: var(--gold); }
+.cm-job-name { display: block; font-weight: 600; }
+.cm-job-sub { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
+.cm-job-empty { margin: 0; padding: 10px; font-size: 13px; color: var(--muted); }
+
+/* Job tags on a timesheet row, above the free-text work note. */
+.job-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 5px; }
+.job-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gold);
+  background: rgba(200, 155, 92, .15);
+  border: 1px solid rgba(200, 155, 92, .35);
+}
+.clock-modal .cm-input { width: 100%; margin-bottom: 12px; }
+/* Missed clock-out notice inside the modal */
+.cm-warn {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--red);
+  background: rgba(209, 91, 82, 0.12);
+  border: 1px solid rgba(209, 91, 82, 0.35);
+}
 .cm-foot {
   display: flex;
   gap: 10px;

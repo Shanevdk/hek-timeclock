@@ -1,5 +1,5 @@
 // Assembles the static "dist" folder that Netlify publishes:
-//   - everything in public/  (login/portal page, PIN clock, assets)
+//   - everything in public/  (login/portal page, assets)
 //   - the admin page, copied to  <ADMIN_PATH>.html  (default /admin). Netlify
 //     serves "/admin" for "admin.html" automatically. Admins reach it by
 //     signing in on the main page, which redirects there.
