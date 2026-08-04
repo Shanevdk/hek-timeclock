@@ -220,6 +220,9 @@ const GRANTABLE_PERMISSIONS = [
   })),
 ];
 const ALL_PERMISSIONS = GRANTABLE_PERMISSIONS.map((p) => p.key);
+// Permission keys that are backed by a switchable feature. ("admin" is not — it
+// is always available to the client.)
+const FEATURE_KEYS = new Set(ADMIN_FEATURES.map((f) => f.key));
 function cleanPermissions(list) {
   if (!Array.isArray(list)) return [];
   return [...new Set(list.filter((p) => ALL_PERMISSIONS.includes(p)))];
@@ -289,13 +292,30 @@ async function checkDev(email, password) {
   return emailOk && verifyPassword(password, dev.password_salt, dev.password_hash);
 }
 
+// Salaried staff are paid the same however long the day runs, so they have no
+// clock. Anyone whose pay type is not set still clocks in — a blank field means
+// "not decided yet", and nobody should silently lose the clock by omission.
+function clockAllowed(emp) {
+  return (emp.pay_type || '') !== 'Salary';
+}
+
 // Shape an employee document for the current session (never leaks the hash).
-function selfView(emp) {
+// can_clock is a plain yes/no — the pay rate itself stays admin-only.
+//
+// Permissions are filtered through the org's entitlements: a feature the dev
+// has not granted this client is invisible to the employee, even if the admin
+// granted it while the feature was still on. The grant stays on their record,
+// so switching the feature back on restores it.
+function selfView(emp, ent) {
+  const granted = emp.permissions || [];
   return {
     id: emp._id,
     name: emp.name,
     email: emp.email || null,
-    permissions: emp.permissions || [],
+    permissions: ent
+      ? granted.filter((p) => !FEATURE_KEYS.has(p) || ent[p] !== false)
+      : granted,
+    can_clock: clockAllowed(emp),
   };
 }
 
@@ -556,7 +576,7 @@ app.post(
     req.session.admin = false;
     req.session.role = null;
     req.session.employeeId = emp._id;
-    res.json({ role: 'employee', ...selfView(emp) });
+    res.json({ role: 'employee', ...selfView(emp, await getEntitlements()) });
   })
 );
 
@@ -572,7 +592,8 @@ app.get(
     if (req.session && req.session.admin) return res.json({ role: 'admin', redirect: ADMIN_PATH });
     if (req.session && req.session.employeeId) {
       const emp = await store.employees.findOne({ _id: req.session.employeeId, active: true });
-      if (emp) return res.json({ role: 'employee', ...selfView(emp) });
+      if (emp)
+        return res.json({ role: 'employee', ...selfView(emp, await getEntitlements()) });
     }
     res.json({ role: null });
   })
@@ -620,6 +641,7 @@ app.get(
     // the browser's own timezone can't disagree about which day it is.
     const day = open ? localDay(open.clock_in) : localDay(new Date());
     res.json({
+      canClock: clockAllowed(req.employee),
       clockedIn: !!open,
       since: open ? iso(open.clock_in) : null,
       missed,
@@ -633,6 +655,11 @@ app.post(
   '/api/my/clock-in',
   requireEmployee,
   wrap(async (req, res) => {
+    // Only clocking IN is blocked for salaried staff. Clock-out and missed
+    // clock-outs stay open to everyone, so a punch started before someone moved
+    // onto salary can still be closed instead of hanging open forever.
+    if (!clockAllowed(req.employee))
+      return res.status(403).json({ error: 'Salaried employees do not clock in.' });
     const open = await getOpenPunch(req.employee._id);
     if (open) {
       if (localDay(open.clock_in) < localDay(new Date()))
@@ -1066,22 +1093,19 @@ app.get(
 );
 
 // Also tell the admin UI which permission keys exist, so it can render the
-// right checkboxes without hard-coding the list in two places. Every grantable
-// role is offered, including features currently switched off for this org — an
-// employee can be set up ahead of time — but each one is flagged with `off` so
-// the picker can say the grant is inert until the feature is turned back on.
-// Dev-only tools (the "Client access" panel) are not in GRANTABLE_PERMISSIONS
-// and so are never offered here.
+// right checkboxes without hard-coding the list in two places. A feature the
+// dev has not granted this client is switched off completely: it is not offered
+// here, its tab is hidden, its endpoints are refused, and it disappears from the
+// employee portal (see selfView). Anything already granted stays on the employee
+// record, so turning the feature back on restores it untouched.
 app.get(
   '/api/admin/permissions',
   requireAdmin,
   wrap(async (req, res) => {
     const ent = await getEntitlements();
-    const featureKeys = new Set(ADMIN_FEATURES.map((f) => f.key));
-    const permissions = GRANTABLE_PERMISSIONS.map((p) => ({
-      ...p,
-      off: featureKeys.has(p.key) && ent[p.key] === false,
-    }));
+    const permissions = GRANTABLE_PERMISSIONS.filter(
+      (p) => !FEATURE_KEYS.has(p.key) || ent[p.key] !== false
+    );
     res.json({ permissions });
   })
 );

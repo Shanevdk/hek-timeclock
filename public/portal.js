@@ -405,7 +405,7 @@
   // `jobs` are the scheduled jobs for `day` (the day a clock-out would be
   // recorded against). The server decides that day, so the browser's own
   // timezone can't disagree about which one it is.
-  let clock = { clockedIn: false, since: null, missed: null, day: null, jobs: [] };
+  let clock = { canClock: true, clockedIn: false, since: null, missed: null, day: null, jobs: [] };
   let nowTimer = null;
   let lastOutBoundary = null; // quarter-hour the clock-out picker was built for
 
@@ -448,6 +448,14 @@
   // and the top-bar one (phone). Only one of them is visible at a time.
   function renderClockWidget() {
     const missed = !!clock.missed;
+    // Salaried staff have no clock. They still see it while a punch is open, so
+    // an entry started before they moved onto salary can be closed off.
+    const show = clock.canClock || clock.clockedIn || missed;
+    $('clockWidget').style.display = show ? '' : 'none';
+    // '' hands the bar button back to the stylesheet, which shows it on a phone
+    // and hides it on desktop; 'none' hides it at every width.
+    $('clockBtnBar').style.display = show ? '' : 'none';
+    if (!show) return;
     const label = missed ? 'Fix Clock Out' : clock.clockedIn ? 'Clock Out' : 'Clock In';
     const aria = missed
       ? 'Resolve missed clock-out'
@@ -469,6 +477,7 @@
     try {
       const s = await api('/api/my/clock-status');
       clock = {
+        canClock: s.canClock !== false,
         clockedIn: !!s.clockedIn,
         since: s.since || null,
         missed: s.missed || null,

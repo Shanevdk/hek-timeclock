@@ -334,9 +334,7 @@
             (p) => `<label class="perm${p.key === 'admin' ? ' perm-admin' : ''}">
               <input type="checkbox" value="${esc(p.key)}"${sel.has(p.key) ? ' checked' : ''} />
               <span>
-                <span class="perm-label">${markHit(p.label, q)}${
-                  p.off ? '<span class="perm-off">off for this account</span>' : ''
-                }</span>
+                <span class="perm-label">${markHit(p.label, q)}</span>
                 ${p.note ? `<span class="perm-note">${markHit(p.note, q)}</span>` : ''}
               </span>
             </label>`
