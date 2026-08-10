@@ -65,9 +65,13 @@
   let picked = { lat: null, lng: null }; // coords from the last chosen suggestion
   let allEmployees = [];
   let jobsCache = [];
+  let weekStart = null; // Monday of the week on screen (YYYY-MM-DD)
+  let dragId = null; // job being dragged between columns
 
   // Wire the admin form once, if we're on the admin page.
-  if ($('schedForm')) initAdmin();
+  // The board only exists on the dashboard, so it's what tells the two pages
+  // apart — the portal loads this same file for its own read-only view.
+  if ($('schedBoard')) initAdmin();
 
   function initAdmin() {
     const addr = $('schedAddr');
@@ -116,9 +120,128 @@
     });
 
     $('schedSave').addEventListener('click', saveJob);
-    $('schedCancel').addEventListener('click', resetForm);
-    $('schedBody').addEventListener('click', onTableClick);
+    $('schedCancel').addEventListener('click', closeForm);
+    // The heading tracks what's typed, so it never describes a different job.
+    $('schedDesc').addEventListener('input', paintHeader);
+    $('schedAddr').addEventListener('input', paintHeader);
+    $('schedDate').addEventListener('change', paintHeader);
+    $('jobModalBack').addEventListener('click', (e) => {
+      if (e.target === $('jobModalBack')) closeForm();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && $('jobModalBack').classList.contains('open')) closeForm();
+    });
+
+    // Takes the date off without touching anything else — the job drops back
+    // into "To be scheduled" rather than being lost.
+    $('schedUnschedule').addEventListener('click', async () => {
+      if (editingId == null) return;
+      try {
+        await api('/api/admin/schedules/' + editingId, {
+          method: 'PATCH',
+          body: JSON.stringify({ date: '', time: '' }),
+        });
+        closeForm();
+        await refreshJobs();
+      } catch (e) {
+        $('schedMsg').textContent = e.message;
+      }
+    });
+
+    $('schedDelete').addEventListener('click', async () => {
+      if (editingId == null) return;
+      if (!confirm('Delete this job? This cannot be undone.')) return;
+      try {
+        await api('/api/admin/schedules/' + editingId, { method: 'DELETE' });
+        closeForm();
+        await refreshJobs();
+      } catch (e) {
+        $('schedMsg').textContent = e.message;
+      }
+    });
+
+    // ---- board ----
+    $('schedPrev').addEventListener('click', () => { weekStart = addDays(weekStart, -7); renderBoard(); });
+    $('schedNext').addEventListener('click', () => { weekStart = addDays(weekStart, 7); renderBoard(); });
+    $('schedToday').addEventListener('click', () => { weekStart = mondayOf(todayStr()); renderBoard(); });
+    $('schedSearch').addEventListener('input', renderBoard);
+    $('schedNew').addEventListener('click', () => openForm(null));
+
+    const board = $('schedBoard');
+    board.addEventListener('click', onBoardClick);
+
+    // Dragging a card onto a day moves the job to that day; onto the backlog
+    // takes the date off again. The columns are the whole point of this view,
+    // so this is the fastest way to plan a week.
+    board.addEventListener('dragstart', (e) => {
+      const card = e.target.closest('.sched-card');
+      if (!card) return;
+      dragId = Number(card.dataset.id);
+      card.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox needs something in the payload before it will start a drag.
+      e.dataTransfer.setData('text/plain', String(dragId));
+    });
+    board.addEventListener('dragend', () => {
+      dragId = null;
+      board.querySelectorAll('.dragging').forEach((c) => c.classList.remove('dragging'));
+      board.querySelectorAll('.drop-over').forEach((c) => c.classList.remove('drop-over'));
+    });
+    board.addEventListener('dragover', (e) => {
+      const zone = e.target.closest('[data-drop]');
+      if (!zone || dragId == null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      zone.classList.add('drop-over');
+    });
+    board.addEventListener('dragleave', (e) => {
+      const zone = e.target.closest('[data-drop]');
+      if (zone && !zone.contains(e.relatedTarget)) zone.classList.remove('drop-over');
+    });
+    board.addEventListener('drop', async (e) => {
+      const zone = e.target.closest('[data-drop]');
+      if (!zone || dragId == null) return;
+      e.preventDefault();
+      zone.classList.remove('drop-over');
+      const id = dragId;
+      dragId = null;
+      const to = zone.dataset.drop; // '' means back to the backlog
+      const job = jobsCache.find((j) => j.id === id);
+      if (!job || (job.date || '') === to) return;
+      try {
+        // An empty string clears the date server-side; null would be ignored,
+        // because the route treats "not sent" and null the same way.
+        await api('/api/admin/schedules/' + id, {
+          method: 'PATCH',
+          body: JSON.stringify({ date: to }),
+        });
+        await refreshJobs();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
   }
+
+  // ---- dates ----
+  const DAY_MS = 86400000;
+  const todayStr = () => {
+    const d = new Date();
+    return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  };
+  function addDays(day, n) {
+    const [y, m, d] = day.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d) + n * DAY_MS).toISOString().slice(0, 10);
+  }
+  // The Monday on or before `day`, so a week always starts the same way.
+  function mondayOf(day) {
+    const [y, m, d] = day.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return addDays(day, -((dt.getUTCDay() + 6) % 7));
+  }
+  const dayLabel = (day, opts) => {
+    const [y, m, d] = day.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString([], { timeZone: 'UTC', ...opts });
+  };
 
   function renderEmpChecks(selected) {
     const sel = new Set(selected || []);
@@ -138,7 +261,8 @@
     );
 
   async function loadAdmin() {
-    if (!$('schedForm')) return;
+    if (!$('schedBoard')) return;
+    if (!weekStart) weekStart = mondayOf(todayStr());
     try {
       allEmployees = await api('/api/admin/employees');
     } catch (e) {
@@ -151,30 +275,131 @@
   async function refreshJobs() {
     const d = await api('/api/admin/schedules');
     jobsCache = d.jobs || [];
-    $('schedEmpty').style.display = jobsCache.length ? 'none' : 'block';
-    $('schedBody').innerHTML = jobsCache
-      .map(
-        (j) => `<tr class="clickable-row" data-id="${j.id}" title="Click to edit this job">
-          <td>${esc(fmtWhen(j))}</td>
-          <td><a href="${mapsUrl(j)}" target="_blank" rel="noopener">${esc(j.address)}</a></td>
-          <td>${j.description ? esc(j.description) : '<span style="color:var(--muted)">—</span>'}</td>
-          <td>${
-            j.employees && j.employees.length
-              ? esc(j.employees.join(', '))
-              : '<span style="color:var(--muted)">Unassigned</span>'
-          }</td>
-          <td style="text-align:right;white-space:nowrap">
-            <button class="link-btn danger" data-del="${j.id}">Delete</button>
-          </td>
-        </tr>`
-      )
-      .join('');
+    renderBoard();
   }
 
-  async function onTableClick(ev) {
-    if (ev.target.closest('a')) return; // let the address (maps) link open normally
+  // Initials for the crew chips on a card. Falls back to the first letters of
+  // the name when nobody has filled the initials field in.
+  function initialsFor(id) {
+    const e = allEmployees.find((x) => x.id === id);
+    if (!e) return '?';
+    if (e.initials) return e.initials.slice(0, 3).toUpperCase();
+    return (e.name || '?')
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((w) => w[0] || '')
+      .join('')
+      .toUpperCase();
+  }
+
+  function cardHtml(job) {
+    const crew = job.employee_ids || [];
+    const late = job.date && job.date < todayStr();
+    const state = !crew.length ? 'nocrew' : late ? 'past' : 'ok';
+    const title = (job.description || '').split('\n')[0].trim() || job.address;
+    // Late against what the customer asked for — the thing worth spotting from
+    // across the room.
+    const overdue = job.due_date && job.date && job.date > job.due_date;
+    return `<article class="sched-card ${state}" draggable="true" data-id="${job.id}"
+              title="Click to open · drag to another day">
+      <div class="sched-card-title">${esc(title)}</div>
+      <a class="sched-card-addr" href="${mapsUrl(job)}" target="_blank" rel="noopener"
+         title="Open directions">📍 ${esc(job.address)}</a>
+      <div class="sched-card-meta">
+        ${job.time ? `<span class="sched-card-time">${esc(job.time)}</span>` : ''}
+        ${job.job_type && job.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(job.job_type)}</span>` : ''}
+        ${job.confirmed ? '<span class="sched-tag ok">Confirmed</span>' : ''}
+      </div>
+      ${
+        job.due_date
+          ? `<div class="sched-req${overdue ? ' late' : ''}">Req: ${esc(
+              dayLabel(job.due_date, { month: 'short', day: 'numeric' })
+            )}</div>`
+          : ''
+      }
+      <div class="sched-card-foot">
+        ${
+          crew.length
+            ? crew.map((id) => `<span class="sched-chip" title="${esc(
+                (allEmployees.find((e) => e.id === id) || {}).name || ''
+              )}">${esc(initialsFor(id))}</span>`).join('')
+            : '<span class="sched-nocrew">No crew yet</span>'
+        }
+        <button class="link-btn danger sched-del" data-del="${job.id}" title="Delete">✕</button>
+      </div>
+    </article>`;
+  }
+
+  const columnHtml = (opts) =>
+    `<div class="sched-col ${opts.cls || ''}">
+      <div class="sched-col-head">
+        <div class="sched-col-name">${opts.name}</div>
+        ${opts.sub ? `<div class="sched-col-sub">${opts.sub}</div>` : ''}
+        <span class="sched-col-count">${opts.jobs.length}</span>
+      </div>
+      <div class="sched-col-body"${opts.drop != null ? ` data-drop="${opts.drop}"` : ''}>
+        ${opts.jobs.map(cardHtml).join('') || `<p class="sched-col-empty">${opts.empty || ''}</p>`}
+      </div>
+    </div>`;
+
+  function renderBoard() {
+    const board = $('schedBoard');
+    if (!board) return;
+    const needle = ($('schedSearch').value || '').trim().toLowerCase();
+    const match = (j) =>
+      !needle ||
+      (j.address || '').toLowerCase().includes(needle) ||
+      (j.description || '').toLowerCase().includes(needle);
+
+    const jobs = jobsCache.filter(match);
+    const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+    const weekEnd = days[6];
+    $('schedRange').textContent =
+      dayLabel(weekStart, { month: 'short', day: 'numeric' }) +
+      ' – ' +
+      dayLabel(weekEnd, { month: 'short', day: 'numeric', year: 'numeric' });
+    $('schedEmpty').style.display = jobsCache.length ? 'none' : 'block';
+
+    const today = todayStr();
+    const cols = [
+      columnHtml({
+        cls: 'backlog',
+        name: 'To be scheduled',
+        sub: 'No date yet',
+        drop: '',
+        jobs: jobs.filter((j) => !j.date),
+        empty: 'Everything has a date.',
+      }),
+      ...days.map((day) =>
+        columnHtml({
+          cls: 'day' + (day === today ? ' is-today' : '') + (day < today ? ' is-past' : ''),
+          name: dayLabel(day, { weekday: 'short' }),
+          sub: dayLabel(day, { month: 'short', day: 'numeric' }),
+          drop: day,
+          jobs: jobs.filter((j) => j.date === day),
+          empty: '',
+        })
+      ),
+      // A dispatcher's checklist, not a bucket — these cards also sit in their
+      // own day column, which is why this one takes no drops.
+      columnHtml({
+        cls: 'needcrew',
+        name: 'Needs a crew',
+        sub: 'This week',
+        jobs: jobs.filter(
+          (j) => j.date && j.date >= weekStart && j.date <= weekEnd && !(j.employee_ids || []).length
+        ),
+        empty: 'Every job this week has a crew.',
+      }),
+    ];
+    board.innerHTML = cols.join('');
+  }
+
+  async function onBoardClick(ev) {
+    if (ev.target.closest('a')) return; // let the address link open the map
     const del = ev.target.closest('button[data-del]');
     if (del) {
+      ev.stopPropagation();
       const id = Number(del.dataset.del);
       if (!confirm('Delete this job?')) return;
       try {
@@ -185,25 +410,53 @@
       }
       return;
     }
-    const row = ev.target.closest('tr[data-id]');
-    if (row) startEdit(Number(row.dataset.id));
+    const card = ev.target.closest('.sched-card');
+    if (card) startEdit(Number(card.dataset.id));
+  }
+
+  // ---- job detail modal ----
+  function openForm(job) {
+    if (!job) resetForm();
+    $('jobModalBack').classList.add('open');
+    if (!job) $('schedAddr').focus();
+  }
+  function closeForm() {
+    $('jobModalBack').classList.remove('open');
+    resetForm();
+  }
+
+  // The heading mirrors the card: who it's for on the left, when it lands on
+  // the right, so the modal is recognisably the same job you clicked.
+  function paintHeader() {
+    const title = ($('schedDesc').value || '').split('\n')[0].trim();
+    $('jobTitle').textContent = title || $('schedAddr').value.trim() || 'New job';
+    const d = $('schedDate').value;
+    $('jobWhen').textContent = d
+      ? dayLabel(d, { weekday: 'long', month: 'long', day: 'numeric' })
+      : 'Not scheduled';
+    $('jobWhen').classList.toggle('unscheduled', !d);
   }
 
   function startEdit(id) {
     const j = jobsCache.find((x) => x.id === id);
     if (!j) return;
     editingId = id;
-    $('schedFormTitle').textContent = 'Edit job';
     $('schedAddr').value = j.address || '';
     picked = { lat: j.lat, lng: j.lng };
     $('schedDesc').value = j.description || '';
     $('schedDate').value = j.date || '';
     $('schedTime').value = j.time || '';
+    $('schedDue').value = j.due_date || '';
+    $('schedType').value = j.job_type || 'Delivery';
+    $('schedNotesDriver').value = j.notes_driver || '';
+    $('schedNotesInternal').value = j.notes_internal || '';
+    $('schedConfirmed').checked = !!j.confirmed;
     renderEmpChecks(j.employee_ids || []);
-    $('schedSave').textContent = 'Update job';
-    $('schedCancel').style.display = 'inline-block';
+    $('schedUnschedule').style.display = j.date ? '' : 'none';
+    $('schedDelete').style.display = '';
     $('schedMsg').textContent = '';
-    $('schedForm').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    paintHeader();
+    openForm(j);
   }
 
   function resetForm() {
@@ -213,13 +466,19 @@
     $('schedDesc').value = '';
     $('schedDate').value = '';
     $('schedTime').value = '';
+    $('schedDue').value = '';
+    $('schedType').value = 'Delivery';
+    $('schedNotesDriver').value = '';
+    $('schedNotesInternal').value = '';
+    $('schedConfirmed').checked = false;
     $('schedSuggest').innerHTML = '';
     $('schedSuggest').style.display = 'none';
     renderEmpChecks([]);
-    $('schedFormTitle').textContent = 'Add job';
-    $('schedSave').textContent = 'Add job';
-    $('schedCancel').style.display = 'none';
+    // Nothing to unschedule or delete until the job exists.
+    $('schedUnschedule').style.display = 'none';
+    $('schedDelete').style.display = 'none';
     $('schedMsg').textContent = '';
+    paintHeader();
   }
 
   async function saveJob() {
@@ -236,6 +495,11 @@
       description: $('schedDesc').value,
       date: $('schedDate').value,
       time: $('schedTime').value,
+      due_date: $('schedDue').value,
+      job_type: $('schedType').value,
+      notes_driver: $('schedNotesDriver').value,
+      notes_internal: $('schedNotesInternal').value,
+      confirmed: $('schedConfirmed').checked,
       lat: picked.lat,
       lng: picked.lng,
       employee_ids: collectEmps(),
@@ -253,7 +517,7 @@
           body: JSON.stringify(payload),
         });
       }
-      resetForm();
+      closeForm();
       await refreshJobs();
     } catch (e) {
       msg.textContent = e.message;

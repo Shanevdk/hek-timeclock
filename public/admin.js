@@ -8,10 +8,20 @@
 
   // ---- API helper ----
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
-      ...opts,
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+      });
+    } catch (err) {
+      // fetch() only rejects when the request never got a reply at all — the
+      // server is stopped, the connection dropped, or the device is offline.
+      // The browser's own wording for this is "Failed to fetch", which reads
+      // like the app did something wrong and sends people looking in the wrong
+      // place. Say what actually happened.
+      throw new Error("Couldn't reach the server — it may have stopped, or you're offline. Nothing was saved.");
+    }
     // A 401 on a normal request means the session expired — bounce to login.
     // The login request itself is allowed to surface its own error message.
     if (res.status === 401 && path !== '/api/admin/login') {
@@ -28,7 +38,13 @@
     } catch (e) {
       data = null;
     }
-    if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status}).`);
+    if (!res.ok) {
+      const err = new Error((data && data.error) || `Request failed (${res.status}).`);
+      // Some endpoints attach the upstream reason (e.g. a QuickBooks validation
+      // fault) as "detail" — keep it so the caller can show what went wrong.
+      if (data && data.detail) err.detail = data.detail;
+      throw err;
+    }
     if (data === null)
       throw new Error('The server returned an unexpected response. Please refresh the page and sign in again.');
     return data;
@@ -88,7 +104,18 @@
     if (isDev) applyDevRestrictions();
     else {
       applyEntitlements(currentFeatures);
-      showLive();
+      // Back to whichever tab was open before the refresh; "On the clock" only
+      // when there is nothing to go back to.
+      if (!restoreTab()) showLive();
+      // Returning from QuickBooks' consent screen lands here with the outcome
+      // in the URL — let that module open its own tab on the result.
+      if (window.QuickBooks) window.QuickBooks.afterLogin();
+      // Show how many emails are waiting without making them open the tab.
+      if (window.Inbox && currentFeatures && currentFeatures.inbox !== false)
+        window.Inbox.refreshCount();
+      // Same for quote requests sent in from the public estimate page.
+      if (window.Estimates && currentFeatures && currentFeatures.estimate !== false)
+        window.Estimates.refreshCount();
     }
   }
 
@@ -100,6 +127,24 @@
       const sec = $('tab-' + name);
       if (sec) sec.classList.remove('active');
     }
+    syncNavGroups();
+  }
+
+  const navVisible = (el) => el.style.display !== 'none';
+
+  // Keep the grouped nav tidy after tabs are hidden: a section with nothing
+  // left under it disappears rather than sitting there as an empty heading,
+  // and whichever section ends up first loses its divider so the list doesn't
+  // start with a stray line.
+  function syncNavGroups() {
+    document.querySelectorAll('.side-nav .side-group').forEach((group) => {
+      const items = [...group.querySelectorAll('.tab')];
+      group.style.display = items.some(navVisible) ? '' : 'none';
+    });
+    const blocks = [...document.querySelectorAll('.side-nav > .side-group, .side-nav > .side-solo')];
+    blocks.forEach((el) => el.classList.remove('side-first'));
+    const first = blocks.find(navVisible);
+    if (first) first.classList.add('side-first');
   }
 
   // For the real admin: hide any feature the dev has switched off. Data-driven
@@ -111,6 +156,7 @@
     Object.keys(features).forEach((key) => {
       if (features[key] === false) setTabVisible(key, false);
     });
+    syncNavGroups();
   }
 
   // The "dev" account is a limited admin: hide the clock-in features it can't use,
@@ -120,16 +166,19 @@
     ['live', 'sheets'].forEach((t) => setTabVisible(t, false));
     const devTab = $('devAccessTab');
     if (devTab) devTab.style.display = '';
+    syncNavGroups();
     // The dev account's login comes from the environment — hide that editor.
     ['acLabel', 'acEmail', 'acPass', 'acSave', 'acMsg'].forEach((id) => {
       const el = $(id);
       if (el) el.style.display = 'none';
     });
-    // Label the signed-in account and open the first available tab.
+    // Label the signed-in account, then go back to the tab that was open before
+    // the refresh, or the first one available.
     const ue = $('userEmail');
     if (ue) ue.textContent = 'dev';
     const av = $('userAvatar');
     if (av) av.textContent = 'D';
+    if (restoreTab()) return;
     const firstTab = [...document.querySelectorAll('.side-nav .tab')].find(
       (t) => t.style.display !== 'none'
     );
@@ -205,9 +254,52 @@
   $('sidebarBackdrop').addEventListener('click', () => setMenu(false));
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenu(false); });
 
+  // ---- Which tab is open, remembered in the URL ----
+  // A refresh (or a reconnect after the session drops) comes back to the same
+  // tab instead of the default one, and a tab can be linked to directly.
+  //
+  // The name is written as "#tab=quotes" rather than "#quotes" on purpose: a
+  // bare fragment that happens to match an element id — "#map" does — makes the
+  // browser scroll to it on load. Prefixing keeps that from ever happening.
+  const TAB_HASH = /^#tab=([a-z-]+)$/;
+
+  function rememberTab(name) {
+    try {
+      history.replaceState(null, '', location.pathname + location.search + '#tab=' + name);
+    } catch (e) {
+      /* history is unavailable in some embedded views — the tab still works */
+    }
+  }
+
+  // The tab named in the URL, but only if it is one this account can actually
+  // open. A stale link to a switched-off feature falls back to the default.
+  function tabFromUrl() {
+    const m = TAB_HASH.exec(location.hash || '');
+    if (!m) return null;
+    const tab = document.querySelector('.side-nav .tab[data-tab="' + m[1] + '"]');
+    if (!tab || tab.style.display === 'none') return null;
+    return tab;
+  }
+
+  // Open the tab from the URL. Returns false when there was nothing to restore,
+  // so the caller can fall back to its own default.
+  function restoreTab() {
+    const tab = tabFromUrl();
+    if (!tab) return false;
+    tab.click();
+    return true;
+  }
+
+  // Someone editing the address bar, or a browser restoring an older entry.
+  window.addEventListener('hashchange', () => {
+    const tab = tabFromUrl();
+    if (tab && !tab.classList.contains('active')) tab.click();
+  });
+
   // ---- Tabs ----
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => {
+      rememberTab(t.dataset.tab);
       document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
       document.querySelectorAll('.section').forEach((x) => x.classList.remove('active'));
       t.classList.add('active');
@@ -225,6 +317,16 @@
       if (t.dataset.tab === 'messages' && window.Messages)
         window.Messages.load().catch((e) => alert(e.message));
       if (t.dataset.tab === 'access') loadDevFeatures().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'quickbooks' && window.QuickBooks)
+        window.QuickBooks.load().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'pricing' && window.Pricing)
+        window.Pricing.load().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'invoices' && window.Invoices)
+        window.Invoices.load().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'inbox' && window.Inbox)
+        window.Inbox.load().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'estimate' && window.Estimates)
+        window.Estimates.load().catch((e) => alert(e.message));
       setMenu(false); // close the popout after choosing a tab
     });
   });
@@ -752,10 +854,24 @@
           .join('')}</div>`
       : '';
 
+  // Distance travelled for a row: worked out from the jobs tagged onto it and
+  // how far each is from the shop. A dash means no job on that entry had a
+  // position — different from having travelled nothing.
+  const kmCell = (r) =>
+    r.km != null
+      ? `<strong>${r.km.toFixed(1).replace(/\.0$/, '')}</strong>`
+      : '<span style="color:var(--muted)">—</span>';
+
   function renderTimesheet(data) {
     const entries = data.entries || [];
     $('tsTotal').textContent = (data.totalHours || 0).toFixed(2);
     $('tsEntries').textContent = entries.length;
+    $('tsKm').textContent = (data.totalKm || 0).toFixed(1).replace(/\.0$/, '');
+    if (data.mileage) {
+      $('tsRoundTrip').checked = data.mileage.round_trip !== false;
+      $('tsKmLabel').textContent =
+        data.mileage.round_trip !== false ? 'Km travelled (return)' : 'Km travelled (one way)';
+    }
     $('tsEmpty').style.display = entries.length ? 'none' : 'block';
     $('tsBody').innerHTML = entries
       .map(
@@ -764,6 +880,7 @@
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
           <td>${r.hours != null ? r.hours.toFixed(2) : '—'}</td>
+          <td>${kmCell(r)}</td>
           <td>${jobChips(r)}${r.work_done ? esc(r.work_done) : '<span style="color:var(--muted)">—</span>'}${
             r.missed_reason
               ? `<div style="font-size:12px;color:var(--red)">missed: ${esc(r.missed_reason)}</div>`
@@ -786,6 +903,22 @@
   $('tsLoad').addEventListener('click', () => loadTimesheet().catch((e) => alert(e.message)));
   $('tsExport').addEventListener('click', () => {
     window.location = '/api/admin/export.csv?' + buildQuery();
+  });
+
+  // Whether mileage counts the drive home. Changing it re-reads every range,
+  // so the cached figures can't disagree with the setting.
+  $('tsRoundTrip').addEventListener('change', async () => {
+    try {
+      await api('/api/admin/mileage', {
+        method: 'PATCH',
+        body: JSON.stringify({ round_trip: $('tsRoundTrip').checked }),
+      });
+      tsCache.clear();
+      await loadTimesheet();
+    } catch (e) {
+      $('tsRoundTrip').checked = !$('tsRoundTrip').checked; // put it back
+      alert(e.message);
+    }
   });
 
   $('tsBody').addEventListener('click', (ev) => {
@@ -934,14 +1067,104 @@
       map.setView([lat, lng], 16);
     }, 0);
   }
+  // ---- map badges ----
+  // Drawn as divIcons rather than image pins so they follow the theme colours
+  // and stay sharp at any zoom.
+  const SHOP_GLYPH =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M3 10.5 12 4l9 6.5" /><path d="M5 10v9h14v-9" />' +
+    '<path d="M9.5 19v-5h5v5" /></svg>';
+  const JOB_GLYPH =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round">' +
+    // A fence: three pickets on two rails.
+    '<path d="M5 21V7l2-3 2 3v14" /><path d="M11 21V7l2-3 2 3v14" />' +
+    '<path d="M17 21V7l2-3 2 3v14" opacity=".55" />' +
+    '<path d="M3 11h18M3 16h18" /></svg>';
+
+  const shopIcon = () =>
+    L.divIcon({
+      className: 'map-badge map-badge-shop',
+      html: `<span class="mb-ring"></span><span class="mb-glyph">${SHOP_GLYPH}</span>`,
+      iconSize: [40, 40],
+      iconAnchor: [20, 20],
+      popupAnchor: [0, -18],
+    });
+
+  const jobIcon = () =>
+    L.divIcon({
+      className: 'map-badge map-badge-job',
+      html: `<span class="mb-glyph">${JOB_GLYPH}</span>`,
+      iconSize: [32, 32],
+      iconAnchor: [16, 16],
+      popupAnchor: [0, -14],
+    });
+
+  const km = (n) => (n == null ? '—' : n.toFixed(1).replace(/\.0$/, '') + ' km');
+
   async function loadMap() {
     if (!map) return;
-    const rows = await api('/api/admin/locations?' + mapQuery());
+    // Punches and jobs are independent; fetch together so one slow query does
+    // not hold up the other.
+    const [rows, plan] = await Promise.all([
+      api('/api/admin/locations?' + mapQuery()),
+      api('/api/admin/map?' + mapQuery()),
+    ]);
     mapMarkers.forEach((m) => map.removeLayer(m));
     mapMarkers = [];
-    $('mapEmpty').style.display = rows.length ? 'none' : 'block';
-    if (!rows.length) return;
+    const jobs = (plan && plan.jobs) || [];
+    const shop = plan && plan.shop;
     const bounds = [];
+
+    // The shop, and the yardstick everything else is measured from.
+    if (shop) {
+      const mk = L.marker([shop.lat, shop.lng], {
+        icon: shopIcon(),
+        title: 'The shop',
+        zIndexOffset: 1000, // always on top of the job pins
+        draggable: true,
+      }).addTo(map);
+      mk.bindPopup(
+        `<b>The shop</b><br>${esc(shop.address)}` +
+          (shop.exact
+            ? ''
+            : '<br><span class="mp-warn">Approximate — drag this pin onto the yard to fix it.</span>')
+      );
+      // Dragging it is how the exact spot gets recorded; distances then redraw.
+      mk.on('dragend', async () => {
+        const p = mk.getLatLng();
+        try {
+          await api('/api/admin/shop', {
+            method: 'PATCH',
+            body: JSON.stringify({ lat: p.lat, lng: p.lng }),
+          });
+          await loadMap();
+        } catch (e) {
+          alert(e.message);
+          await loadMap();
+        }
+      });
+      mapMarkers.push(mk);
+      bounds.push([shop.lat, shop.lng]);
+    }
+
+    // Scheduled jobs, each with how far it is from the shop.
+    jobs.forEach((j) => {
+      const mk = L.marker([j.lat, j.lng], { icon: jobIcon(), title: j.address }).addTo(map);
+      const when = [j.date ? fmtDay(j.date) : 'No date set', j.time || ''].filter(Boolean).join(' · ');
+      mk.bindPopup(
+        `<b>${esc(j.address)}</b>` +
+          (j.description ? `<br>${esc(j.description)}` : '') +
+          `<br><span class="mp-dim">${esc(when)}</span>` +
+          (j.crew.length ? `<br><span class="mp-dim">${esc(j.crew.join(', '))}</span>` : '') +
+          `<br><b class="mp-km">${km(j.km)}</b> <span class="mp-dim">from the shop (straight line)</span>`
+      );
+      mapMarkers.push(mk);
+      bounds.push([j.lat, j.lng]);
+    });
+
+    // Clock-ins stay as plain dots — they are readings, not places.
     rows.forEach((r) => {
       const mk = L.circleMarker([r.lat, r.lng], {
         radius: 8, color: '#a97f43', fillColor: '#c89b5c', fillOpacity: 0.9, weight: 2,
@@ -950,7 +1173,43 @@
       mapMarkers.push(mk);
       bounds.push([r.lat, r.lng]);
     });
-    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
+
+    renderMapLegend(jobs, plan && plan.unmapped);
+    $('mapEmpty').style.display = rows.length || jobs.length ? 'none' : 'block';
+    // Never zoom to just the shop — a lone pin at max zoom looks broken.
+    if (bounds.length > 1) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
+    else if (bounds.length === 1) map.setView(bounds[0], 12);
+  }
+
+  // A list under the map: every job, nearest first, so distances can be read
+  // without clicking each pin.
+  function renderMapLegend(jobs, unmapped) {
+    const box = $('mapJobs');
+    if (!box) return;
+    if (!jobs.length) {
+      box.innerHTML = unmapped
+        ? `<p class="status-sub" style="margin:0">${unmapped} scheduled job${unmapped > 1 ? 's have' : ' has'} no position yet — pick an address from the suggestions when adding one.</p>`
+        : '<p class="status-sub" style="margin:0">No scheduled jobs in this range.</p>';
+      return;
+    }
+    const sorted = [...jobs].sort((a, b) => (a.km ?? 1e9) - (b.km ?? 1e9));
+    box.innerHTML =
+      `<table><thead><tr><th>Job</th><th>When</th><th>Crew</th><th>From shop</th></tr></thead><tbody>` +
+      sorted
+        .map(
+          (j) => `<tr class="clickable-row" data-job="${j.id}">
+            <td><strong>${esc(j.address)}</strong>${j.description ? `<div class="mp-dim">${esc(j.description)}</div>` : ''}</td>
+            <td class="qb-dim">${j.date ? esc(fmtDay(j.date)) : '—'}${j.time ? ' ' + esc(j.time) : ''}</td>
+            <td class="qb-dim">${j.crew.length ? esc(j.crew.join(', ')) : '—'}</td>
+            <td><strong>${km(j.km)}</strong></td>
+          </tr>`
+        )
+        .join('') +
+      '</tbody></table>' +
+      (unmapped
+        ? `<p class="status-sub" style="margin:10px 0 0">${unmapped} more job${unmapped > 1 ? 's have' : ' has'} no position — pick an address from the suggestions to put ${unmapped > 1 ? 'them' : 'it'} on the map.</p>`
+        : '') +
+      '<p class="status-sub" style="margin:10px 0 0">Distances are straight-line from the shop, so the drive is always a little longer.</p>';
   }
   // The map tab is optional markup — only wire it if it's present on the page,
   // so a build without the map section doesn't break the whole dashboard.

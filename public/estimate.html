@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0d0d0d" />
+    <!-- Set the saved theme before first paint so there is no flash. -->
+    <script>
+      try { document.documentElement.dataset.theme = localStorage.getItem('hek-theme') || 'system'; }
+      catch (e) { document.documentElement.dataset.theme = 'system'; }
+    </script>
+    <title>HEK Fencing — Fence Estimate</title>
+    <meta name="description" content="Price your fence in a minute, then ask HEK Fencing for a full quote." />
+
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="/icon-192.png" />
+    <!-- Leaflet, for tracing the fence on the customer's own property -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+
+    <!-- three.js for the 3D fence preview. Module-only these days, so it comes
+         in through an import map; fence3d.js hands the viewer to estimate.js. -->
+    <script type="importmap">
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+    </script>
+    <script type="module">
+      import { FencePreview, styleForService, styleList } from '/fence3d.js';
+      window.Fence3D = { FencePreview, styleForService, styleList };
+      window.dispatchEvent(new Event('fence3d-ready'));
+    </script>
+
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="est-page">
+    <div class="wrap est-wrap">
+      <div class="brand">
+        <div class="hek">HEK</div>
+        <div class="sub">FENCING</div>
+        <div class="inc">Inc.</div>
+      </div>
+
+      <!-- Shown while the config loads, and if the page is switched off -->
+      <div class="card" id="estLoading">
+        <p class="status-sub" style="margin:0">Loading…</p>
+      </div>
+
+      <div class="card" id="estOffline" style="display:none">
+        <h2 style="text-align:center;margin-top:0">Estimates are closed right now</h2>
+        <p class="status-sub" style="margin:0">
+          Our instant estimate tool is unavailable at the moment. Please get in
+          touch and we will price your job by hand.
+        </p>
+      </div>
+
+      <!-- The estimate builder -->
+      <div id="estMain" style="display:none">
+        <div class="card">
+          <h2 style="text-align:center;margin-top:0" id="estHeadline">Get an instant fence estimate</h2>
+          <p class="status-sub" id="estIntro" style="margin-bottom:18px"></p>
+
+          <!-- Measure on the map: find the property, trace the fence line -->
+          <div class="est-measure">
+            <div class="est-measure-head">
+              <h3>Not sure how many feet?</h3>
+              <button class="btn ghost sm" id="mapToggle" type="button">Measure on a map</button>
+            </div>
+            <p class="est-measure-hint" id="mapHint" style="display:none">
+              Find your property, then click along where the fence goes. Each click adds a
+              corner. Switch to <b>Satellite</b> to see your yard.
+            </p>
+
+            <div id="mapPanel" style="display:none">
+              <div class="est-search">
+                <input id="mapSearch" placeholder="Your address, e.g. 123 Maple St, Norwich ON"
+                       autocomplete="off" autocapitalize="none" spellcheck="false" />
+                <button class="btn gold sm" id="mapSearchBtn" type="button">Find</button>
+                <button class="btn ghost sm est-locate" id="mapLocate" type="button"
+                        title="Centre the map on where you are">📍 <span>My location</span></button>
+              </div>
+              <div class="est-locating" id="mapLocating" style="display:none"></div>
+              <div class="est-results" id="mapResults" style="display:none"></div>
+
+              <div class="est-map-wrap">
+                <div id="estMap"></div>
+                <div class="est-layers">
+                  <button type="button" class="active" data-layer="sat">Satellite</button>
+                  <button type="button" data-layer="street">Map</button>
+                </div>
+              </div>
+
+              <div class="est-measure-bar">
+                <div class="est-length">
+                  <span class="est-length-n" id="mapFeet">0</span>
+                  <span class="est-length-u">ft</span>
+                  <span class="est-length-m" id="mapMetres">0 m</span>
+                </div>
+                <div class="est-measure-btns">
+                  <button class="btn ghost sm" id="mapUndo" type="button">Undo</button>
+                  <button class="btn ghost sm" id="mapNewRun" type="button" title="Start a separate stretch of fence">New run</button>
+                  <button class="btn ghost sm" id="mapClear" type="button">Clear</button>
+                </div>
+              </div>
+              <button class="btn gold sm" id="mapUse" type="button" style="width:100%;margin-top:10px" disabled>
+                Use this length
+              </button>
+              <button class="btn ghost sm" id="map3d" type="button" style="width:100%;margin-top:8px" disabled>
+                See it on your property in 3D
+              </button>
+              <p class="est-measure-hint" style="margin-top:10px">
+                Measured along the ground, so it does not allow for slopes or obstructions.
+                We confirm it on site.
+              </p>
+            </div>
+          </div>
+
+          <!-- 3D preview: the traced fence standing on aerial imagery of the yard -->
+          <div class="est-3d" id="est3d" style="display:none">
+            <div class="est-3d-head">
+              <h3>Your fence, on your property</h3>
+              <button class="btn ghost sm" id="est3dHide" type="button">Hide</button>
+            </div>
+            <div class="est-3d-controls">
+              <div class="field"><label for="est3dStyle">Fence style</label>
+                <select id="est3dStyle"></select></div>
+              <div class="field"><label for="est3dHeight">Height</label>
+                <select id="est3dHeight">
+                  <option value="3">3 ft</option>
+                  <option value="4">4 ft</option>
+                  <option value="5">5 ft</option>
+                  <option value="6" selected>6 ft</option>
+                  <option value="7">7 ft</option>
+                  <option value="8">8 ft</option>
+                </select></div>
+            </div>
+            <div class="est-3d-stage">
+              <canvas id="est3dCanvas"></canvas>
+              <div class="est-3d-note" id="est3dNote">Building your fence…</div>
+            </div>
+            <div class="est-3d-bar">
+              <span class="est-3d-hint">Drag to look around · scroll or pinch to zoom</span>
+              <button class="btn ghost sm" id="est3dSave" type="button">Save picture</button>
+            </div>
+
+            <!-- From the road. Only offered when a Google key is set up. -->
+            <div class="est-sv" id="estSv" style="display:none">
+              <div class="est-3d-head">
+                <h3>From the road</h3>
+                <label class="est-sv-toggle">
+                  <input type="checkbox" id="estSvFence" /> Show the fence
+                </label>
+              </div>
+              <div class="est-sv-stage">
+                <img id="estSvImg" alt="The property seen from the road" />
+                <canvas id="estSvCanvas"></canvas>
+              </div>
+              <p class="est-sv-msg" id="estSvMsg"></p>
+            </div>
+          </div>
+
+          <div id="estLines"></div>
+
+          <button class="btn ghost sm" id="estAdd" style="margin-top:12px">+ Add another item</button>
+
+          <div class="est-totals" id="estTotals">
+            <div class="totals-line"><span>Subtotal</span><span id="estSubtotal">$0.00</span></div>
+            <div class="totals-line"><span>Tax <span id="estTaxRate">0</span>%</span><span id="estTax">$0.00</span></div>
+            <div class="totals-line grand"><span>Estimate</span><span id="estTotal">$0.00</span></div>
+            <p class="est-min" id="estMinNote" style="display:none">
+              A minimum job charge has been applied.
+            </p>
+          </div>
+
+          <p class="est-foot" id="estFootnote"></p>
+
+          <div class="est-disclaimer" id="estDisclaimer" style="display:none">
+            <span class="est-disclaimer-label">Please note</span>
+            <p id="estDisclaimerText"></p>
+          </div>
+
+          <button class="btn gold" id="estRequest" style="margin-top:16px" disabled>
+            Request a quote
+          </button>
+        </div>
+      </div>
+
+      <!-- Sent -->
+      <div class="card" id="estDone" style="display:none">
+        <h2 style="text-align:center;margin-top:0">Thanks — we have it</h2>
+        <p class="status-sub">
+          Your request is with our office. We will be in touch to confirm the
+          details and give you a firm price.
+        </p>
+        <p class="status-sub" style="margin-bottom:0">
+          Your reference is <strong id="estRef"></strong>.
+        </p>
+      </div>
+    </div>
+
+    <!-- Contact details, asked for only when they press "Request a quote" -->
+    <div class="modal-back" id="estModalBack">
+      <div class="modal">
+        <h3 style="margin-top:0">Request a quote</h3>
+        <p class="status-sub" style="text-align:left;margin:0 0 16px">
+          Your estimate is <strong id="estModalTotal">$0.00</strong>. Leave your
+          details and we will confirm it.
+        </p>
+        <label for="estName">Your name *</label>
+        <input id="estName" style="width:100%;margin-bottom:12px" autocomplete="name" />
+        <label for="estEmail">Email</label>
+        <input id="estEmail" type="email" style="width:100%;margin-bottom:12px" autocomplete="email"
+               autocapitalize="none" autocorrect="off" spellcheck="false" />
+        <label for="estPhone">Phone</label>
+        <input id="estPhone" style="width:100%;margin-bottom:12px" autocomplete="tel" />
+        <label for="estAddress">Job site address</label>
+        <input id="estAddress" style="width:100%;margin-bottom:12px" autocomplete="street-address" />
+        <label for="estNotes">Anything else we should know?</label>
+        <textarea id="estNotes" rows="3" placeholder="e.g. gate on the north side, sloped ground"></textarea>
+        <p class="est-modal-disclaimer" id="estModalDisclaimer" style="display:none"></p>
+        <div class="msg err" id="estMsg"></div>
+        <div class="cm-foot">
+          <button class="btn gold" id="estSend" type="button">Send request</button>
+          <button class="btn ghost" id="estCancel" type="button">Back</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/estimate.js"></script>
+    <script src="/theme.js"></script>
+  </body>
+</html>

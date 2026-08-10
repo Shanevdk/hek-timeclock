@@ -3,5 +3,9 @@ data/
 dist/
 .netlify/
 *.log
+# Every env file, not just .env — a backup like .env.backup-atlas holds the
+# same live database password and this repo is public.
 .env
+.env.*
+!.env.example
 .DS_Store

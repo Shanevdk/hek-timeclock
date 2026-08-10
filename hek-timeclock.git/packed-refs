@@ -1,0 +1,9 @@
+# pack-refs with: peeled fully-peeled sorted 
+c2d04eb74b016ddd9d819f077bc7a544bb8e7f8c refs/heads/hek-1
+a761836643fa64705f5510d687953240bfea708c refs/heads/hek-2
+db3a80ab0b2f93a47aa3e748f1f223c41fec1aff refs/heads/hek-3
+1a90431d2f4cd0898df7281dcc13bc26fbfff9aa refs/heads/main
+7925371ce968ac55383bfdfc94b742e0da1d23b8 refs/pull/1/head
+a761836643fa64705f5510d687953240bfea708c refs/pull/2/head
+c0dbd28e2d2e12be9d0c946898021ec595cfbec1 refs/pull/3/head
+db3a80ab0b2f93a47aa3e748f1f223c41fec1aff refs/pull/4/head

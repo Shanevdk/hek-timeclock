@@ -24,6 +24,10 @@ const store = {
   vacations: null,
   bulletins: null,
   settings: null,
+  qboTime: null,
+  qboRuns: null,
+  invoices: null,
+  inboxLeads: null,
   nextId,
 };
 
@@ -72,8 +76,27 @@ async function doConnect() {
   // employee sees the ones targeted to them; the admin tracks who has read each.
   store.bulletins = store.db.collection('bulletins');
   // Small key/value collection for app config — currently the admin login
-  // credentials (doc _id: 'admin'), seeded from env on first run.
+  // credentials (doc _id: 'admin'), seeded from env on first run, and the
+  // QuickBooks connection (doc _id: 'quickbooks').
   store.settings = store.db.collection('settings');
+  // One doc per hours record pushed to QuickBooks, keyed
+  // "<period start>|<employee id>|<day>|<kind>". Holds the QuickBooks id and
+  // SyncToken so re-running a pay period updates what changed instead of
+  // creating a second copy of everyone's hours.
+  store.qboTime = store.db.collection('qbo_time');
+  // History of sync runs (manual and scheduled), newest id last.
+  store.qboRuns = store.db.collection('qbo_runs');
+  // Customer invoices — line items, tax, due date, status and payments. A quote
+  // that gets accepted is converted into one of these.
+  store.invoices = store.db.collection('invoices');
+  // Inbox agent leads: one doc per email the agent has read, holding the
+  // original message and the estimate it drafted from it. Approving a lead is
+  // what turns it into a real quote — the agent never creates one itself.
+  store.inboxLeads = store.db.collection('inbox_leads');
+  // Quote requests sent in from the public estimate page at "/estimate". One
+  // doc per request, holding what the customer picked and the price the server
+  // worked out. Approving one is what turns it into a real quote.
+  store.estimateRequests = store.db.collection('estimate_requests');
 
   // Unique login email, but only for employees that actually have one set
   // (older records may have no email and must not collide on null).
@@ -93,6 +116,17 @@ async function doConnect() {
   await store.vacations.createIndex({ status: 1, created_at: -1 });
   await store.bulletins.createIndex({ status: 1, published_at: -1 });
   await store.bulletins.createIndex({ status: 1, publish_at: 1 });
+  await store.qboTime.createIndex({ period_start: 1 });
+  await store.qboTime.createIndex({ employee_id: 1, day: 1 });
+  await store.qboRuns.createIndex({ start: 1, _id: -1 });
+  await store.invoices.createIndex({ created_at: -1 });
+  await store.invoices.createIndex({ status: 1, due_date: 1 });
+  await store.invoices.createIndex({ quote_id: 1 });
+  // Unique on the email's Message-ID so the same message is never read (or
+  // paid for) twice, even if two scans overlap.
+  await store.inboxLeads.createIndex({ message_id: 1 }, { unique: true });
+  await store.inboxLeads.createIndex({ status: 1, received_at: -1 });
+  await store.estimateRequests.createIndex({ status: 1, created_at: -1 });
   // Auto-remove stale rate-limit records an hour after they were last touched.
   await store.rateLimits.createIndex({ windowStart: 1 }, { expireAfterSeconds: 3600 });
 }

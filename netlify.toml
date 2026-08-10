@@ -12,6 +12,18 @@
 [functions]
   node_bundler = "esbuild"
 
+# Push a finished pay period's hours into QuickBooks. Runs daily at 11:00 UTC
+# (early morning Eastern) and does nothing unless a pay period has just closed
+# and hasn't been pushed yet — see quickbooks.js.
+[functions."qbo-sync"]
+  schedule = "0 11 * * *"
+
+# Read the mailbox and draft quotes from any new requests. Every two hours —
+# a quote request sitting overnight is a lost job. Does nothing when the agent
+# is off, and never re-reads an email it has already handled (see inbox.js).
+[functions."inbox-scan"]
+  schedule = "0 */2 * * *"
+
 # Route the API to the serverless function. The extra "/api" in the target is
 # kept so Express still sees paths like "/api/status".
 [[redirects]]

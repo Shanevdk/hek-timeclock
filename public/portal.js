@@ -61,8 +61,15 @@
     $('app').style.display = 'block';
     applyPermissions();
     $('sideUser').textContent = me && me.name ? me.name : '';
-    showTab('hours');
-    loadMyHours().catch((e) => alert(e.message));
+    // Back to the tab that was open before the refresh; hours otherwise.
+    // applyPermissions() has already run, so a tab they cannot see is skipped.
+    const back = tabFromUrl();
+    if (back) {
+      back.click();
+    } else {
+      showTab('hours');
+      loadMyHours().catch((e) => alert(e.message));
+    }
     refreshMessageCount();
     refreshClock();
   }
@@ -83,7 +90,9 @@
       const nav = $(navId);
       if (!nav) return;
       const ok = perms.includes(perm);
-      nav.style.display = ok ? 'block' : 'none';
+      // Empty string, not "block": the grouped nav lays tabs out with flex so
+      // the unread badge sits on the right, and forcing block would undo it.
+      nav.style.display = ok ? '' : 'none';
       if (!ok) {
         nav.classList.remove('active');
         const sec = $('tab-' + perm);
@@ -96,7 +105,24 @@
         }
       }
     });
+    syncNavGroups();
   }
+
+  // A heading with nothing under it is worse than no heading, so a group whose
+  // tabs are all hidden disappears with them, and whichever group ends up first
+  // loses its divider — otherwise the list opens with a stray line.
+  function syncNavGroups() {
+    const visible = (el) => el.style.display !== 'none';
+    document.querySelectorAll('.side-nav .side-group').forEach((group) => {
+      const items = [...group.querySelectorAll('.tab')];
+      group.style.display = items.some(visible) ? '' : 'none';
+    });
+    const groups = [...document.querySelectorAll('.side-nav > .side-group')];
+    groups.forEach((g) => g.classList.remove('side-first'));
+    const first = groups.find(visible);
+    if (first) first.classList.add('side-first');
+  }
+
   const can = (perm) => ((me && me.permissions) || []).includes(perm);
 
   $('loginBtn').addEventListener('click', doLogin);
@@ -121,6 +147,7 @@
       $('loginMsg').textContent = e.message;
     }
   }
+
 
   $('logoutBtn').addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' }).catch(() => {});
@@ -151,8 +178,37 @@
     const sec = $('tab-' + name);
     if (sec) sec.classList.add('active');
   }
+  // Which tab is open, remembered in the URL, so a refresh comes back to the
+  // same place. Written as "#tab=hours" rather than "#hours" so the browser
+  // never mistakes it for an element to scroll to.
+  const TAB_HASH = /^#tab=([a-z-]+)$/;
+
+  function rememberTab(name) {
+    try {
+      history.replaceState(null, '', location.pathname + location.search + '#tab=' + name);
+    } catch (e) {
+      /* history is unavailable in some embedded views — the tab still works */
+    }
+  }
+
+  // Only a tab this employee actually has; a stale link to a feature they were
+  // never granted falls back to their hours.
+  function tabFromUrl() {
+    const m = TAB_HASH.exec(location.hash || '');
+    if (!m) return null;
+    const tab = document.querySelector('.side-nav .tab[data-tab="' + m[1] + '"]');
+    if (!tab || tab.style.display === 'none') return null;
+    return tab;
+  }
+
+  window.addEventListener('hashchange', () => {
+    const tab = tabFromUrl();
+    if (tab && !tab.classList.contains('active')) tab.click();
+  });
+
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => {
+      rememberTab(t.dataset.tab);
       showTab(t.dataset.tab);
       if (t.dataset.tab === 'hours') loadMyHours().catch((e) => alert(e.message));
       if (t.dataset.tab === 'messages') openMessages().catch((e) => alert(e.message));
@@ -326,6 +382,7 @@
     const entries = data.entries || [];
     $('myTotal').textContent = (data.totalHours || 0).toFixed(2);
     $('myEntries').textContent = entries.length;
+    $('myKm').textContent = (data.totalKm || 0).toFixed(1).replace(/\.0$/, '');
     $('myEmpty').style.display = entries.length ? 'none' : 'block';
     $('myBody').innerHTML = entries
       .map(
@@ -333,6 +390,11 @@
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
           <td>${r.hours != null ? r.hours.toFixed(2) : '—'}</td>
+          <td>${
+            r.km != null
+              ? r.km.toFixed(1).replace(/\.0$/, '')
+              : '<span style="color:var(--muted)">—</span>'
+          }</td>
           <td>${jobChips(r)}${r.work_done ? esc(r.work_done) : '<span style="color:var(--muted)">—</span>'}${
             r.missed_reason
               ? `<div style="font-size:12px;color:var(--red)">missed: ${esc(r.missed_reason)}</div>`

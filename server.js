@@ -21,6 +21,10 @@ const crypto = require('crypto');
 const express = require('express');
 const cookieSession = require('cookie-session');
 const { connect, store } = require('./db');
+const qbo = require('./quickbooks');
+const rateBook = require('./ratebook');
+const inbox = require('./inbox');
+const estimates = require('./estimates');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,10 +92,23 @@ const DEV_BLOCKED = [
   '/api/admin/timesheet',
   '/api/admin/export.csv',
   '/api/admin/credentials',
+  '/api/cron/quickbooks-sync',
+  '/api/cron/inbox-scan',
+];
+// Path prefixes the dev account may not touch. These are the client's own
+// business: payroll reads pay rates and writes to their books, invoices are
+// money owed them, and the inbox agent reads their email. The dev may switch
+// any of these features on or off, but never operate them.
+const DEV_BLOCKED_PREFIXES = [
+  '/api/admin/punches',
+  '/api/admin/quickbooks',
+  '/api/quickbooks',
+  '/api/admin/invoices',
+  '/api/admin/inbox',
 ];
 app.use((req, res, next) => {
   if (req.session && req.session.role === 'dev') {
-    if (DEV_BLOCKED.includes(req.path) || req.path.startsWith('/api/admin/punches')) {
+    if (DEV_BLOCKED.includes(req.path) || DEV_BLOCKED_PREFIXES.some((p) => req.path.startsWith(p))) {
       return res.status(403).json({ error: 'Not available for the dev account.' });
     }
   }
@@ -115,6 +132,16 @@ const ADMIN_FEATURES = [
   { key: 'map', label: 'Clock-in map' },
   { key: 'tasks', label: 'My Tasks' },
   { key: 'messages', label: 'Message board' },
+  // adminOnly: the client can switch it on or off, but it is never something to
+  // hand an employee — it reads everyone's pay rate and writes to the books.
+  { key: 'quickbooks', label: 'QuickBooks payroll sync', adminOnly: true },
+  // Billing and the mailbox are office functions: one is money owed, the other
+  // reads the company's email. Neither is something to grant a field employee.
+  { key: 'invoices', label: 'Invoices', adminOnly: true },
+  { key: 'inbox', label: 'AI inbox — drafts quotes from email', adminOnly: true },
+  // The public estimate page and the requests it files. adminOnly: it decides
+  // what the outside world is shown and quoted, which is the office's call.
+  { key: 'estimate', label: 'Public estimate page', adminOnly: true },
 ];
 // Which request paths belong to each feature (used to block them when disabled).
 const FEATURE_MATCH = {
@@ -124,9 +151,22 @@ const FEATURE_MATCH = {
     p === '/api/admin/geocode' ||
     p.startsWith('/api/my/schedules'),
   pricing: () => false, // client-only calculator; no endpoints to guard
-  map: (p) => p.startsWith('/api/admin/locations') || p.startsWith('/api/my/locations'),
+  map: (p) =>
+    p.startsWith('/api/admin/locations') ||
+    p.startsWith('/api/my/locations') ||
+    p.startsWith('/api/admin/map') ||
+    p === '/api/admin/shop',
   tasks: (p) => p.startsWith('/api/admin/tasks') || p.startsWith('/api/my/tasks'),
   messages: (p) => p.startsWith('/api/admin/bulletins') || p.startsWith('/api/my/bulletins'),
+  quickbooks: (p) =>
+    p.startsWith('/api/admin/quickbooks') ||
+    p.startsWith('/api/quickbooks') ||
+    p === '/api/cron/quickbooks-sync',
+  invoices: (p) => p.startsWith('/api/admin/invoices'),
+  inbox: (p) => p.startsWith('/api/admin/inbox') || p === '/api/cron/inbox-scan',
+  // Both sides of the estimate page: the admin's queue and the public endpoints
+  // the page itself calls, so switching the feature off closes it to the world.
+  estimate: (p) => p.startsWith('/api/admin/estimate') || p.startsWith('/api/estimate'),
 };
 
 let _entitlements = null; // cached; reloaded on write and on cold start
@@ -213,7 +253,7 @@ const PERMISSION_NOTES = {
 };
 const GRANTABLE_PERMISSIONS = [
   { key: 'admin', label: 'Admin (full dashboard access)', note: PERMISSION_NOTES.admin },
-  ...ADMIN_FEATURES.map((f) => ({
+  ...ADMIN_FEATURES.filter((f) => !f.adminOnly).map((f) => ({
     key: f.key,
     label: f.label,
     note: PERMISSION_NOTES[f.key] || '',
@@ -384,6 +424,71 @@ const wrap = (fn) => (req, res) =>
     if (!res.headersSent) res.status(500).json({ error: 'Server error.' });
   });
 
+// ---------------------------------------------------------------------------
+// The shop — where jobs are measured from.
+//
+// OpenStreetMap has no entry for the street number, only the road, so the
+// default below is Otterville Rd in N0J 1R0 rather than the building itself.
+// The admin can drag the pin onto the exact spot; that is stored and used from
+// then on. Distances are straight-line, not driving distance (see distanceKm).
+// ---------------------------------------------------------------------------
+
+const SHOP_DEFAULT = {
+  address: '225439 Otterville Rd, Otterville, ON N0J 1R0',
+  lat: 42.9340705,
+  lng: -80.5536229,
+  exact: false, // true once someone has placed the pin themselves
+};
+
+async function getShop() {
+  const doc = await store.settings.findOne({ _id: 'shop' });
+  if (!doc) return { ...SHOP_DEFAULT };
+  return {
+    address: doc.address || SHOP_DEFAULT.address,
+    lat: Number.isFinite(doc.lat) ? doc.lat : SHOP_DEFAULT.lat,
+    lng: Number.isFinite(doc.lng) ? doc.lng : SHOP_DEFAULT.lng,
+    exact: !!doc.exact,
+  };
+}
+
+async function saveShop(body) {
+  const set = {};
+  if (body.address != null) set.address = String(body.address).trim().slice(0, 200);
+  if (body.lat != null || body.lng != null) {
+    const { lat, lng } = cleanLatLng(body.lat, body.lng);
+    if (lat == null || lng == null) {
+      const err = new Error('That is not a valid position on the map.');
+      err.status = 400;
+      throw err;
+    }
+    set.lat = lat;
+    set.lng = lng;
+    // Placing the pin by hand is what makes it exact, so distances can say so.
+    set.exact = true;
+  }
+  if (Object.keys(set).length) {
+    set.updated_at = new Date();
+    await store.settings.updateOne({ _id: 'shop' }, { $set: set }, { upsert: true });
+  }
+  return getShop();
+}
+
+// Straight-line distance in kilometres (haversine). This is "as the crow
+// flies", not driving distance — the road route is always longer, and working
+// that out would mean calling a routing service on every job. Labelled as such
+// wherever it is shown so nobody mistakes it for a trip odometer.
+function distanceKm(aLat, aLng, bLat, bLng) {
+  if (![aLat, aLng, bLat, bLng].every((n) => Number.isFinite(n))) return null;
+  const R = 6371; // mean earth radius, km
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(s)) * 10) / 10;
+}
+
 async function getOpenPunch(employeeId) {
   return store.punches.findOne(
     { employee_id: employeeId, clock_out: null },
@@ -423,7 +528,79 @@ async function pickJobs(employeeId, day, rawIds) {
   const jobs = await jobsOnDay(employeeId, day);
   return jobs
     .filter((d) => ids.has(d._id))
-    .map((d) => ({ id: d._id, address: d.address, description: d.description || null }));
+    .map((d) => {
+      // The position is snapshotted alongside the address for the same reason:
+      // the mileage on a past timesheet must not move because someone later
+      // edited or deleted the job.
+      const { lat, lng } = cleanLatLng(d.lat, d.lng);
+      return {
+        id: d._id,
+        address: d.address,
+        description: d.description || null,
+        lat,
+        lng,
+      };
+    });
+}
+
+// ---- Mileage -------------------------------------------------------------
+// How far the crew travelled, worked out from the jobs tagged onto a punch and
+// the shop's position. Reimbursement is normally paid on the return trip, so
+// that is the default; an office that chains jobs without coming back can turn
+// it off and get one-way figures instead.
+
+async function getMileageSettings() {
+  const doc = await store.settings.findOne({ _id: 'mileage' });
+  return { round_trip: !doc || doc.round_trip !== false };
+}
+
+async function saveMileageSettings(body) {
+  const set = {};
+  if (body.round_trip != null) set.round_trip = !!body.round_trip;
+  if (Object.keys(set).length) {
+    set.updated_at = new Date();
+    await store.settings.updateOne({ _id: 'mileage' }, { $set: set }, { upsert: true });
+  }
+  return getMileageSettings();
+}
+
+// Fill in each row's job distances and the row total. Punches recorded before
+// positions were snapshotted fall back to looking the job up by id, so old
+// timesheets still get mileage as long as the job still exists.
+async function attachMileage(rows) {
+  const needsLookup = new Set();
+  for (const r of rows)
+    for (const j of r.jobs || [])
+      if (j && j.id != null && (j.lat == null || j.lng == null)) needsLookup.add(Number(j.id));
+
+  let byId = {};
+  if (needsLookup.size) {
+    const docs = await store.schedules.find({ _id: { $in: [...needsLookup] } }).toArray();
+    byId = Object.fromEntries(docs.map((d) => [d._id, d]));
+  }
+
+  const shop = await getShop();
+  const { round_trip: roundTrip } = await getMileageSettings();
+  const legs = roundTrip ? 2 : 1;
+
+  for (const r of rows) {
+    let total = 0;
+    let known = false;
+    r.jobs = (r.jobs || []).map((j) => {
+      let { lat, lng } = cleanLatLng(j.lat, j.lng);
+      if (lat == null && byId[j.id]) ({ lat, lng } = cleanLatLng(byId[j.id].lat, byId[j.id].lng));
+      const oneWay = lat == null ? null : distanceKm(shop.lat, shop.lng, lat, lng);
+      if (oneWay != null) {
+        total += oneWay * legs;
+        known = true;
+      }
+      return { ...j, km: oneWay == null ? null : Math.round(oneWay * legs * 10) / 10 };
+    });
+    // null, not 0, when nothing could be worked out — "no distance known" and
+    // "travelled nothing" are different answers.
+    r.km = known ? Math.round(total * 10) / 10 : null;
+  }
+  return rows;
 }
 
 // One-line label for a snapshotted job, used in the CSV export and elsewhere
@@ -585,6 +762,7 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+
 // Who am I? Used by the portal (and by the shared login page) to restore state.
 app.get(
   '/api/me',
@@ -610,12 +788,18 @@ app.get(
       to: req.query.to,
     });
     let total = 0;
+    let totalKm = 0;
     const entries = rows.map((r) => {
       const hours = hoursOf(r);
       if (hours) total += hours;
+      if (r.km) totalKm += r.km;
       return { ...r, clock_in: iso(r.clock_in), clock_out: iso(r.clock_out), hours };
     });
-    res.json({ entries, totalHours: Math.round(total * 100) / 100 });
+    res.json({
+      entries,
+      totalHours: Math.round(total * 100) / 100,
+      totalKm: Math.round(totalKm * 10) / 10,
+    });
   })
 );
 
@@ -1080,6 +1264,10 @@ function employeeView(e) {
   };
   for (const f of PROFILE_FIELDS) v[f] = e[f] || '';
   v.reports_to = e.reports_to || null; // the id of the employee they report to
+  // Which QuickBooks employee this person is, for the payroll sync. Set from
+  // the QuickBooks tab, not the profile editor, so it can be picked from the
+  // real list instead of typed from memory.
+  v.qbo_employee_id = e.qbo_employee_id || '';
   return v;
 }
 
@@ -1237,6 +1425,12 @@ app.delete(
 const cleanDate = (s) => (/^\d{4}-\d{2}-\d{2}$/.test(s || '') ? s : null);
 const cleanTime = (s) => (/^\d{2}:\d{2}$/.test(s || '') ? s : null);
 
+// What kind of visit this is. Anything unrecognised falls back to a delivery,
+// which is the common case.
+const JOB_TYPES = ['Delivery', 'Install', 'Service', 'Pickup'];
+const cleanJobType = (s) => (JOB_TYPES.includes(s) ? s : 'Delivery');
+const cleanNote = (s, max = 2000) => String(s == null ? '' : s).trim().slice(0, max) || null;
+
 // Keep a lat/lng pair only if it's a real, in-range coordinate; else drop both.
 function cleanLatLng(lat, lng) {
   const a = Number(lat);
@@ -1267,6 +1461,12 @@ function publicScheduleView(d) {
     description: d.description || null,
     date: d.date || null,
     time: d.time || null,
+    due_date: d.due_date || null,
+    job_type: d.job_type || 'Delivery',
+    // The crew's own notes travel with the job. Internal notes deliberately do
+    // not — that is the whole point of having two boxes.
+    notes_driver: d.notes_driver || null,
+    confirmed: !!d.confirmed,
     lat: d.lat ?? null,
     lng: d.lng ?? null,
   };
@@ -1324,6 +1524,9 @@ app.get(
     const jobs = docs
       .map((d) => ({
         ...publicScheduleView(d),
+        // Admin-only, so the internal note is added back on top of the view the
+        // employee portal gets.
+        notes_internal: d.notes_internal || null,
         employee_ids: d.employee_ids || [],
         employees: (d.employee_ids || []).map((id) => nameById[id] || '(removed)'),
       }))
@@ -1346,6 +1549,14 @@ app.post(
       description: (req.body?.description || '').trim() || null,
       date: cleanDate(req.body?.date),
       time: cleanTime(req.body?.time),
+      // When the customer needs it by — independent of the day it's booked on,
+      // which is what makes a late booking visible.
+      due_date: cleanDate(req.body?.due_date),
+      job_type: cleanJobType(req.body?.job_type),
+      // Notes for the crew go out with the job; internal notes never do.
+      notes_driver: cleanNote(req.body?.notes_driver),
+      notes_internal: cleanNote(req.body?.notes_internal),
+      confirmed: !!req.body?.confirmed,
       lat,
       lng,
       employee_ids: await cleanEmployeeIds(req.body?.employee_ids),
@@ -1374,6 +1585,11 @@ app.patch(
       set.description = String(req.body.description).trim() || null;
     if (req.body?.date != null) set.date = cleanDate(req.body.date);
     if (req.body?.time != null) set.time = cleanTime(req.body.time);
+    if (req.body?.due_date != null) set.due_date = cleanDate(req.body.due_date);
+    if (req.body?.job_type != null) set.job_type = cleanJobType(req.body.job_type);
+    if (req.body?.notes_driver != null) set.notes_driver = cleanNote(req.body.notes_driver);
+    if (req.body?.notes_internal != null) set.notes_internal = cleanNote(req.body.notes_internal);
+    if (req.body?.confirmed != null) set.confirmed = !!req.body.confirmed;
     if (req.body?.lat !== undefined || req.body?.lng !== undefined) {
       const { lat, lng } = cleanLatLng(req.body?.lat, req.body?.lng);
       set.lat = lat;
@@ -1449,6 +1665,76 @@ app.get(
   })
 );
 
+// The shop and the scheduled jobs, each with how far it is from the shop. Only
+// jobs whose address was matched to a position can be mapped — one typed in by
+// hand without picking a suggestion has no coordinates, and is counted rather
+// than silently dropped.
+app.get(
+  '/api/admin/map',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const shop = await getShop();
+    const { from, to } = req.query;
+    const q = {};
+    if (from || to) {
+      // Undated jobs are ongoing work rather than work fixed to a day, so they
+      // stay on the map whatever range is chosen.
+      q.$or = [
+        { date: null },
+        { date: { ...(from ? { $gte: String(from) } : {}), ...(to ? { $lte: String(to) } : {}) } },
+      ];
+    }
+    const docs = (await store.schedules.find(q).toArray()).sort(scheduleSort);
+    const employees = await store.employees.find({}).toArray();
+    const nameById = Object.fromEntries(employees.map((e) => [e._id, e.name]));
+
+    const jobs = [];
+    let unmapped = 0;
+    for (const d of docs) {
+      // cleanLatLng rather than Number(): Number(null) is 0, which is finite,
+      // and would put an ungeocoded job in the Gulf of Guinea.
+      const { lat, lng } = cleanLatLng(d.lat, d.lng);
+      if (lat == null || lng == null) {
+        unmapped++;
+        continue;
+      }
+      jobs.push({
+        id: d._id,
+        address: d.address,
+        description: d.description || null,
+        date: d.date || null,
+        time: d.time || null,
+        lat,
+        lng,
+        crew: (d.employee_ids || []).map((id) => nameById[id]).filter(Boolean),
+        km: distanceKm(shop.lat, shop.lng, lat, lng),
+      });
+    }
+    res.json({ shop, jobs, unmapped });
+  })
+);
+
+app.get(
+  '/api/admin/shop',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ shop: await getShop(), default: SHOP_DEFAULT });
+  })
+);
+
+app.patch(
+  '/api/admin/shop',
+  requireAdmin,
+  wrap(async (req, res) => {
+    try {
+      res.json({ shop: await saveShop(req.body || {}) });
+    } catch (err) {
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+  })
+);
+
 // ---------------------------------------------------------------------------
 // Admin: timesheets
 // ---------------------------------------------------------------------------
@@ -1465,20 +1751,22 @@ async function timesheetRows({ employeeId, from, to }) {
   }
   const rows = await store.punches.find(q, { sort: { clock_in: -1 } }).toArray();
   const named = await withNames(rows);
-  return named.map((r) => ({
-    id: r._id,
-    employee_id: r.employee_id,
-    name: r.name,
-    clock_in: r.clock_in,
-    clock_out: r.clock_out,
-    work_done: r.work_done,
-    jobs: r.jobs || [],
-    missed_reason: r.missed_reason,
-    note: r.note,
-    edited: r.edited,
-    clock_in_lat: r.clock_in_lat ?? null,
-    clock_in_lng: r.clock_in_lng ?? null,
-  }));
+  return attachMileage(
+    named.map((r) => ({
+      id: r._id,
+      employee_id: r.employee_id,
+      name: r.name,
+      clock_in: r.clock_in,
+      clock_out: r.clock_out,
+      work_done: r.work_done,
+      jobs: r.jobs || [],
+      missed_reason: r.missed_reason,
+      note: r.note,
+      edited: r.edited,
+      clock_in_lat: r.clock_in_lat ?? null,
+      clock_in_lng: r.clock_in_lng ?? null,
+    }))
+  );
 }
 
 function hoursOf(row) {
@@ -1497,12 +1785,38 @@ app.get(
       to: req.query.to,
     });
     let total = 0;
+    let totalKm = 0;
     const entries = rows.map((r) => {
       const hours = hoursOf(r);
       if (hours) total += hours;
+      if (r.km) totalKm += r.km;
       return { ...r, clock_in: iso(r.clock_in), clock_out: iso(r.clock_out), hours };
     });
-    res.json({ entries, totalHours: Math.round(total * 100) / 100 });
+    res.json({
+      entries,
+      totalHours: Math.round(total * 100) / 100,
+      totalKm: Math.round(totalKm * 10) / 10,
+      mileage: await getMileageSettings(),
+    });
+  })
+);
+
+// Whether mileage counts the return trip. Deliberately its own endpoint rather
+// than part of the map: the timesheet has to keep working when the map feature
+// is switched off.
+app.get(
+  '/api/admin/mileage',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ mileage: await getMileageSettings(), shop: await getShop() });
+  })
+);
+
+app.patch(
+  '/api/admin/mileage',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ mileage: await saveMileageSettings(req.body || {}) });
   })
 );
 
@@ -1620,6 +1934,7 @@ app.get(
       'Clock Out',
       'Hours',
       'Jobs',
+      'Km',
       'Work Done',
       'Missed Clock-out Reason',
       'Edited',
@@ -1634,6 +1949,7 @@ app.get(
           csvCell(iso(r.clock_out) || ''),
           csvCell(hoursOf(r) ?? ''),
           csvCell((r.jobs || []).map(jobLabel).join('; ')),
+          csvCell(r.km ?? ''),
           csvCell(r.work_done || ''),
           csvCell(r.missed_reason || ''),
           csvCell(r.edited ? 'yes' : ''),
@@ -1649,6 +1965,290 @@ app.get(
     res.send(lines.join('\n'));
   })
 );
+
+// ---------------------------------------------------------------------------
+// Admin: QuickBooks payroll sync
+//
+// Pushes each pay period's approved hours into QuickBooks as TimeActivity
+// records so payroll is reviewed and run there with the numbers already in
+// place. Intuit has no public API for running payroll or moving money, so the
+// final "Run payroll" click stays with a person — see quickbooks.js.
+// ---------------------------------------------------------------------------
+
+// Like wrap(), but a QuickBooksError carries a message written for the admin
+// (a QuickBooks validation fault, a missing setting) and is passed through
+// verbatim instead of being flattened into "Server error".
+const qbWrap = (fn) => (req, res) =>
+  Promise.resolve(fn(req, res)).catch((err) => {
+    if (res.headersSent) return;
+    if (err instanceof qbo.QuickBooksError) {
+      return res
+        .status(err.status || 400)
+        .json({ error: err.message, detail: err.detail || undefined });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Server error.' });
+  });
+
+// A readable name for whoever is acting, recorded against the connection and
+// each sync run. The unified login at "/" doesn't put an email on the session,
+// so fall back to their employee record and then to the admin account.
+async function adminActor(req) {
+  if (req.session?.email) return req.session.email;
+  if (req.session?.employeeId) {
+    const emp = await store.employees.findOne({ _id: req.session.employeeId });
+    if (emp) return emp.email || emp.name;
+  }
+  try {
+    return (await getAdminRecord()).email;
+  } catch {
+    return null;
+  }
+}
+
+// Which pay period a request is about. Any date is snapped to the pay-period
+// grid, so a preview always covers exactly what a sync would push — an
+// arbitrary date range would file its records under the wrong period and break
+// the bookkeeping that makes re-syncing safe.
+async function resolvePeriod(q) {
+  const settings = await qbo.getSettings();
+  if (!settings.period_anchor)
+    throw new qbo.QuickBooksError('Set the pay period start date before syncing.');
+  const today = qbo.localDay(new Date());
+  if (q && q.start) {
+    if (isNaN(qbo.dayToMs(String(q.start))))
+      throw new qbo.QuickBooksError('That is not a real date.');
+    return qbo.periodContaining(String(q.start), settings);
+  }
+  const which = (q && q.period) || 'last_complete';
+  if (which === 'current') return qbo.periodContaining(today, settings);
+  if (which === 'previous')
+    return qbo.shiftPeriod(qbo.periodContaining(today, settings), -1, settings);
+  return qbo.lastCompletePeriod(today, settings);
+}
+
+app.get(
+  '/api/admin/quickbooks/status',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const status = await qbo.getStatus();
+    // How many people the sync can actually pay attention to, so the dashboard
+    // can say "3 of 7 matched" without a second round trip.
+    const hourly = await store.employees
+      .find({ active: true, pay_type: { $ne: 'Salary' } })
+      .toArray();
+    status.mapping = {
+      total: hourly.length,
+      matched: hourly.filter((e) => e.qbo_employee_id).length,
+    };
+    // The callback URL for *this* deployment, so the form can offer the exact
+    // string to paste into the Intuit app rather than describing it.
+    status.credentials.suggested_redirect_uri = qbo.derivedRedirectUri(req);
+    res.json(status);
+  })
+);
+
+app.patch(
+  '/api/admin/quickbooks/settings',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    await qbo.saveSettings(req.body || {});
+    res.json(await qbo.getStatus());
+  })
+);
+
+// The products/services and tax codes in the connected company, for the two
+// pickers the invoice sync needs.
+app.get(
+  '/api/admin/quickbooks/items',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    res.json({ items: await qbo.listQboItems() });
+  })
+);
+
+app.get(
+  '/api/admin/quickbooks/taxcodes',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    res.json({ taxcodes: await qbo.listQboTaxCodes() });
+  })
+);
+
+// The Intuit app's own keys. Saved here rather than only in the environment so
+// they can be entered and rotated without a redeploy.
+app.patch(
+  '/api/admin/quickbooks/credentials',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const status = await qbo.saveCredentials(req.body || {});
+    status.credentials.suggested_redirect_uri = qbo.derivedRedirectUri(req);
+    res.json(status);
+  })
+);
+
+// Start the OAuth handshake. This is a top-level navigation rather than a fetch
+// because Intuit's consent screen has to be shown to the person clicking.
+app.get(
+  '/api/admin/quickbooks/connect',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const state = crypto.randomBytes(16).toString('hex');
+    const redirectUri = await qbo.redirectUriFor(req);
+    // Remembered so the callback can prove the response belongs to this
+    // request, and so the token exchange sends a byte-identical redirect URI.
+    req.session.qboState = state;
+    req.session.qboRedirect = redirectUri;
+    try {
+      res.redirect(await qbo.authorizeUrl(state, redirectUri));
+    } catch (err) {
+      // This is a whole-page navigation, so an error has to come back as one —
+      // a JSON body would just be dumped into the browser window.
+      res.redirect(
+        ADMIN_PATH + '?' + new URLSearchParams({ quickbooks: 'error', message: err.message })
+      );
+    }
+  })
+);
+
+// Where Intuit sends the browser back to. Registered with the Intuit app, so
+// its path must stay stable.
+app.get(
+  '/api/quickbooks/callback',
+  wrap(async (req, res) => {
+    const back = (params) => res.redirect(ADMIN_PATH + '?' + new URLSearchParams(params));
+    if (!(req.session && req.session.admin))
+      return back({ quickbooks: 'error', message: 'Sign in as an admin and try again.' });
+
+    const { code, state, realmId, error, error_description: errorDescription } = req.query;
+    const expected = req.session.qboState;
+    const redirectUri = req.session.qboRedirect || (await qbo.redirectUriFor(req));
+    req.session.qboState = null;
+    req.session.qboRedirect = null;
+
+    if (error) return back({ quickbooks: 'error', message: errorDescription || String(error) });
+    // A missing or mismatched state means this response didn't come from the
+    // handshake we started — never trade it for tokens.
+    if (!state || !expected || state !== expected)
+      return back({ quickbooks: 'error', message: 'The QuickBooks sign-in expired. Try again.' });
+    if (!code || !realmId)
+      return back({ quickbooks: 'error', message: 'QuickBooks did not send a company to connect.' });
+
+    try {
+      const actor = await adminActor(req);
+      await qbo.exchangeCode({ code: String(code), realmId: String(realmId), redirectUri, actor });
+      return back({ quickbooks: 'connected' });
+    } catch (err) {
+      console.error('QuickBooks connect failed:', err);
+      return back({ quickbooks: 'error', message: err.detail || err.message });
+    }
+  })
+);
+
+app.post(
+  '/api/admin/quickbooks/disconnect',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    await qbo.disconnect();
+    res.json(await qbo.getStatus());
+  })
+);
+
+// The QuickBooks employee list, for matching people up.
+app.get(
+  '/api/admin/quickbooks/qbo-employees',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    res.json({ employees: await qbo.listQboEmployees() });
+  })
+);
+
+app.patch(
+  '/api/admin/quickbooks/mapping',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const id = Number(req.body?.employee_id);
+    const qboId = String(req.body?.qbo_employee_id ?? '').trim();
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Which employee?' });
+    if (qboId && !/^\d+$/.test(qboId))
+      return res.status(400).json({ error: 'That is not a QuickBooks employee id.' });
+    const emp = await store.employees.findOne({ _id: id });
+    if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+    // Two people pointed at the same QuickBooks employee would pile both
+    // timesheets onto one person's paycheque.
+    if (qboId) {
+      const clash = await store.employees.findOne({ qbo_employee_id: qboId, _id: { $ne: id } });
+      if (clash)
+        return res
+          .status(409)
+          .json({ error: `${clash.name} is already matched to that QuickBooks employee.` });
+    }
+    await store.employees.updateOne(
+      { _id: id },
+      qboId ? { $set: { qbo_employee_id: qboId } } : { $unset: { qbo_employee_id: '' } }
+    );
+    res.json({ ok: true, employee_id: id, qbo_employee_id: qboId || null });
+  })
+);
+
+// Exactly what a sync would push, without pushing it.
+app.get(
+  '/api/admin/quickbooks/preview',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const period = await resolvePeriod(req.query);
+    const settings = await qbo.getSettings();
+    const report = await qbo.buildPeriod(period, settings);
+    const pushed = await store.qboTime.countDocuments({ period_start: period.start });
+    res.json({ ...report, settings, already_pushed: pushed });
+  })
+);
+
+app.post(
+  '/api/admin/quickbooks/sync',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const period = await resolvePeriod(req.body || {});
+    const result = await qbo.syncPeriod(period, {
+      actor: await adminActor(req),
+      trigger: 'manual',
+    });
+    res.json(result);
+  })
+);
+
+app.get(
+  '/api/admin/quickbooks/runs',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const runs = await store.qboRuns.find({}, { sort: { _id: -1 }, limit: 20 }).toArray();
+    res.json({ runs });
+  })
+);
+
+// The scheduled push. Vercel Cron sends "Authorization: Bearer $CRON_SECRET"
+// when that variable is set on the project; without it the endpoint stays shut,
+// because anything that can reach this URL can write to the company's books.
+function cronAuthorized(req) {
+  const secret = process.env.CRON_SECRET || '';
+  if (secret && req.headers.authorization === `Bearer ${secret}`) return true;
+  // An admin firing it by hand from the dashboard.
+  return !!(req.session && req.session.admin && req.session.role !== 'dev');
+}
+
+const cronSync = qbWrap(async (req, res) => {
+  if (!cronAuthorized(req)) {
+    return res.status(401).json({
+      error: process.env.CRON_SECRET
+        ? 'Not authorized.'
+        : 'CRON_SECRET is not set on the server, so the scheduled sync is disabled.',
+    });
+  }
+  const result = await qbo.runScheduledSync();
+  res.json(result);
+});
+app.get('/api/cron/quickbooks-sync', cronSync);
+app.post('/api/cron/quickbooks-sync', cronSync);
 
 // ---------------------------------------------------------------------------
 // Admin: quotes / estimates
@@ -1785,6 +2385,898 @@ app.delete(
     res.json({ ok: true });
   })
 );
+
+// ---------------------------------------------------------------------------
+// Admin: rate book — what HEK charges per service. Lives in the database (see
+// ratebook.js) because the inbox agent prices against the same numbers the
+// Pricing calculator uses.
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/admin/ratebook',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json(await rateBook.getRateBook());
+  })
+);
+
+app.patch(
+  '/api/admin/ratebook',
+  requireAdmin,
+  wrap(async (req, res) => {
+    try {
+      res.json(await rateBook.saveRateBook(req.body || {}));
+    } catch (err) {
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+  })
+);
+
+// Add / rename / reprice / remove a service. This is what makes the rate book
+// the admin's list rather than a fixed one in the code.
+app.post(
+  '/api/admin/ratebook/services',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const { action, ...body } = req.body || {};
+    try {
+      res.json(await rateBook.editService(action, body));
+    } catch (err) {
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+  })
+);
+
+// The built-in services that have been switched off, so they can be brought back.
+app.get(
+  '/api/admin/ratebook/hidden',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ hidden: await rateBook.hiddenServices() });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Public estimate page ("/estimate") — open to the world, no login.
+//
+// Only two endpoints are public, both rate limited: one reads the switched-on
+// services, the other files a quote request. Prices are always worked out on
+// the server from the live rate book, so what the browser sends is only ever
+// "which service, how much of it".
+// ---------------------------------------------------------------------------
+
+const estimateLimiter = limiter('estimate');
+
+app.get(
+  '/api/estimate/config',
+  wrap(async (req, res) => {
+    res.json(await estimates.publicConfig());
+  })
+);
+
+// Find the customer's property so they can trace the fence on it. The lookup
+// goes through us rather than straight from the browser: OpenStreetMap asks for
+// an identifying User-Agent, and proxying keeps this rate limited like the rest
+// of the public endpoints.
+app.get(
+  '/api/estimate/geocode',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled) return res.json({ results: [] });
+    const q = String(req.query.q || '').trim().slice(0, 200);
+    if (q.length < 3) return res.json({ results: [] });
+    try {
+      const url =
+        'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=ca,us&q=' +
+        encodeURIComponent(q);
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': 'HEK-Timeclock/1.0 (customer estimate address lookup)',
+          'Accept-Language': 'en',
+        },
+      });
+      if (!r.ok) return res.json({ results: [] });
+      const data = await r.json();
+      const results = (Array.isArray(data) ? data : [])
+        .map((d) => ({ label: d.display_name, lat: Number(d.lat), lng: Number(d.lon) }))
+        .filter((x) => x.label && Number.isFinite(x.lat) && Number.isFinite(x.lng));
+      res.json({ results });
+    } catch (err) {
+      console.error('estimate geocode failed:', err.message);
+      res.json({ results: [] });
+    }
+  })
+);
+
+// The address at a position — used when the customer lets the browser place
+// them, so the request carries a street address rather than bare coordinates.
+app.get(
+  '/api/estimate/reverse',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled) return res.json({ label: null });
+    const { lat, lng } = cleanLatLng(req.query.lat, req.query.lng);
+    if (lat == null) return res.json({ label: null });
+    try {
+      const url =
+        `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`;
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': 'HEK-Timeclock/1.0 (customer estimate address lookup)',
+          'Accept-Language': 'en',
+        },
+      });
+      if (!r.ok) return res.json({ label: null });
+      const data = await r.json();
+      res.json({ label: (data && data.display_name) || null });
+    } catch (err) {
+      console.error('estimate reverse geocode failed:', err.message);
+      res.json({ label: null });
+    }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Estimate: imagery for the 3D fence preview
+// ---------------------------------------------------------------------------
+
+// Satellite tiles, relayed through this server rather than fetched straight
+// from Esri by the browser.
+//
+// The 3D view paints these onto the ground so the fence stands on a picture of
+// the customer's actual yard. A canvas that has drawn a cross-origin image is
+// "tainted" and can no longer be read back, which would break saving the render
+// as a picture. Serving the tiles from our own origin avoids that entirely.
+app.get(
+  '/api/estimate/tile/:z/:x/:y',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled) return res.status(404).end();
+
+    const z = Number(req.params.z);
+    const x = Number(req.params.x);
+    const y = Number(req.params.y);
+    // Bounds-check before calling out: a tile index outside the pyramid is
+    // either a bug or someone probing, and neither deserves an upstream fetch.
+    const span = 2 ** z;
+    if (
+      !Number.isInteger(z) || z < 1 || z > 21 ||
+      !Number.isInteger(x) || x < 0 || x >= span ||
+      !Number.isInteger(y) || y < 0 || y >= span
+    )
+      return res.status(400).end();
+
+    try {
+      const upstream = await fetch(
+        `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`,
+        { headers: { 'User-Agent': 'HEK-Timeclock/1.0 (fence preview)' } }
+      );
+      if (!upstream.ok) return res.status(502).end();
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'image/jpeg');
+      // Aerial imagery changes about once a year; a long cache keeps repeat
+      // views instant and costs the upstream nothing.
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      res.send(buf);
+    } catch (err) {
+      console.error('tile proxy failed:', err.message);
+      res.status(502).end();
+    }
+  })
+);
+
+// A photo of the property from the road. Proxied so the Google key stays on the
+// server — the browser only ever asks us for a picture.
+app.get(
+  '/api/estimate/streetview',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled) return res.status(404).json({ error: 'Estimates are closed.' });
+    const key = await estimates.googleKey();
+    if (!key)
+      return res.status(409).json({ error: 'No Google Maps key is set up, so there is no photo.' });
+
+    const { lat, lng } = cleanLatLng(req.query.lat, req.query.lng);
+    if (lat == null) return res.status(400).json({ error: 'Where?' });
+    const heading = Number(req.query.heading);
+    const fov = Math.min(120, Math.max(20, Number(req.query.fov) || 90));
+    const pitch = Math.min(60, Math.max(-60, Number(req.query.pitch) || 0));
+
+    const params = new URLSearchParams({
+      size: '640x400',
+      location: `${lat},${lng}`,
+      fov: String(fov),
+      pitch: String(pitch),
+      // Frame the property rather than whatever the car happened to face.
+      source: 'outdoor',
+      key,
+    });
+    if (Number.isFinite(heading)) params.set('heading', String(((heading % 360) + 360) % 360));
+
+    try {
+      // Ask the free metadata endpoint first. Without this a location with no
+      // coverage silently bills for a "sorry, no imagery" placeholder image.
+      const meta = await fetch(
+        `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&source=outdoor&key=${encodeURIComponent(key)}`
+      );
+      const info = meta.ok ? await meta.json() : null;
+      if (!info || info.status !== 'OK')
+        return res
+          .status(404)
+          .json({ error: 'Google has no road-level photo of this spot.', status: info && info.status });
+
+      const shot = await fetch(`https://maps.googleapis.com/maps/api/streetview?${params}`);
+      if (!shot.ok) return res.status(502).json({ error: 'Google would not return the photo.' });
+      const buf = Buffer.from(await shot.arrayBuffer());
+      res.setHeader('Content-Type', shot.headers.get('content-type') || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      // Where the camera actually is, so the 3D overlay can line itself up.
+      if (info.location) {
+        res.setHeader('X-Pano-Lat', String(info.location.lat));
+        res.setHeader('X-Pano-Lng', String(info.location.lng));
+      }
+      res.send(buf);
+    } catch (err) {
+      console.error('street view failed:', err.message);
+      res.status(502).json({ error: 'Could not reach Google for the photo.' });
+    }
+  })
+);
+
+// Where the Street View camera stands, and which way it must look to face the
+// property. The overlay needs both before it can draw anything.
+app.get(
+  '/api/estimate/streetview/meta',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled) return res.status(404).json({ error: 'Estimates are closed.' });
+    const key = await estimates.googleKey();
+    if (!key) return res.status(409).json({ error: 'No Google Maps key is set up.' });
+    const { lat, lng } = cleanLatLng(req.query.lat, req.query.lng);
+    if (lat == null) return res.status(400).json({ error: 'Where?' });
+    try {
+      const r = await fetch(
+        `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&source=outdoor&key=${encodeURIComponent(key)}`
+      );
+      const info = r.ok ? await r.json() : null;
+      if (!info || info.status !== 'OK')
+        return res.status(404).json({ error: 'No road-level photo here.', status: info && info.status });
+      res.json({ lat: info.location.lat, lng: info.location.lng, date: info.date || null });
+    } catch (err) {
+      res.status(502).json({ error: 'Could not reach Google.' });
+    }
+  })
+);
+
+// A live total as the customer edits, priced by the server so the figure they
+// see is the figure that gets filed.
+app.post(
+  '/api/estimate/price',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    const settings = await estimates.getSettings();
+    if (!settings.enabled)
+      return res.status(403).json({ error: 'The estimate page is not available right now.' });
+    res.json(await estimates.priceItems(req.body && req.body.items));
+  })
+);
+
+app.post(
+  '/api/estimate/request',
+  estimateLimiter,
+  wrap(async (req, res) => {
+    try {
+      const doc = await estimates.createRequest(req.body || {}, {
+        ip: clientIp(req),
+        agent: req.headers['user-agent'],
+      });
+      // A failed-attempt counter is only meant to catch abuse, so a genuine
+      // request clears it — a busy day of real enquiries never locks anyone out.
+      await clearFails(req._rlKey);
+      res.json({ ok: true, reference: 'R' + String(1000 + doc._id), total: doc.total });
+    } catch (err) {
+      if (err.status) {
+        await recordFail(req._rlKey);
+        return res.status(err.status).json({ error: err.message });
+      }
+      throw err;
+    }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Admin: the quote requests that page files, and its settings
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/admin/estimate/settings',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ settings: await estimates.getSettings(), defaults: estimates.DEFAULTS });
+  })
+);
+
+app.patch(
+  '/api/admin/estimate/settings',
+  requireAdmin,
+  wrap(async (req, res) => {
+    try {
+      res.json({ settings: await estimates.saveSettings(req.body || {}) });
+    } catch (err) {
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+  })
+);
+
+app.get(
+  '/api/admin/estimate/requests',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ requests: await estimates.listRequests(), unread: await estimates.countNew() });
+  })
+);
+
+// Approving a request is what turns it into a quote — the page never does.
+app.post(
+  '/api/admin/estimate/requests/:id/approve',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const r = await store.estimateRequests.findOne({ _id: id });
+    if (!r) return res.status(404).json({ error: 'Request not found.' });
+    if (r.quote_id)
+      return res.status(409).json({ error: 'That request has already been turned into a quote.' });
+
+    const quoteId = await store.nextId('quotes');
+    const now = new Date();
+    const quote = {
+      _id: quoteId,
+      number: 'Q' + String(1000 + quoteId),
+      customer: cleanCustomer(r.customer),
+      quote_date: now,
+      items: cleanItems(
+        (r.items || []).map((i) => ({
+          description: i.description,
+          qty: i.qty,
+          unit: i.unit,
+          unit_price: i.unit_price,
+        }))
+      ),
+      tax_rate: toNum(r.tax_rate),
+      notes: r.notes || '',
+      status: 'draft',
+      // Where it came from, so the estimator can reread the original request.
+      source: { type: 'estimate', request_id: id },
+      created_at: now,
+      updated_at: now,
+    };
+    await store.quotes.insertOne(quote);
+    await store.estimateRequests.updateOne(
+      { _id: id },
+      { $set: { status: 'approved', quote_id: quoteId, approved_at: now } }
+    );
+    res.json({ ok: true, quote: quoteView(quote) });
+  })
+);
+
+app.post(
+  '/api/admin/estimate/requests/:id/dismiss',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const r = await store.estimateRequests.findOneAndUpdate(
+      { _id: id },
+      { $set: { status: 'dismissed', dismissed_at: new Date() } }
+    );
+    if (!r) return res.status(404).json({ error: 'Request not found.' });
+    res.json({ ok: true });
+  })
+);
+
+app.delete(
+  '/api/admin/estimate/requests/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const r = await store.estimateRequests.deleteOne({ _id: Number(req.params.id) });
+    if (!r.deletedCount) return res.status(404).json({ error: 'Request not found.' });
+    res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Admin: invoices
+//
+// An invoice is money owed, so unlike a quote it tracks payments and a due
+// date. "Paid" and "overdue" are never stored — they are derived from the
+// payments and the due date every time it is read, so a recorded payment can
+// never disagree with the status shown next to it.
+// ---------------------------------------------------------------------------
+
+// Stored statuses only. paid / overdue are computed in invoiceView.
+const INVOICE_STATUSES = new Set(['draft', 'sent', 'void']);
+const DEFAULT_TERMS_DAYS = 30;
+
+function cleanPayments(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((p) => ({
+      amount: round2(toNum(p?.amount)),
+      date: p?.date ? new Date(p.date) : new Date(),
+      method: String(p?.method || '').trim(),
+      note: String(p?.note || '').trim(),
+    }))
+    .filter((p) => p.amount > 0 && !isNaN(p.date));
+}
+
+const todayLocal = () => qbo.localDay(new Date());
+
+function invoiceView(inv) {
+  const totals = quoteTotals(inv.items, inv.tax_rate);
+  const payments = (inv.payments || []).map((p) => ({ ...p, date: iso(p.date) }));
+  const paid = round2(payments.reduce((s, p) => s + toNum(p.amount), 0));
+  const balance = round2(totals.total - paid);
+  const dueDay = inv.due_date ? qbo.localDay(inv.due_date) : null;
+
+  // The stored status only says what the office did with it. Whether it is
+  // settled or late falls out of the numbers.
+  let status = inv.status || 'draft';
+  if (status !== 'void' && status !== 'draft') {
+    if (totals.total > 0 && balance <= 0) status = 'paid';
+    else if (dueDay && dueDay < todayLocal()) status = 'overdue';
+  }
+
+  return {
+    id: inv._id,
+    number: inv.number,
+    customer: inv.customer || { name: '', address: '', phone: '', email: '' },
+    items: inv.items || [],
+    tax_rate: inv.tax_rate || 0,
+    notes: inv.notes || '',
+    issue_date: iso(inv.issue_date),
+    due_date: iso(inv.due_date),
+    stored_status: inv.status || 'draft',
+    status,
+    quote_id: inv.quote_id || null,
+    // Where this invoice stands in QuickBooks, so the list can show it without
+    // asking Intuit on every page load.
+    qbo: inv.qbo
+      ? {
+          id: inv.qbo.id || null,
+          doc_number: inv.qbo.doc_number || null,
+          synced_at: iso(inv.qbo.synced_at),
+          sent_at: iso(inv.qbo.sent_at),
+          sent_to: inv.qbo.sent_to || null,
+        }
+      : null,
+    payments,
+    paid,
+    balance,
+    created_at: iso(inv.created_at),
+    updated_at: iso(inv.updated_at),
+    ...totals,
+  };
+}
+
+function readInvoiceFields(b, { partial } = {}) {
+  const set = {};
+  if (b.customer != null || !partial) set.customer = cleanCustomer(b.customer);
+  if (b.items != null || !partial) set.items = cleanItems(b.items);
+  if (b.tax_rate != null || !partial) set.tax_rate = toNum(b.tax_rate);
+  if (b.notes != null) set.notes = String(b.notes || '').trim();
+  if (b.issue_date != null) set.issue_date = b.issue_date ? new Date(b.issue_date) : new Date();
+  if (b.due_date != null) set.due_date = b.due_date ? new Date(b.due_date) : null;
+  if (b.status != null && INVOICE_STATUSES.has(b.status)) set.status = b.status;
+  if (b.payments != null) set.payments = cleanPayments(b.payments);
+  return set;
+}
+
+app.get(
+  '/api/admin/invoices',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const rows = await store.invoices.find({}, { sort: { created_at: -1 } }).toArray();
+    const invoices = rows.map(invoiceView);
+    // Totals for the header tiles. Voided invoices are money that was never
+    // owed, so they're left out of both.
+    const live = invoices.filter((i) => i.status !== 'void');
+    res.json({
+      invoices,
+      totals: {
+        outstanding: round2(live.reduce((s, i) => s + Math.max(0, i.balance), 0)),
+        overdue: round2(
+          live.filter((i) => i.status === 'overdue').reduce((s, i) => s + Math.max(0, i.balance), 0)
+        ),
+        paid: round2(live.reduce((s, i) => s + i.paid, 0)),
+        count: live.length,
+      },
+    });
+  })
+);
+
+app.get(
+  '/api/admin/invoices/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const inv = await store.invoices.findOne({ _id: Number(req.params.id) });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    res.json(invoiceView(inv));
+  })
+);
+
+app.post(
+  '/api/admin/invoices',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const set = readInvoiceFields(b, { partial: false });
+    if (!set.customer.name) return res.status(400).json({ error: 'Customer name is required.' });
+
+    const _id = await store.nextId('invoices');
+    const now = new Date();
+    const issue = set.issue_date || now;
+    const doc = {
+      _id,
+      number: 'INV-' + String(1000 + _id),
+      ...set,
+      issue_date: issue,
+      due_date: set.due_date || new Date(issue.getTime() + DEFAULT_TERMS_DAYS * 86400000),
+      status: set.status || 'draft',
+      payments: set.payments || [],
+      quote_id: Number.isInteger(b.quote_id) ? b.quote_id : null,
+      created_at: now,
+      updated_at: now,
+    };
+    await store.invoices.insertOne(doc);
+    res.json(invoiceView(doc));
+  })
+);
+
+app.patch(
+  '/api/admin/invoices/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    const set = readInvoiceFields(req.body || {}, { partial: true });
+    if (set.customer && !set.customer.name)
+      return res.status(400).json({ error: 'Customer name is required.' });
+    set.updated_at = new Date();
+    await store.invoices.updateOne({ _id: id }, { $set: set });
+    res.json(invoiceView(await store.invoices.findOne({ _id: id })));
+  })
+);
+
+// Record a payment against an invoice. Kept separate from the general edit so
+// taking money is its own deliberate action, not a side effect of saving a form.
+app.post(
+  '/api/admin/invoices/:id/payments',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    const [payment] = cleanPayments([req.body || {}]);
+    if (!payment) return res.status(400).json({ error: 'Enter a payment amount.' });
+    await store.invoices.updateOne(
+      { _id: id },
+      { $push: { payments: payment }, $set: { updated_at: new Date() } }
+    );
+    res.json(invoiceView(await store.invoices.findOne({ _id: id })));
+  })
+);
+
+app.delete(
+  '/api/admin/invoices/:id/payments/:index',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    const index = Number(req.params.index);
+    const payments = [...(inv.payments || [])];
+    if (!Number.isInteger(index) || index < 0 || index >= payments.length)
+      return res.status(404).json({ error: 'Payment not found.' });
+    payments.splice(index, 1);
+    await store.invoices.updateOne(
+      { _id: id },
+      { $set: { payments, updated_at: new Date() } }
+    );
+    res.json(invoiceView(await store.invoices.findOne({ _id: id })));
+  })
+);
+
+// Turn an accepted quote into an invoice, carrying the customer and pricing
+// across so nothing is retyped.
+app.post(
+  '/api/admin/quotes/:id/invoice',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const quoteId = Number(req.params.id);
+    const q = await store.quotes.findOne({ _id: quoteId });
+    if (!q) return res.status(404).json({ error: 'Quote not found.' });
+
+    const existing = await store.invoices.findOne({ quote_id: quoteId });
+    if (existing)
+      return res.status(409).json({
+        error: `That quote is already invoiced as ${existing.number}.`,
+        invoice_id: existing._id,
+      });
+
+    const _id = await store.nextId('invoices');
+    const now = new Date();
+    const doc = {
+      _id,
+      number: 'INV-' + String(1000 + _id),
+      customer: q.customer || { name: '', address: '', phone: '', email: '' },
+      items: q.items || [],
+      tax_rate: q.tax_rate || 0,
+      notes: q.notes || '',
+      issue_date: now,
+      due_date: new Date(now.getTime() + DEFAULT_TERMS_DAYS * 86400000),
+      status: 'draft',
+      payments: [],
+      quote_id: quoteId,
+      created_at: now,
+      updated_at: now,
+    };
+    await store.invoices.insertOne(doc);
+    // Accepting is implied by billing for it.
+    if (q.status !== 'accepted')
+      await store.quotes.updateOne({ _id: quoteId }, { $set: { status: 'accepted', updated_at: now } });
+    res.json(invoiceView(doc));
+  })
+);
+
+app.delete(
+  '/api/admin/invoices/:id',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const inv = await store.invoices.findOne({ _id: Number(req.params.id) });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    // Deleting a paid invoice erases the record of money received. Voiding
+    // keeps the number and the history, which is what the books need.
+    if ((inv.payments || []).length)
+      return res
+        .status(409)
+        .json({ error: 'This invoice has payments recorded. Void it instead of deleting it.' });
+    await store.invoices.deleteOne({ _id: Number(req.params.id) });
+    res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Invoices -> QuickBooks. QuickBooks is what actually emails a customer, so
+// this pushes the invoice across and then asks QuickBooks to send it. Pushing
+// twice updates the same QuickBooks invoice rather than making a second one.
+// ---------------------------------------------------------------------------
+
+// Record what QuickBooks said against our copy, so the UI can show where an
+// invoice stands without asking Intuit again on every page load.
+async function saveQboState(id, patch) {
+  const set = {};
+  for (const [k, v] of Object.entries(patch)) set['qbo.' + k] = v;
+  set.updated_at = new Date();
+  await store.invoices.updateOne({ _id: id }, { $set: set });
+}
+
+app.post(
+  '/api/admin/invoices/:id/quickbooks',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    if ((inv.status || 'draft') === 'void')
+      return res.status(409).json({ error: 'That invoice is void — nothing to send.' });
+
+    // Push the totals the office sees, not the raw doc, so what lands in
+    // QuickBooks matches the invoice on screen.
+    const view = invoiceView(inv);
+    const result = await qbo.pushInvoice({ ...view, qbo: inv.qbo });
+    await saveQboState(id, {
+      id: result.id,
+      doc_number: result.doc_number,
+      total: result.total,
+      customer_id: result.customer.id,
+      synced_at: new Date(),
+    });
+    res.json({
+      ok: true,
+      qbo: result,
+      link: await qbo.invoiceLink(result.id),
+      // Surfaced rather than swallowed: our flat tax percentage and
+      // QuickBooks' tax engine can legitimately disagree.
+      warning: result.mismatch
+        ? `QuickBooks totalled this at ${result.mismatch.theirs.toFixed(2)} where we have ` +
+          `${result.mismatch.ours.toFixed(2)}. QuickBooks works tax out from its own tax code, ` +
+          `so check the tax setting before sending.`
+        : null,
+    });
+  })
+);
+
+app.post(
+  '/api/admin/invoices/:id/quickbooks/send',
+  requireAdmin,
+  qbWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    if (!inv.qbo || !inv.qbo.id)
+      return res.status(409).json({ error: 'Send it to QuickBooks first.' });
+
+    const to = String((req.body && req.body.email) || (inv.customer && inv.customer.email) || '').trim();
+    if (!to)
+      return res
+        .status(400)
+        .json({ error: 'No email address to send to — add one to the invoice first.' });
+
+    const sent = await qbo.sendInvoice(inv.qbo.id, to);
+    await saveQboState(id, { sent_at: new Date(), sent_to: sent.sent_to, email_status: sent.status });
+    // Emailing it is the moment it stops being a draft on our side too.
+    if ((inv.status || 'draft') === 'draft')
+      await store.invoices.updateOne({ _id: id }, { $set: { status: 'sent' } });
+    res.json({ ok: true, sent_to: sent.sent_to, status: sent.status });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Admin: AI inbox — reads the mailbox and drafts quotes (see inbox.js).
+//
+// Nothing here sends mail or creates a quote on its own. The agent files
+// *leads*; approving one is what turns it into a quote.
+// ---------------------------------------------------------------------------
+
+const inboxWrap = (fn) => (req, res) =>
+  Promise.resolve(fn(req, res)).catch((err) => {
+    if (res.headersSent) return;
+    if (err instanceof inbox.InboxError)
+      return res
+        .status(err.status || 400)
+        .json({ error: err.message, detail: err.detail || undefined });
+    console.error(err);
+    res.status(500).json({ error: 'Server error.' });
+  });
+
+function leadView(l) {
+  return {
+    id: l._id,
+    from_name: l.from_name,
+    from_email: l.from_email,
+    subject: l.subject,
+    received_at: iso(l.received_at),
+    body: l.body,
+    status: l.status,
+    ai: l.ai || null,
+    draft: l.draft || null,
+    quote_id: l.quote_id || null,
+    created_at: iso(l.created_at),
+  };
+}
+
+app.get(
+  '/api/admin/inbox/status',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    res.json({ ...(await inbox.getStatus()), models: inbox.ALLOWED_MODELS });
+  })
+);
+
+app.patch(
+  '/api/admin/inbox/settings',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    await inbox.saveSettings(req.body || {});
+    res.json({ ...(await inbox.getStatus()), models: inbox.ALLOWED_MODELS });
+  })
+);
+
+app.post(
+  '/api/admin/inbox/test',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    res.json(await inbox.testConnection(req.body || {}));
+  })
+);
+
+app.get(
+  '/api/admin/inbox/leads',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    const status = String(req.query.status || 'new');
+    const q = status === 'all' ? {} : { status };
+    const rows = await store.inboxLeads
+      .find(q, { sort: { received_at: -1 }, limit: 100 })
+      .toArray();
+    res.json({ leads: rows.map(leadView) });
+  })
+);
+
+app.post(
+  '/api/admin/inbox/scan',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    res.json(await inbox.scan({ trigger: 'manual', actor: await adminActor(req) }));
+  })
+);
+
+// Approve a lead: create the quote from the (possibly edited) draft and mark
+// the lead done. The draft sent back from the browser wins, so a correction
+// made while reviewing is what gets saved.
+app.post(
+  '/api/admin/inbox/leads/:id/approve',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const lead = await store.inboxLeads.findOne({ _id: id });
+    if (!lead) return res.status(404).json({ error: 'Lead not found.' });
+    if (lead.quote_id)
+      return res.status(409).json({ error: 'That email has already been turned into a quote.' });
+
+    const draft = req.body && req.body.draft ? req.body.draft : lead.draft || {};
+    const customer = cleanCustomer(draft.customer);
+    if (!customer.name) return res.status(400).json({ error: 'Customer name is required.' });
+
+    const quoteId = await store.nextId('quotes');
+    const now = new Date();
+    const quote = {
+      _id: quoteId,
+      number: 'Q' + String(1000 + quoteId),
+      customer,
+      quote_date: now,
+      items: cleanItems(draft.items),
+      tax_rate: toNum(draft.tax_rate),
+      notes: String(draft.notes || '').trim(),
+      status: 'draft',
+      // Where it came from, so the estimator can reread the email later.
+      source: { type: 'inbox', lead_id: id, subject: lead.subject, from: lead.from_email },
+      created_at: now,
+      updated_at: now,
+    };
+    await store.quotes.insertOne(quote);
+    await store.inboxLeads.updateOne(
+      { _id: id },
+      { $set: { status: 'approved', quote_id: quoteId, draft, approved_at: now } }
+    );
+    res.json({ ok: true, quote: quoteView(quote) });
+  })
+);
+
+app.post(
+  '/api/admin/inbox/leads/:id/dismiss',
+  requireAdmin,
+  inboxWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const r = await store.inboxLeads.updateOne(
+      { _id: id },
+      { $set: { status: 'dismissed', dismissed_at: new Date() } }
+    );
+    if (!r.matchedCount) return res.status(404).json({ error: 'Lead not found.' });
+    res.json({ ok: true });
+  })
+);
+
+const cronInboxScan = inboxWrap(async (req, res) => {
+  if (!cronAuthorized(req)) {
+    return res.status(401).json({
+      error: process.env.CRON_SECRET
+        ? 'Not authorized.'
+        : 'CRON_SECRET is not set on the server, so the scheduled scan is disabled.',
+    });
+  }
+  res.json(await inbox.runScheduledScan());
+});
+app.get('/api/cron/inbox-scan', cronInboxScan);
+app.post('/api/cron/inbox-scan', cronInboxScan);
 
 // ---------------------------------------------------------------------------
 // Admin: "My Tasks" board — a kanban card assigned to a single employee.
@@ -2504,6 +3996,13 @@ app.post(
 // ---------------------------------------------------------------------------
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+// The public estimate maker. Served explicitly (not just as /estimate.html) so
+// the clean "/estimate" URL works on hosts that route everything through this
+// app. The page itself checks whether the feature is switched on.
+app.get('/estimate', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'estimate.html'));
+});
 
 // Old URLs that no longer exist (the shared PIN clock, old admin paths) — send
 // any stale bookmarks to the login page instead of 404ing. Employees now clock

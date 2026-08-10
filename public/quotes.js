@@ -160,6 +160,8 @@
     $('qEditorTitle').textContent = 'New quote';
     resetForm();
     $('qNotes').value = DEFAULT_TERMS;
+    // Nothing to bill for until the quote exists.
+    if ($('qToInvoice')) $('qToInvoice').style.display = 'none';
     addRow(); // start with one blank line
     showEditor();
     $('qcName').focus();
@@ -179,6 +181,7 @@
     $('qNotes').value = q.notes || '';
     $('qItems').innerHTML = '';
     (q.items && q.items.length ? q.items : [{}]).forEach(addRow);
+    if ($('qToInvoice')) $('qToInvoice').style.display = '';
     computeTotals();
   }
 
@@ -354,6 +357,29 @@
     const p = collect();
     openPrint({ number: currentNumber, ...p });
   });
+
+  // Bill for an accepted quote: copies the customer and pricing into a new
+  // invoice rather than making anyone retype it, and marks the quote accepted.
+  if ($('qToInvoice'))
+    $('qToInvoice').addEventListener('click', async () => {
+      if (editingId == null) return;
+      if (!confirm('Create an invoice from this quote?\n\nThe quote will be marked accepted.')) return;
+      $('qMsg').className = 'msg';
+      $('qMsg').textContent = 'Creating…';
+      try {
+        const inv = await api('/api/admin/quotes/' + editingId + '/invoice', { method: 'POST' });
+        $('qMsg').className = 'msg ok';
+        $('qMsg').textContent = `Invoice ${inv.number} created.`;
+        const tab = document.querySelector('.side-nav .tab[data-tab="invoices"]');
+        if (tab && tab.style.display !== 'none') {
+          tab.click();
+          if (window.Invoices) window.Invoices.openById(inv.id).catch(() => {});
+        }
+      } catch (e) {
+        $('qMsg').className = 'msg err';
+        $('qMsg').textContent = e.message;
+      }
+    });
 
   $('qItems').addEventListener('input', computeTotals);
   $('qItems').addEventListener('click', (e) => {

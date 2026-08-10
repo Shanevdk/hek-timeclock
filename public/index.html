@@ -89,16 +89,49 @@
             </button>
             <div class="clock-status" id="clockStatus"></div>
           </div>
+          <!--
+            Grouped the same way as the dashboard, with the same headings and
+            icons, so the two halves of the app read as one product. A group
+            hides itself when nothing in it is granted (see applyPermissions in
+            portal.js), which is why most employees only ever see two of these.
+          -->
           <nav class="side-nav">
-            <div class="tab active" data-tab="hours">My hours</div>
-            <div class="tab" data-tab="messages" id="navMessages">Messages <span class="nav-count" id="msgNavCount" style="display:none">0</span></div>
-            <div class="tab" data-tab="schedule">My schedule</div>
-            <div class="tab" data-tab="timeoff">Vacation</div>
-            <!-- Permission-gated tabs; portal.js reveals the ones they hold -->
-            <div class="tab" data-tab="tasks" id="navTasks" style="display:none">My Tasks</div>
-            <div class="tab" data-tab="quotes" id="navQuotes" style="display:none">Quotes</div>
-            <div class="tab" data-tab="pricing" id="navPricing" style="display:none">Pricing</div>
-            <div class="tab" data-tab="map" id="navMap" style="display:none">Map</div>
+            <div class="side-group" data-group="time">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6.25" /><path d="M8 4.5V8l2.5 1.5" /></svg>
+                <span>Time</span>
+              </div>
+              <div class="tab active" data-tab="hours">My hours</div>
+              <!-- Permission-gated; portal.js reveals the ones they hold -->
+              <div class="tab" data-tab="map" id="navMap" style="display:none">Map</div>
+            </div>
+
+            <div class="side-group" data-group="sales">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.4 1.75H4.25a1.5 1.5 0 0 0-1.5 1.5v9.5a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V5.6z" /><path d="M9.25 1.75v4h4" /><path d="M5.75 9h4.5M5.75 11.4h3" /></svg>
+                <span>Sales</span>
+              </div>
+              <div class="tab" data-tab="quotes" id="navQuotes" style="display:none">Quotes</div>
+              <div class="tab" data-tab="pricing" id="navPricing" style="display:none">Pricing</div>
+            </div>
+
+            <div class="side-group" data-group="work">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="2.25" y="3.25" width="11.5" height="10.5" rx="1.5" /><path d="M2.25 6.5h11.5M5.5 1.75v2.5M10.5 1.75v2.5" /></svg>
+                <span>Work</span>
+              </div>
+              <div class="tab" data-tab="schedule">My schedule</div>
+              <div class="tab" data-tab="tasks" id="navTasks" style="display:none">My Tasks</div>
+            </div>
+
+            <div class="side-group" data-group="team">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5.5" r="2.5" /><path d="M1.75 13.6a4.25 4.25 0 0 1 8.5 0" /><path d="M10.6 3.35a2.5 2.5 0 0 1 0 4.3M11.9 13.6a4.3 4.3 0 0 0-1.15-2.9" /></svg>
+                <span>Team</span>
+              </div>
+              <div class="tab" data-tab="messages" id="navMessages">Messages <span class="nav-count" id="msgNavCount" style="display:none">0</span></div>
+              <div class="tab" data-tab="timeoff">Vacation</div>
+            </div>
           </nav>
           <div class="theme-toggle" role="group" aria-label="Color theme">
             <button type="button" data-theme-choice="system" title="Match system" aria-label="System theme">◐</button>
@@ -121,11 +154,12 @@
           </div>
           <div class="stat-row">
             <div class="stat"><div class="n" id="myTotal">0.00</div><div class="l">Total hours</div></div>
+            <div class="stat"><div class="n" id="myKm">0</div><div class="l">Km travelled</div></div>
             <div class="stat"><div class="n" id="myEntries">0</div><div class="l">Entries</div></div>
           </div>
           <div class="card">
             <table>
-              <thead><tr><th>Clock In</th><th>Clock Out</th><th>Hours</th><th>Work done</th></tr></thead>
+              <thead><tr><th>Clock In</th><th>Clock Out</th><th>Hours</th><th>Km</th><th>Work done</th></tr></thead>
               <tbody id="myBody"></tbody>
             </table>
             <p class="status-sub" id="myEmpty" style="display:none">No entries for this range.</p>

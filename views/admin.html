@@ -63,18 +63,63 @@
         <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
         <aside class="sidebar" id="sidebar">
           <div class="side-brand">HEK <small>TIMECLOCK</small></div>
+          <!--
+            Grouped by what someone is actually doing: tracking time, selling a
+            job, planning the week, or managing people. A group hides itself
+            when every item under it is switched off (see applyEntitlements in
+            admin.js), so a client without Quotes never sees an empty "Sales".
+          -->
           <nav class="side-nav">
-            <div class="tab active" data-tab="live">On the clock</div>
-            <div class="tab" data-tab="sheets">Timesheets</div>
-            <div class="tab" data-tab="map">Map</div>
-            <div class="tab" data-tab="schedule">Schedule</div>
-            <div class="tab" data-tab="pricing">Pricing</div>
-            <div class="tab" data-tab="quotes">Quotes</div>
-            <div class="tab" data-tab="employees">Employees</div>
-            <div class="tab" data-tab="timeoff">Vacation <span class="nav-count" id="voNavCount" style="display:none">0</span></div>
-            <div class="tab" data-tab="tasks">My Tasks</div>
-            <div class="tab" data-tab="messages">Messages</div>
-            <div class="tab" data-tab="access" id="devAccessTab" style="display:none">Client access</div>
+            <div class="side-group" data-group="time">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6.25" /><path d="M8 4.5V8l2.5 1.5" /></svg>
+                <span>Time</span>
+              </div>
+              <div class="tab active" data-tab="live">On the clock</div>
+              <div class="tab" data-tab="sheets">Timesheets</div>
+              <div class="tab" data-tab="map">Map</div>
+            </div>
+
+            <div class="side-group" data-group="sales">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.4 1.75H4.25a1.5 1.5 0 0 0-1.5 1.5v9.5a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V5.6z" /><path d="M9.25 1.75v4h4" /><path d="M5.75 9h4.5M5.75 11.4h3" /></svg>
+                <span>Sales</span>
+              </div>
+              <div class="tab" data-tab="inbox">Inbox <span class="nav-count" id="ibNavCount" style="display:none">0</span></div>
+              <div class="tab" data-tab="estimate">Estimate requests <span class="nav-count" id="esNavCount" style="display:none">0</span></div>
+              <div class="tab" data-tab="quotes">Quotes</div>
+              <div class="tab" data-tab="invoices">Invoices</div>
+              <div class="tab" data-tab="pricing">Pricing</div>
+            </div>
+
+            <div class="side-group" data-group="work">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="2.25" y="3.25" width="11.5" height="10.5" rx="1.5" /><path d="M2.25 6.5h11.5M5.5 1.75v2.5M10.5 1.75v2.5" /></svg>
+                <span>Work</span>
+              </div>
+              <div class="tab" data-tab="schedule">Schedule</div>
+              <div class="tab" data-tab="tasks">My Tasks</div>
+            </div>
+
+            <div class="side-group" data-group="team">
+              <div class="side-group-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5.5" r="2.5" /><path d="M1.75 13.6a4.25 4.25 0 0 1 8.5 0" /><path d="M10.6 3.35a2.5 2.5 0 0 1 0 4.3M11.9 13.6a4.3 4.3 0 0 0-1.15-2.9" /></svg>
+                <span>Team</span>
+              </div>
+              <div class="tab" data-tab="employees">Employees</div>
+              <div class="tab" data-tab="timeoff">Vacation <span class="nav-count" id="voNavCount" style="display:none">0</span></div>
+              <div class="tab" data-tab="messages">Messages</div>
+            </div>
+
+            <div class="tab side-solo" data-tab="quickbooks">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.4 6.9a5.5 5.5 0 0 0-9.3-3.3L2.6 5" /><path d="M2.5 2.4V5H5" /><path d="M2.6 9.1a5.5 5.5 0 0 0 9.3 3.3l1.5-1.4" /><path d="M13.5 13.6V11H11" /></svg>
+              <span>QuickBooks</span>
+            </div>
+
+            <div class="tab side-solo" data-tab="access" id="devAccessTab" style="display:none">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M2.5 4.75h11M2.5 11.25h11" /><circle cx="6" cy="4.75" r="1.85" /><circle cx="10.5" cy="11.25" r="1.85" /></svg>
+              <span>Client access</span>
+            </div>
           </nav>
 
           <!-- Signed-in user + settings (gear opens theme + sign out) -->
@@ -94,6 +139,7 @@
                      style="width:100%;margin-bottom:8px" />
               <button class="btn gold sm" id="acSave" style="width:100%">Save login</button>
               <div class="msg" id="acMsg" style="min-height:0;margin:8px 0 0;font-size:13px"></div>
+
 
               <button class="btn ghost sm" id="logoutBtn" style="margin-top:12px">Sign out</button>
             </div>
@@ -133,18 +179,219 @@
               <button class="btn gold sm" id="tsLoad">Load</button>
               <button class="btn ghost sm" id="tsExport">Export CSV</button>
               <button class="btn ghost sm" id="tsAdd">+ Add entry</button>
+              <div class="field" style="justify-content:flex-end">
+                <label class="switch" title="Count the drive back to the shop as well">
+                  <span class="switch-label">Return trip</span>
+                  <input type="checkbox" id="tsRoundTrip" /><span class="slider"></span>
+                </label>
+              </div>
             </div>
           </div>
           <div class="stat-row">
             <div class="stat"><div class="n" id="tsTotal">0.00</div><div class="l">Total hours</div></div>
+            <div class="stat"><div class="n" id="tsKm">0</div><div class="l" id="tsKmLabel">Km travelled</div></div>
             <div class="stat"><div class="n" id="tsEntries">0</div><div class="l">Entries</div></div>
           </div>
           <div class="card">
             <table>
-              <thead><tr><th>Employee</th><th>Clock In</th><th>Clock Out</th><th>Hours</th><th>Work done</th></tr></thead>
+              <thead><tr><th>Employee</th><th>Clock In</th><th>Clock Out</th><th>Hours</th><th>Km</th><th>Work done</th></tr></thead>
               <tbody id="tsBody"></tbody>
             </table>
             <p class="status-sub" id="tsEmpty" style="display:none">No entries for this range.</p>
+          </div>
+        </section>
+
+        <!-- QUICKBOOKS -->
+        <section class="section" id="tab-quickbooks">
+          <!-- Connection -->
+          <div class="card qb-card">
+            <div class="qb-head">
+              <h3>QuickBooks connection</h3>
+              <span class="badge" id="qbEnvBadge" style="display:none"></span>
+            </div>
+            <p class="status-sub qb-lead">
+              Each pay period the hours below are pushed into QuickBooks so payroll opens
+              with them already filled in. QuickBooks has no way to let an app run payroll
+              or send direct deposit, so the final <strong>Run payroll</strong> click stays
+              with you.
+            </p>
+            <div class="qb-conn" id="qbConn"></div>
+            <div class="qb-needs" id="qbNeeds" style="display:none"></div>
+            <div class="msg" id="qbConnMsg"></div>
+          </div>
+
+          <!-- Intuit app keys -->
+          <div class="card qb-card" id="qbCredsCard">
+            <div class="qb-head">
+              <h3>Intuit app</h3>
+              <span class="badge" id="qbCredsSource" style="display:none"></span>
+            </div>
+            <p class="status-sub qb-lead">
+              From your app at <strong>developer.intuit.com → My Apps → Keys &amp; credentials</strong>.
+              Sandbox and production have separate keys — make sure these match the environment
+              picked below.
+            </p>
+            <div class="row">
+              <!-- An Intuit Client ID is ~36 characters, so it needs the room. -->
+              <div class="field" style="flex:2 1 330px"><label>Client ID</label>
+                <input id="qbClientId" autocomplete="off" spellcheck="false" placeholder="ABxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" /></div>
+              <div class="field" style="flex:2 1 240px"><label>Client Secret</label>
+                <input id="qbClientSecret" type="password" autocomplete="new-password" placeholder="leave blank to keep current" /></div>
+              <div class="field" style="flex:0 1 185px"><label>Environment</label>
+                <select id="qbEnvironment">
+                  <option value="sandbox">Sandbox (testing)</option>
+                  <option value="production">Production (live company)</option>
+                </select></div>
+            </div>
+            <div class="row" style="margin-top:12px">
+              <div class="field" style="flex:3 1 340px"><label>Redirect URI</label>
+                <input id="qbRedirectUri" autocomplete="off" spellcheck="false" /></div>
+              <button class="btn ghost sm" id="qbUseSuggested">Use this deployment's URL</button>
+            </div>
+            <p class="status-sub qb-lead" id="qbRedirectHint"></p>
+            <div class="row">
+              <button class="btn gold sm" id="qbSaveCreds">Save keys</button>
+              <button class="link-btn danger" id="qbClearSecret" style="margin-left:auto">Forget saved secret</button>
+            </div>
+            <div class="msg" id="qbCredsMsg"></div>
+          </div>
+
+          <!-- Pay period settings -->
+          <div class="card qb-card" id="qbSettingsCard">
+            <h3>Pay schedule</h3>
+            <p class="status-sub qb-lead">
+              Pick any pay period's first day — every other period is counted from it.
+            </p>
+            <div class="row">
+              <div class="field"><label>A pay period starts on</label>
+                <input type="date" id="qbAnchor" /></div>
+              <div class="field"><label>Length</label>
+                <select id="qbLength">
+                  <option value="14">Every two weeks</option>
+                  <option value="7">Weekly</option>
+                </select></div>
+              <div class="field"><label>Overtime after (hours/week)</label>
+                <input id="qbOtWeekly" inputmode="decimal" placeholder="0 = no split" /></div>
+              <div class="field"><label>Overtime after (hours/day)</label>
+                <input id="qbOtDaily" inputmode="decimal" placeholder="0 = off" /></div>
+            </div>
+            <p class="status-sub qb-lead">
+              Overtime thresholds are a labour-law question, so nothing is assumed —
+              44 hours/week is standard in Ontario, 40 under US federal rules. Leave it at
+              0 to send every hour as regular time.
+            </p>
+            <div class="row">
+              <div class="field"><label>Regular payroll item id</label>
+                <input id="qbRegItem" inputmode="numeric" placeholder="optional" /></div>
+              <div class="field"><label>Overtime payroll item id</label>
+                <input id="qbOtItem" inputmode="numeric" placeholder="optional" /></div>
+              <div class="field" style="justify-content:flex-end">
+                <label class="switch"><span class="switch-label">Push automatically</span>
+                  <input type="checkbox" id="qbAuto" /><span class="slider"></span></label>
+              </div>
+              <button class="btn gold sm" id="qbSaveSettings">Save</button>
+            </div>
+            <p class="status-sub qb-lead">
+              With both payroll item ids set, each day goes over as two entries — regular
+              and overtime — tagged with those items. Left blank, each day is one entry for
+              the day's total and the split is written into its description.
+            </p>
+            <div class="msg" id="qbSettingsMsg"></div>
+          </div>
+
+          <!-- Invoicing: what an invoice line bills against over there -->
+          <div class="card qb-card" id="qbInvoiceCard">
+            <div class="qb-head">
+              <h3>Invoices</h3>
+              <div class="qb-head-actions">
+                <button class="btn ghost sm" id="qbInvRefresh">Reload from QuickBooks</button>
+              </div>
+            </div>
+            <p class="status-sub qb-lead">
+              QuickBooks needs every invoice line billed against one of its products or
+              services. Pick the one your fencing work belongs to — your own wording still
+              goes across as the line description.
+            </p>
+            <div class="row">
+              <div class="field" style="flex:1 1 240px"><label>Bill invoice lines against</label>
+                <select id="qbInvItem"><option value="">— choose a product/service —</option></select></div>
+              <div class="field" style="flex:1 1 200px"><label>Tax code</label>
+                <select id="qbInvTax"><option value="">— none —</option></select></div>
+              <button class="btn gold sm" id="qbSaveInvoice">Save</button>
+            </div>
+            <p class="status-sub qb-lead">
+              Tax is left to QuickBooks. Our invoices carry a flat percentage; QuickBooks
+              works it out from the tax code and the customer, and QuickBooks is what files
+              the return. If the two totals disagree, you are told rather than left to find
+              out later.
+            </p>
+            <div class="msg" id="qbInvoiceMsg"></div>
+          </div>
+
+          <!-- Employee matching -->
+          <div class="card qb-card" id="qbMapCard">
+            <div class="qb-head">
+              <h3>Who is who</h3>
+              <div class="qb-head-actions">
+                <button class="btn ghost sm" id="qbMapAuto">Match by name</button>
+                <button class="btn ghost sm" id="qbMapRefresh">Reload from QuickBooks</button>
+              </div>
+            </div>
+            <p class="status-sub qb-lead">
+              Match each person here to the employee QuickBooks already has. Anyone left
+              unmatched is skipped — their hours are never guessed onto someone else.
+            </p>
+            <table>
+              <thead><tr><th>Employee</th><th>Pay</th><th>QuickBooks employee</th></tr></thead>
+              <tbody id="qbMapBody"></tbody>
+            </table>
+            <p class="status-sub" id="qbMapEmpty" style="display:none">
+              No hourly employees yet.
+            </p>
+            <div class="msg" id="qbMapMsg"></div>
+          </div>
+
+          <!-- Period preview + push -->
+          <div class="card qb-card" id="qbPeriodCard">
+            <div class="qb-head">
+              <h3>Pay period</h3>
+              <span class="qb-range" id="qbRange"></span>
+            </div>
+            <div class="row">
+              <button class="btn ghost sm" id="qbPrev">← Earlier</button>
+              <button class="btn ghost sm" id="qbNext">Later →</button>
+              <div class="field"><label>Or jump to a date in the period</label>
+                <input type="date" id="qbJump" /></div>
+              <button class="btn ghost sm" id="qbReload">Refresh</button>
+              <button class="btn gold sm" id="qbSync">Push to QuickBooks</button>
+            </div>
+            <div class="stat-row">
+              <div class="stat"><div class="n" id="qbStatHours">0.00</div><div class="l">Total hours</div></div>
+              <div class="stat"><div class="n" id="qbStatReg">0.00</div><div class="l">Regular</div></div>
+              <div class="stat"><div class="n" id="qbStatOt">0.00</div><div class="l">Overtime</div></div>
+              <div class="stat"><div class="n" id="qbStatPeople">0</div><div class="l">Employees</div></div>
+            </div>
+            <div class="qb-warnings" id="qbWarnings"></div>
+            <table>
+              <thead><tr><th>Employee</th><th>Days</th><th>Regular</th><th>Overtime</th><th>Total</th><th>QuickBooks</th></tr></thead>
+              <tbody id="qbPreviewBody"></tbody>
+            </table>
+            <p class="status-sub" id="qbPreviewEmpty" style="display:none">
+              Nobody has hours in this period.
+            </p>
+            <div class="msg" id="qbSyncMsg"></div>
+          </div>
+
+          <!-- History -->
+          <div class="card qb-card" id="qbRunsCard">
+            <h3>Recent pushes</h3>
+            <table>
+              <thead><tr><th>Pay period</th><th>When</th><th>By</th><th>Result</th></tr></thead>
+              <tbody id="qbRunsBody"></tbody>
+            </table>
+            <p class="status-sub" id="qbRunsEmpty" style="display:none">
+              Nothing has been pushed yet.
+            </p>
           </div>
         </section>
 
@@ -157,7 +404,8 @@
               <button class="btn gold sm" id="mapLoad">Load</button>
               <div class="field" style="flex:1;min-width:180px">
                 <p class="status-sub" style="text-align:left;margin:0">
-                  Each pin is where an employee clocked in.
+                  Scheduled jobs, the shop, and every clock-in. Drag the shop pin to
+                  put it exactly on the yard.
                 </p>
               </div>
             </div>
@@ -165,10 +413,12 @@
           <div class="card" style="padding:0;overflow:hidden">
             <div id="map"></div>
             <p class="status-sub" id="mapEmpty" style="display:none;padding:22px">
-              No clock-in locations for this range yet. A pin is saved whenever an employee
-              allows location access while clocking in.
+              Nothing to show for this range yet. Scheduled jobs appear once their address
+              is picked from the suggestions, and a clock-in pin is saved whenever an
+              employee allows location access.
             </p>
           </div>
+          <div class="card" id="mapJobs" style="margin-top:16px"></div>
         </section>
 
         <!-- QUOTES -->
@@ -254,53 +504,358 @@
             <div class="msg err" id="qMsg"></div>
             <div class="row" style="justify-content:flex-end;margin-top:12px">
               <button class="btn ghost sm" id="qPrint">Print / PDF</button>
+              <button class="btn ghost sm" id="qToInvoice" style="display:none">Convert to invoice →</button>
               <button class="btn gold sm" id="qSave">Save quote</button>
             </div>
           </div>
         </section>
 
-        <!-- SCHEDULE (jobs: address + description assigned to employees) -->
-        <section class="section" id="tab-schedule">
-          <div class="card" id="schedForm" style="margin-bottom:16px">
-            <h3 style="margin-top:0" id="schedFormTitle">Add job</h3>
-            <div class="row">
-              <div class="field" style="flex:3 1 320px;position:relative">
-                <label>Address (start typing, then pick a match)</label>
-                <input id="schedAddr" autocomplete="off" placeholder="123 Maple St, Springfield" />
-                <div class="addr-suggest" id="schedSuggest" style="display:none"></div>
+        <!-- INVOICES -->
+        <section class="section" id="tab-invoices">
+          <div id="invList">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+              <h2 style="margin:0">Invoices</h2>
+              <button class="btn gold sm" id="invNew">+ New invoice</button>
+            </div>
+            <div class="stat-row">
+              <div class="stat"><div class="n" id="invStatOutstanding">$0.00</div><div class="l">Outstanding</div></div>
+              <div class="stat"><div class="n" id="invStatOverdue">$0.00</div><div class="l">Overdue</div></div>
+              <div class="stat"><div class="n" id="invStatPaid">$0.00</div><div class="l">Collected</div></div>
+              <div class="stat"><div class="n" id="invStatCount">0</div><div class="l">Invoices</div></div>
+            </div>
+            <div class="card" style="margin-bottom:16px">
+              <div class="row">
+                <div class="field" style="flex:2 1 200px"><label>Search</label>
+                  <input type="search" id="invSearch" placeholder="Customer or invoice number…" /></div>
+                <div class="field"><label>Status</label>
+                  <select id="invFilter">
+                    <option value="">All</option>
+                    <option value="draft">Draft</option>
+                    <option value="sent">Sent</option>
+                    <option value="overdue">Overdue</option>
+                    <option value="paid">Paid</option>
+                    <option value="void">Void</option>
+                  </select></div>
               </div>
-              <div class="field" style="flex:1 1 150px"><label>Date</label><input type="date" id="schedDate" /></div>
-              <div class="field" style="flex:1 1 120px"><label>Time</label><input type="time" id="schedTime" /></div>
             </div>
-            <div class="field" style="margin-top:12px">
-              <label>Description (what's the job?)</label>
-              <textarea id="schedDesc" rows="2" placeholder="e.g. install 150ft cedar privacy fence, back yard"></textarea>
+            <div class="card">
+              <table>
+                <thead><tr><th>#</th><th>Customer</th><th>Issued</th><th>Due</th><th>Total</th><th>Balance</th><th>Status</th></tr></thead>
+                <tbody id="invBody"></tbody>
+              </table>
+              <p class="status-sub" id="invEmpty" style="display:none">
+                No invoices yet. Make one here, or accept a quote and convert it.
+              </p>
             </div>
-            <div class="field" style="margin-top:12px">
-              <label>Assign to employees</label>
-              <div class="perm-list" id="schedEmps"></div>
-            </div>
-            <div class="row" style="margin-top:12px;align-items:center">
-              <button class="btn gold sm" id="schedSave">Add job</button>
-              <button class="btn ghost sm" id="schedCancel" style="display:none">Cancel edit</button>
-            </div>
-            <div class="msg err" id="schedMsg"></div>
           </div>
-          <div class="card">
-            <table>
-              <thead><tr><th>When</th><th>Address</th><th>Description</th><th>Assigned</th><th></th></tr></thead>
-              <tbody id="schedBody"></tbody>
-            </table>
-            <p class="status-sub" id="schedEmpty" style="display:none">No jobs scheduled yet.</p>
+
+          <!-- Invoice editor -->
+          <div id="invEditor" style="display:none">
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+              <h2 style="margin:0" id="invEditorTitle">New invoice</h2>
+              <button class="btn ghost sm" id="invBack">← Back to list</button>
+            </div>
+
+            <div class="card" style="margin-bottom:16px">
+              <h3 style="margin-top:0">Bill to</h3>
+              <div class="row">
+                <div class="field" style="flex:2 1 220px"><label>Name *</label><input id="icName" placeholder="Jane Doe" /></div>
+                <div class="field" style="flex:1 1 160px"><label>Phone</label><input id="icPhone" /></div>
+                <div class="field" style="flex:2 1 220px"><label>Email</label><input id="icEmail" /></div>
+              </div>
+              <div class="row" style="margin-top:12px">
+                <div class="field" style="flex:3 1 300px"><label>Job site / address</label><input id="icAddress" /></div>
+                <div class="field" style="flex:1 1 140px"><label>Issued</label><input type="date" id="invIssue" /></div>
+                <div class="field" style="flex:1 1 140px"><label>Due</label><input type="date" id="invDue" /></div>
+                <div class="field" style="flex:1 1 140px"><label>Status</label>
+                  <select id="invStatus">
+                    <option value="draft">Draft</option>
+                    <option value="sent">Sent</option>
+                    <option value="void">Void</option>
+                  </select></div>
+              </div>
+              <p class="status-sub qb-lead" id="invDerived"></p>
+            </div>
+
+            <div class="card" style="margin-bottom:16px">
+              <h3 style="margin-top:0">Line items</h3>
+              <p class="status-sub" style="text-align:left;margin:-6px 0 12px">Quick add:</p>
+              <div class="quick-adds" id="invQuick"></div>
+              <div style="overflow-x:auto">
+                <table class="items-table">
+                  <thead><tr>
+                    <th style="min-width:200px">Description</th>
+                    <th style="width:80px">Qty</th>
+                    <th style="width:110px">Unit</th>
+                    <th style="width:120px">Unit price</th>
+                    <th style="width:110px">Line total</th>
+                    <th style="width:36px"></th>
+                  </tr></thead>
+                  <tbody id="invItems"></tbody>
+                </table>
+              </div>
+              <button class="btn ghost sm" id="invAddRow" style="margin-top:12px">+ Add line</button>
+            </div>
+
+            <div class="row" style="align-items:stretch">
+              <div class="card" style="flex:2 1 320px">
+                <label for="invNotes">Notes / terms (shown on the invoice)</label>
+                <textarea id="invNotes" rows="5" placeholder="e.g. Payment due within 30 days. Cheques payable to HEK Fencing Inc."></textarea>
+              </div>
+              <div class="card" style="flex:1 1 240px">
+                <div class="totals-line"><span>Subtotal</span><span id="invSubtotal">$0.00</span></div>
+                <div class="totals-line">
+                  <span>Tax <input id="invTax" class="tax-input" inputmode="decimal" value="0" /> %</span>
+                  <span id="invTaxAmt">$0.00</span>
+                </div>
+                <div class="totals-line grand"><span>Total</span><span id="invTotal">$0.00</span></div>
+                <div class="totals-line"><span>Paid</span><span id="invPaid">$0.00</span></div>
+                <div class="totals-line grand"><span>Balance</span><span id="invBalance">$0.00</span></div>
+              </div>
+            </div>
+
+            <!-- Payments -->
+            <div class="card" id="invPayCard" style="margin-top:16px">
+              <h3 style="margin-top:0">Payments</h3>
+              <table>
+                <thead><tr><th>Date</th><th>Method</th><th>Note</th><th>Amount</th><th></th></tr></thead>
+                <tbody id="invPayBody"></tbody>
+              </table>
+              <p class="status-sub" id="invPayEmpty" style="display:none">Nothing received yet.</p>
+              <div class="row" style="margin-top:12px">
+                <div class="field" style="flex:1 1 120px"><label>Amount</label><input id="invPayAmount" inputmode="decimal" placeholder="0.00" /></div>
+                <div class="field" style="flex:1 1 140px"><label>Date</label><input type="date" id="invPayDate" /></div>
+                <div class="field" style="flex:1 1 140px"><label>Method</label>
+                  <select id="invPayMethod">
+                    <option value="">—</option><option>Cheque</option><option>E-transfer</option>
+                    <option>Cash</option><option>Credit card</option><option>Bank transfer</option>
+                  </select></div>
+                <div class="field" style="flex:2 1 180px"><label>Note</label><input id="invPayNote" placeholder="e.g. cheque #204" /></div>
+                <button class="btn gold sm" id="invPayAdd">Record payment</button>
+              </div>
+              <div class="msg" id="invPayMsg"></div>
+            </div>
+
+            <!-- Sending goes through QuickBooks: it holds the customer, the
+                 branding and the payment link, so this app never emails one. -->
+            <div class="card qb-send" id="invQbBox" style="display:none;margin-top:16px">
+              <div class="qb-send-head">
+                <h3 style="margin:0">Send with QuickBooks</h3>
+                <span class="qb-send-state" id="invQbState"></span>
+              </div>
+              <p class="status-sub" style="text-align:left;margin:6px 0 12px" id="invQbHint"></p>
+              <div class="row">
+                <button class="btn ghost sm" id="invQbPush">Send to QuickBooks</button>
+                <button class="btn gold sm" id="invQbSend" disabled>Email it to the customer</button>
+                <a class="btn ghost sm" id="invQbOpen" target="_blank" rel="noopener" style="display:none">Open in QuickBooks</a>
+              </div>
+              <div class="msg" id="invQbMsg"></div>
+            </div>
+
+            <div class="msg err" id="invMsg"></div>
+            <div class="row" style="justify-content:space-between;margin-top:12px">
+              <button class="link-btn danger" id="invDelete" style="display:none">Delete</button>
+              <div>
+                <button class="btn ghost sm" id="invPrint">Print / PDF</button>
+                <button class="btn gold sm" id="invSave">Save invoice</button>
+              </div>
+            </div>
           </div>
         </section>
+
+        <!-- AI INBOX -->
+        <section class="section" id="tab-inbox">
+          <div class="card qb-card">
+            <div class="qb-head">
+              <h3>AI inbox</h3>
+              <div class="qb-head-actions">
+                <button class="btn ghost sm" id="ibSettingsBtn">Settings</button>
+                <button class="btn gold sm" id="ibScan">Scan now</button>
+              </div>
+            </div>
+            <p class="status-sub qb-lead">
+              Reads your mailbox, finds the emails that are asking for a fence, and drafts an
+              estimate from your own rate book. It never replies to anyone and never creates a
+              quote on its own — you review each one and approve it.
+            </p>
+            <div class="qb-needs" id="ibNeeds" style="display:none"></div>
+            <div class="msg" id="ibMsg"></div>
+          </div>
+
+          <!-- Settings (hidden until asked for) -->
+          <div class="card qb-card" id="ibSettingsCard" style="display:none">
+            <h3 style="margin-top:0">Mailbox</h3>
+            <p class="status-sub qb-lead">
+              For Gmail or Google Workspace, turn on 2-step verification and create an
+              <strong>App password</strong> — the 16-character one. Your normal password will not work.
+            </p>
+            <div class="row">
+              <div class="field" style="flex:2 1 200px"><label>Mailbox address</label>
+                <input id="ibUser" type="email" autocapitalize="none" spellcheck="false" placeholder="you@yourcompany.com" /></div>
+              <div class="field" style="flex:2 1 200px"><label>App password</label>
+                <input id="ibPass" type="password" autocomplete="new-password" placeholder="leave blank to keep current" /></div>
+              <div class="field" style="flex:1 1 160px"><label>IMAP server</label><input id="ibHost" /></div>
+              <div class="field" style="flex:0 1 90px"><label>Port</label><input id="ibPort" inputmode="numeric" /></div>
+              <div class="field" style="flex:1 1 120px"><label>Folder</label><input id="ibFolder" /></div>
+            </div>
+            <div class="row" style="margin-top:12px">
+              <div class="field" style="flex:1 1 180px"><label>Model</label><select id="ibModel"></select></div>
+              <div class="field" style="flex:0 1 130px"><label>Look back (days)</label><input id="ibLookback" inputmode="numeric" /></div>
+              <div class="field" style="flex:0 1 150px"><label>Max emails per scan</label><input id="ibMax" inputmode="numeric" /></div>
+              <div class="field" style="justify-content:flex-end">
+                <label class="switch"><span class="switch-label">Agent on</span>
+                  <input type="checkbox" id="ibEnabled" /><span class="slider"></span></label>
+              </div>
+              <div class="field" style="justify-content:flex-end">
+                <label class="switch"><span class="switch-label">Scan automatically</span>
+                  <input type="checkbox" id="ibAuto" /><span class="slider"></span></label>
+              </div>
+            </div>
+            <p class="status-sub qb-lead">
+              Each email read costs a fraction of a cent. "Max emails per scan" is the ceiling —
+              a bad filter can't run up a bill while you're not looking. Newsletters and no-reply
+              mail are skipped before the model ever sees them.
+            </p>
+            <div class="row">
+              <button class="btn ghost sm" id="ibTest">Test connection</button>
+              <button class="btn gold sm" id="ibSaveSettings">Save</button>
+              <button class="link-btn danger" id="ibClearPass" style="margin-left:auto">Forget saved password</button>
+            </div>
+            <div class="msg" id="ibSettingsMsg"></div>
+          </div>
+
+          <!-- Leads -->
+          <div class="card qb-card">
+            <div class="qb-head">
+              <h3 id="ibListTitle">Needs review</h3>
+              <div class="field" style="flex:0 1 170px">
+                <select id="ibFilter">
+                  <option value="new">Needs review</option>
+                  <option value="approved">Approved</option>
+                  <option value="dismissed">Dismissed</option>
+                  <option value="not_quote">Not a quote request</option>
+                  <option value="all">Everything</option>
+                </select>
+              </div>
+            </div>
+            <div id="ibLeads"></div>
+            <p class="status-sub" id="ibEmpty" style="display:none">Nothing here right now.</p>
+          </div>
+        </section>
+
+        <!-- SCHEDULE (jobs: address + description assigned to employees) -->
+        <section class="section" id="tab-schedule">
+          <!-- Week board: a column per day, a backlog on the left for jobs with
+               no date yet, and a "needs a crew" list on the right. Cards drag
+               between columns to move or unschedule a job. -->
+          <div class="sched-toolbar">
+            <div class="sched-week">
+              <button class="btn ghost sm" id="schedPrev" type="button" title="Previous week">←</button>
+              <div class="sched-range" id="schedRange"></div>
+              <button class="btn ghost sm" id="schedNext" type="button" title="Next week">→</button>
+              <button class="btn ghost sm" id="schedToday" type="button">This week</button>
+            </div>
+            <div class="sched-tools">
+              <input type="search" id="schedSearch" placeholder="Search address or job…" />
+              <button class="btn gold sm" id="schedNew" type="button">+ Add job</button>
+            </div>
+          </div>
+
+          <div class="sched-board" id="schedBoard"></div>
+          <p class="status-sub" id="schedEmpty" style="display:none">No jobs scheduled yet.</p>
+        </section>
+
+        <!-- Job detail — opened by clicking a card on the schedule board -->
+        <div class="modal-back" id="jobModalBack">
+          <div class="modal job-modal">
+            <div class="job-head">
+              <h3 id="jobTitle">Job</h3>
+              <div class="job-when" id="jobWhen"></div>
+            </div>
+
+            <div class="job-body">
+              <div class="job-main">
+                <div class="job-row">
+                  <label for="schedAddr">Address</label>
+                  <div class="job-field" style="position:relative">
+                    <input id="schedAddr" autocomplete="off" placeholder="123 Maple St, Springfield" />
+                    <div class="addr-suggest" id="schedSuggest" style="display:none"></div>
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label for="schedDesc">Details</label>
+                  <div class="job-field">
+                    <textarea id="schedDesc" rows="2" placeholder="e.g. MP5-ASPB Lot 50-13 Silverleaf — doors"></textarea>
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label for="schedType">Type</label>
+                  <div class="job-field job-inline">
+                    <select id="schedType">
+                      <option>Delivery</option><option>Install</option>
+                      <option>Service</option><option>Pickup</option>
+                    </select>
+                    <label class="job-sub" for="schedDue">Required by</label>
+                    <input type="date" id="schedDue" />
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label for="schedDate">Scheduled</label>
+                  <div class="job-field job-inline">
+                    <input type="date" id="schedDate" />
+                    <input type="time" id="schedTime" />
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label for="schedNotesDriver">Notes for driver(s)</label>
+                  <div class="job-field">
+                    <textarea id="schedNotesDriver" rows="2" placeholder="Goes out with the job — gate code, where to unload…"></textarea>
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label for="schedNotesInternal">Internal notes</label>
+                  <div class="job-field">
+                    <textarea id="schedNotesInternal" rows="2" placeholder="Office only — never shown to the crew"></textarea>
+                  </div>
+                </div>
+                <div class="job-row">
+                  <label></label>
+                  <div class="job-field">
+                    <label class="job-check"><input type="checkbox" id="schedConfirmed" /> Appointment confirmed</label>
+                  </div>
+                </div>
+              </div>
+
+              <div class="job-side">
+                <h4>Crew</h4>
+                <div class="perm-list" id="schedEmps"></div>
+              </div>
+            </div>
+
+            <div class="msg err" id="schedMsg"></div>
+            <div class="job-foot">
+              <div class="job-foot-left">
+                <button class="btn danger-solid sm" id="schedUnschedule" type="button">Unschedule</button>
+                <button class="link-btn danger" id="schedDelete" type="button">Delete</button>
+              </div>
+              <div class="job-foot-right">
+                <button class="btn ghost sm" id="schedCancel" type="button">Close</button>
+                <button class="btn gold sm" id="schedSave" type="button">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <!-- PRICING (the calculator UI is rendered by pricing.js) -->
         <section class="section" id="tab-pricing"></section>
 
+        <!-- ESTIMATE REQUESTS (rendered by estimates.js) -->
+        <section class="section" id="tab-estimate"></section>
+
         <!-- EMPLOYEES -->
         <section class="section" id="tab-employees">
           <h2 style="margin:0 0 14px">Employees</h2>
+
           <div class="emp-toolbar">
             <div class="tb-field"><label>Active</label>
               <select id="empActive">
@@ -742,6 +1297,10 @@
     <script src="/schedule.js"></script>
     <script src="/tasks.js"></script>
     <script src="/messages.js"></script>
+    <script src="/quickbooks.js"></script>
+    <script src="/invoices.js"></script>
+    <script src="/inbox.js"></script>
+    <script src="/estimates.js"></script>
     <script src="/account.js"></script>
     <script src="/theme.js"></script>
   </body>

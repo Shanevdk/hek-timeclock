@@ -3,9 +3,14 @@
   "outputDirectory": "public",
   "functions": {
     "api/index.js": {
-      "includeFiles": "{public,views}/**"
+      "includeFiles": "{public,views}/**",
+      "maxDuration": 60
     }
   },
+  "crons": [
+    { "path": "/api/cron/quickbooks-sync", "schedule": "0 11 * * *" },
+    { "path": "/api/cron/inbox-scan", "schedule": "0 */2 * * *" }
+  ],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api" }
   ]
