@@ -97,6 +97,17 @@ async function doConnect() {
   // doc per request, holding what the customer picked and the price the server
   // worked out. Approving one is what turns it into a real quote.
   store.estimateRequests = store.db.collection('estimate_requests');
+  // ---- App health (dev dashboard) ----
+  // One rollup document per day rather than a row per request: a busy day is a
+  // handful of $inc calls on one document, so keeping stats costs almost
+  // nothing in storage or write load.
+  store.metrics = store.db.collection('metrics');
+  // One document per (day, visitor) so unique visitors can be counted without
+  // an ever-growing array on the daily document. Expires itself.
+  store.metricVisitors = store.db.collection('metric_visitors');
+  // Recent server errors, newest first. Expires itself so it can never grow
+  // without bound.
+  store.appErrors = store.db.collection('app_errors');
 
   // Unique login email, but only for employees that actually have one set
   // (older records may have no email and must not collide on null).
@@ -127,6 +138,11 @@ async function doConnect() {
   await store.inboxLeads.createIndex({ message_id: 1 }, { unique: true });
   await store.inboxLeads.createIndex({ status: 1, received_at: -1 });
   await store.estimateRequests.createIndex({ status: 1, created_at: -1 });
+  // Health data ages out on its own — 60 days is plenty to spot a trend.
+  await store.metricVisitors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 });
+  await store.metricVisitors.createIndex({ day: 1 });
+  await store.appErrors.createIndex({ at: -1 });
+  await store.appErrors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 });
   // Auto-remove stale rate-limit records an hour after they were last touched.
   await store.rateLimits.createIndex({ windowStart: 1 }, { expireAfterSeconds: 3600 });
 }

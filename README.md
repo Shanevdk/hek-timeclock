@@ -95,6 +95,7 @@ Render pick **New + → Blueprint** and set the same environment variables above
 | --- | --- |
 | `DATABASE_URL` | MongoDB connection string. **Required.** |
 | `DB_NAME` | Database name inside the cluster (default `hektimeclock`). |
+| `DB_STORAGE_LIMIT_MB` | Storage the plan allows, in MB — what "storage left" is measured against (default `512`, the Atlas free tier). Ignored on a server that reports a real disk. |
 | `ADMIN_EMAIL` | Email admins sign in with (default `admin@hekfencing.com`). |
 | `ADMIN_PASSWORD` | Password for the admin dashboard. **Set this.** |
 | `SESSION_SECRET` | Random string signing the login cookie. |

@@ -25,6 +25,7 @@ const qbo = require('./quickbooks');
 const rateBook = require('./ratebook');
 const inbox = require('./inbox');
 const estimates = require('./estimates');
+const metrics = require('./metrics');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -83,6 +84,41 @@ app.use(
     sameSite: 'lax',
   })
 );
+
+// Count every request for the dev dashboard. This runs on 'finish', i.e. after
+// the response has been sent, so measuring never slows anybody down, and a
+// failure to record is swallowed — statistics must not break the app.
+app.use((req, res, next) => {
+  const started = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    const path = req.path || '';
+    // Static assets are noise on a usage chart: a page view already implies
+    // its stylesheet and scripts.
+    if (/.(css|js|png|jpe?g|svg|ico|webmanifest|map|woff2?)$/i.test(path)) return;
+    const who =
+      req.session && req.session.role === 'dev'
+        ? 'dev'
+        : req.session && req.session.admin
+          ? 'admin'
+          : req.session && req.session.employeeId
+            ? 'employee'
+            : 'public';
+    metrics
+      .record({
+        path,
+        status: res.statusCode,
+        ms,
+        ip: clientIp(req),
+        agent: req.headers['user-agent'],
+        timezone: TIMEZONE,
+        isPage: !path.startsWith('/api/'),
+        who,
+      })
+      .catch(() => {});
+  });
+  next();
+});
 
 // The "dev" account is a limited admin: it can use the dashboard's non-clock-in
 // features (quotes, pricing, scheduling, employees) but not the timeclock data,
@@ -421,6 +457,19 @@ function requireMyFeature(perm) {
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
     console.error(err);
+    // Keep it for the dev dashboard as well as the log — a log line on a
+    // serverless host is gone the moment you look away.
+    metrics
+      .recordError({
+        path: req.path,
+        method: req.method,
+        status: 500,
+        message: err && err.message,
+        stack: err && err.stack,
+        who: req.session && req.session.admin ? 'admin' : req.session && req.session.employeeId ? 'employee' : 'anonymous',
+        timezone: TIMEZONE,
+      })
+      .catch(() => {});
     if (!res.headersSent) res.status(500).json({ error: 'Server error.' });
   });
 
@@ -1150,6 +1199,32 @@ app.patch(
   wrap(async (req, res) => {
     const next = await setEntitlements(req.body || {});
     res.json({ features: featureList(next) });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Dev: app health. Usage, errors and what the app actually holds.
+//
+// Dev-only on purpose: it reports on the client's install rather than being
+// part of it, and the error list carries stack traces.
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/dev/stats',
+  requireDev,
+  wrap(async (req, res) => {
+    res.json(await metrics.report({ days: Number(req.query.days) || 30, timezone: TIMEZONE }));
+  })
+);
+
+// Clear the error list once they have been dealt with, so "0 errors" can mean
+// something. The daily counts stay — the history is the point of them.
+app.delete(
+  '/api/dev/stats/errors',
+  requireDev,
+  wrap(async (req, res) => {
+    const r = await store.appErrors.deleteMany({});
+    res.json({ ok: true, cleared: r.deletedCount });
   })
 );
 
@@ -4015,6 +4090,26 @@ for (const legacy of ['/timeclock', '/fence', '/office']) {
 // so it is not reachable at a guessable /admin or /admin.html URL.
 app.get(ADMIN_PATH, (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'admin.html'));
+});
+
+// Anything that threw outside a wrap()ed handler still lands here, so the dev
+// dashboard sees it rather than only the console. Registered after the routes,
+// which is where Express looks for an error handler.
+app.use((err, req, res, next) => {
+  console.error(err);
+  metrics
+    .recordError({
+      path: req.path,
+      method: req.method,
+      status: err && err.status ? err.status : 500,
+      message: err && err.message,
+      stack: err && err.stack,
+      who: req.session && req.session.admin ? 'admin' : req.session && req.session.employeeId ? 'employee' : 'anonymous',
+      timezone: TIMEZONE,
+    })
+    .catch(() => {});
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Server error.' });
 });
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));

@@ -166,6 +166,8 @@
     ['live', 'sheets'].forEach((t) => setTabVisible(t, false));
     const devTab = $('devAccessTab');
     if (devTab) devTab.style.display = '';
+    const healthTab = $('devHealthTab');
+    if (healthTab) healthTab.style.display = '';
     syncNavGroups();
     // The dev account's login comes from the environment — hide that editor.
     ['acLabel', 'acEmail', 'acPass', 'acSave', 'acMsg'].forEach((id) => {
@@ -317,6 +319,8 @@
       if (t.dataset.tab === 'messages' && window.Messages)
         window.Messages.load().catch((e) => alert(e.message));
       if (t.dataset.tab === 'access') loadDevFeatures().catch((e) => alert(e.message));
+      if (t.dataset.tab === 'health' && window.DevStats)
+        window.DevStats.load().catch((e) => alert(e.message));
       if (t.dataset.tab === 'quickbooks' && window.QuickBooks)
         window.QuickBooks.load().catch((e) => alert(e.message));
       if (t.dataset.tab === 'pricing' && window.Pricing)

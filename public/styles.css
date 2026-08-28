@@ -1990,3 +1990,118 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   .job-row { flex-direction: column; gap: 4px; }
   .job-row > label { text-align: left; flex: none; padding-top: 0; }
 }
+
+/* ===================== App health (dev dashboard) ===================== */
+/* Chart colours are their own slots, not the UI accents: the brand gold is too
+   low-chroma to read as a data mark (it validates as "reads gray"), so the
+   plot uses a deeper amber that clears the chroma and contrast checks on both
+   surfaces. Dark values are stepped for the dark surface, not flipped. */
+#tab-health {
+  --dv-series:  #b8791f;   /* counts */
+  --dv-bad:     #c0453b;   /* errors — the reserved status colour */
+  --dv-grid:    #e3ddd2;
+  --dv-ink:     #6f685f;
+}
+/* Dark values are stepped for the dark surface, not an automatic flip. Both
+   scopes are declared so the theme toggle wins either way. */
+:root[data-theme='dark'] #tab-health {
+  --dv-series: #c2851f;
+  --dv-bad:    #d15b52;
+  --dv-grid:   #2c2c2c;
+  --dv-ink:    #9a938a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme='light'])) #tab-health {
+    --dv-series: #c2851f;
+    --dv-bad:    #d15b52;
+    --dv-grid:   #2c2c2c;
+    --dv-ink:    #9a938a;
+  }
+}
+
+/* KPI row */
+.dv-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.dv-tile { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+.dv-tile-n { font-size: 30px; font-weight: 800; line-height: 1.1; color: var(--text); }
+.dv-tile-n .dv-unit { font-size: 15px; font-weight: 600; color: var(--muted); margin-left: 3px; }
+.dv-tile-l { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 4px; }
+.dv-tile-s { font-size: 12px; color: var(--muted); margin-top: 2px; }
+/* Status tone ships with its label, never colour alone. */
+.dv-tile.good .dv-tile-n { color: var(--green); }
+.dv-tile.bad .dv-tile-n { color: var(--red); }
+.dv-tile.warn .dv-tile-n { color: var(--dv-series); }
+
+.dv-card { margin-bottom: 16px; }
+.dv-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.dv-head h3 { margin: 0; font-size: 15px; }
+.dv-note { font-size: 12px; color: var(--muted); }
+.dv-range { padding: 8px 10px; font-size: 14px; }
+.dv-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* The plot itself */
+.dv-plot { position: relative; }
+.dv-svg { width: 100%; height: 190px; display: block; overflow: visible; }
+.dv-grid { stroke: var(--dv-grid); stroke-width: 1; }
+.dv-axis { fill: var(--dv-ink); font-size: 11px; font-family: inherit; }
+.dv-line { fill: none; stroke: var(--dv-series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.dv-line.bad { stroke: var(--dv-bad); }
+.dv-area { fill: var(--dv-series); opacity: .10; stroke: none; }
+.dv-area.bad { fill: var(--dv-bad); }
+/* The newest point is the one people look for, so it keeps a marker. */
+.dv-last { fill: var(--dv-series); stroke: var(--panel); stroke-width: 2; }
+.dv-last.bad { fill: var(--dv-bad); }
+.dv-crosshair { stroke: var(--dv-ink); stroke-width: 1; stroke-dasharray: 3 3; opacity: .7; }
+.dv-dot { fill: var(--dv-series); stroke: var(--panel); stroke-width: 2; }
+.dv-dot.bad { fill: var(--dv-bad); }
+.dv-hit { fill: transparent; cursor: crosshair; }
+
+.dv-tip {
+  position: absolute; transform: translate(-50%, -100%);
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 10px; font-size: 12px; line-height: 1.45;
+  box-shadow: 0 4px 14px rgba(0,0,0,.18); pointer-events: none; white-space: nowrap; z-index: 5;
+}
+
+/* Horizontal bars: magnitude off a shared baseline */
+.dv-bars { display: flex; flex-direction: column; gap: 7px; }
+.dv-bar-row { display: grid; grid-template-columns: minmax(90px, 34%) 1fr auto; gap: 10px; align-items: center; }
+.dv-bar-label { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dv-bar-track { background: var(--panel-2); border-radius: 4px; height: 12px; overflow: hidden; }
+.dv-bar { display: block; height: 100%; background: var(--dv-series); border-radius: 4px; }
+.dv-bar-n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.dv-kvs { display: flex; flex-direction: column; gap: 2px; }
+.dv-kvs > div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.dv-kvs > div:last-child { border-bottom: none; }
+.dv-kvs span:first-child { color: var(--muted); }
+
+/* Meter: one ratio against a limit. The unfilled track is a wash of the same
+   colour as the fill rather than plain grey, so the state reads across the
+   whole bar and not just the filled part. Green-amber-red is the one run a
+   colourblind reader cannot separate, so the state is spelled out in words
+   beside it — the colour is the echo, never the message. */
+.dv-meter { margin-top: 12px; --dv-meter: var(--green); }
+.dv-meter.warn { --dv-meter: var(--dv-series); }
+.dv-meter.crit { --dv-meter: var(--dv-bad); }
+.dv-meter-title { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 14px; }
+.dv-meter-note { font-size: 12px; color: var(--muted); margin: 2px 0 0; }
+.dv-meter-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+.dv-meter-word { font-size: 13px; color: var(--text); }
+.dv-meter-pct { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dv-meter-track { position: relative; height: 12px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+.dv-meter-track::before { content: ''; position: absolute; inset: 0; background: var(--dv-meter); opacity: .16; }
+.dv-meter-fill { position: relative; display: block; height: 100%; border-radius: 4px; background: var(--dv-meter); }
+.dv-meter-ends {
+  display: flex; justify-content: space-between; gap: 12px;
+  margin-top: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+
+.dv-errors { width: 100%; font-size: 13px; }
+.dv-errors th { font-size: 12px; color: var(--muted); text-align: left; }
+.dv-err-row { cursor: help; }
+.dv-table-view { margin-top: 4px; }
+.dv-table-view summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 6px 0; }
+
+@media (max-width: 820px) {
+  .dv-cols { grid-template-columns: 1fr; }
+}
