@@ -595,7 +595,11 @@
     const crew = job.employee_ids || [];
     const late = job.date && job.date < todayStr();
     const state = !crew.length ? 'nocrew' : late ? 'past' : 'ok';
-    const title = (job.description || '').split('\n')[0].trim() || job.address;
+    // The first line of the description names the job; the rest is detail that
+    // belongs on the card too — a card you have to open to recognise is no use
+    // on a board you are meant to read at a glance.
+    const lines = (job.description || '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const title = lines.shift() || job.address;
     // Late against what the customer asked for — the thing worth spotting from
     // across the room.
     const overdue = job.due_date && job.date && job.date > job.due_date;
@@ -617,16 +621,16 @@
           selected.has(job.id) ? ' checked' : ''
         } title="Select for bulk scheduling" />
         <div class="sched-card-title">${esc(title)}</div>
+        <div class="sched-card-icons">
+          ${job.notes_driver ? '<span title="Notes for the crew">📄</span>' : ''}
+          ${fileCount(job) ? `<span title="${fileCount(job)} file(s)">📎</span>` : ''}
+          ${crew.length > 1 ? `<span class="sched-x">× ${crew.length}</span>` : ''}
+        </div>
       </div>
+      ${lines.map((l) => `<div class="sched-card-line">${esc(l)}</div>`).join('')}
       ${multi ? `<div class="sched-span">Day ${nth} of ${total}</div>` : ''}
       <a class="sched-card-addr" href="${mapsUrl(job)}" target="_blank" rel="noopener"
          title="Open directions">📍 ${esc(job.address)}</a>
-      <div class="sched-card-meta">
-        ${job.time ? `<span class="sched-card-time">${esc(job.time)}</span>` : ''}
-        ${job.job_type && job.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(job.job_type)}</span>` : ''}
-        ${job.confirmed ? '<span class="sched-tag ok">Confirmed</span>' : ''}
-        ${fileCount(job) ? `<span class="sched-tag">📎 ${fileCount(job)}</span>` : ''}
-      </div>
       ${
         job.due_date
           ? `<div class="sched-req${overdue ? ' late' : ''}">Req: ${esc(
@@ -634,17 +638,77 @@
             )}</div>`
           : ''
       }
-      <div class="sched-card-foot">
-        ${
-          crew.length
-            ? crew.map((id) => `<span class="sched-chip" title="${esc(
-                (allEmployees.find((e) => e.id === id) || {}).name || ''
-              )}">${esc(initialsFor(id))}</span>`).join('')
-            : '<span class="sched-nocrew">No crew yet</span>'
-        }
-        <button class="link-btn danger sched-del" data-del="${job.id}" title="Delete">✕</button>
+      <div class="sched-card-meta">
+        ${job.time ? `<span class="sched-card-time">${esc(job.time)}</span>` : ''}
+        ${job.job_type && job.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(job.job_type)}</span>` : ''}
+        ${job.confirmed ? '<span class="sched-tag ok">Confirmed</span>' : ''}
       </div>
+      ${
+        crew.length
+          ? `<div class="sched-card-crew">${crew
+              .map(
+                (id) =>
+                  `<span class="sched-chip" title="${esc(
+                    (allEmployees.find((e) => e.id === id) || {}).name || ''
+                  )}">${esc(initialsFor(id))}</span>`
+              )
+              .join('')}</div>`
+          : '<div class="sched-unassigned">Unassigned</div>'
+      }
+      <button class="link-btn danger sched-del" data-del="${job.id}" title="Delete">✕</button>
+      <span class="sched-card-open" aria-hidden="true">↗</span>
     </article>`;
+  }
+
+  // Inside a day, jobs sit under whoever is on them — one lane per crew member,
+  // then everything still unassigned. A dispatcher reads the board by person
+  // ("what is Coltyn on for Tuesday"), not as an undifferentiated pile of cards.
+  // A job with several people on it appears in each of their lanes and carries a
+  // × count, so nobody has to open it to see that it is shared.
+  function groupsForDay(dayJobs) {
+    const byEmp = new Map();
+    const loose = [];
+    for (const j of dayJobs) {
+      const crew = j.employee_ids || [];
+      if (!crew.length) {
+        loose.push(j);
+        continue;
+      }
+      for (const id of crew) {
+        if (!byEmp.has(id)) byEmp.set(id, []);
+        byEmp.get(id).push(j);
+      }
+    }
+    const groups = [...byEmp.entries()]
+      .map(([id, jobs]) => ({
+        id,
+        name: (allEmployees.find((e) => e.id === id) || {}).name || '(removed)',
+        jobs,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (loose.length) groups.push({ id: null, name: 'Unassigned', jobs: loose });
+    return groups;
+  }
+
+  // A stable colour per crew member, so the same person reads as the same colour
+  // on every day of every week. Derived from the id rather than stored, so
+  // adding somebody never recolours anyone else.
+  const crewHue = (id) => (Number(id) * 47) % 360;
+
+  function groupHtml(g, day) {
+    const cards = g.jobs.map((j) => cardHtml(j, day)).join('');
+    if (g.id == null)
+      return `<section class="sched-group loose">
+        <div class="sched-group-head">Unassigned (${g.jobs.length})</div>
+        ${cards}
+      </section>`;
+    return `<section class="sched-group" style="--crew-hue:${crewHue(g.id)}">
+      <div class="sched-group-head named">
+        <span class="sched-group-name">${esc(g.name)}</span>
+        <span class="sched-group-count">${g.jobs.length}</span>
+      </div>
+      ${cards}
+    </section>`;
   }
 
   // How many weeks the board draws at once. The board is a continuous run of
@@ -705,7 +769,7 @@
         <span class="sched-day-date">${cellDate(day)}</span>
       </div>
       <div class="sched-day-body" data-drop="${day}">
-        ${dayJobs.map((j) => cardHtml(j, day)).join('')}
+        ${groupsForDay(dayJobs).map((g) => groupHtml(g, day)).join('')}
       </div>
       <div class="sched-day-free">
         <div class="sched-free-label">Unbooked:</div>

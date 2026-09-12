@@ -1844,10 +1844,11 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   padding: 7px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 9px;
   background: var(--panel);
-  /* Keeps an empty day a big enough target to drop a card onto. */
-  min-height: 96px;
+  /* Tall enough that a day's work is actually readable without opening
+     anything. The row stretches further when a busy day needs it. */
+  min-height: 420px;
   flex: 1;
 }
 .sched-day.is-past .sched-day-body { background: var(--panel-2); }
@@ -1925,6 +1926,96 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   outline: 2px dashed var(--gold);
   outline-offset: -4px;
 }
+
+
+/* ---- crew lanes inside a day ----
+   Jobs sit under whoever is on them, so the board can be read by person rather
+   than as a pile of cards. Each crew member keeps one colour across every day
+   of every week, derived from their id. */
+.sched-group { display: flex; flex-direction: column; gap: 6px; }
+.sched-group.named-wrap { gap: 0; }
+.sched-group-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 1px 2px;
+}
+/* A named lane is boxed and tinted so its cards read as belonging together. */
+.sched-group:has(.named) {
+  border: 1.5px solid hsl(var(--crew-hue) 55% 58% / .9);
+  border-radius: 9px;
+  padding: 0 0 6px;
+  background: hsl(var(--crew-hue) 60% 55% / .10);
+  gap: 6px;
+}
+.sched-group-head.named {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  background: hsl(var(--crew-hue) 65% 62% / .55);
+  padding: 5px 8px;
+  border-radius: 8px 8px 0 0;
+  margin-bottom: 2px;
+}
+.sched-group-name { font-weight: 700; }
+.sched-group-count {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 20px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 17px;
+  text-align: center;
+}
+.sched-group:has(.named) > .sched-card { margin: 0 6px; }
+
+/* ---- card detail ----
+   Everything needed to recognise a job without opening it: what it is, the
+   lines of its description, where it is, and when the customer wants it. */
+.sched-card-icons { margin-left: auto; display: flex; gap: 4px; font-size: 11px; }
+.sched-x {
+  font-weight: 700;
+  font-size: 10.5px;
+  padding: 0 5px;
+  border-radius: 20px;
+  background: var(--text);
+  color: var(--panel);
+}
+.sched-card-line {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.35;
+  word-break: break-word;
+}
+.sched-unassigned {
+  margin-top: 4px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--red);
+  font-weight: 600;
+}
+.sched-card-crew { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+/* The delete cross and the open arrow sit in the corners rather than in the
+   flow, so a card with three description lines still ends tidily. */
+.sched-card { position: relative; padding-bottom: 16px; }
+.sched-card .sched-del { position: absolute; right: 5px; bottom: 2px; }
+.sched-card-open {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0;
+}
+.sched-card:hover .sched-card-open { opacity: .75; }
 
 /* ---- drag scroll buttons ----
    The grid is taller than the screen, and an HTML5 drag won't scroll the page
