@@ -1945,7 +1945,35 @@ app.delete(
 // loads file data). The crew sees the same shelf in the portal, read-only.
 // ---------------------------------------------------------------------------
 
-const JOB_FILE_MAX = 4 * 1024 * 1024; // 4 MB per file — same cap as task attachments
+// ---- Serverless response ceiling -----------------------------------------
+// Netlify Functions cap a response at 6 MB, and serverless-http base64-encodes
+// binary bodies on the way out, which inflates them by 4/3. So a file small
+// enough to store can still be too big to hand back — and when that happens the
+// platform kills the whole invocation with its own "This function has crashed"
+// page, which tells the crew nothing and looks like the app is down.
+//
+// The ceiling is therefore stated once, here. Upload caps are derived from it
+// rather than picked to sit near it by coincidence, and every stored file is
+// measured against it before it is sent.
+const FN_RESPONSE_MAX = 6291556; // bytes, Netlify's documented limit
+// Headers, the response envelope, and a long multi-byte filename all ride along
+// with the body and count towards the same budget.
+const FN_RESPONSE_HEADROOM = 96 * 1024;
+const FN_BODY_MAX = FN_RESPONSE_MAX - FN_RESPONSE_HEADROOM;
+const base64Size = (n) => Math.ceil(n / 3) * 4;
+// The largest raw blob whose base64 form still fits inside that budget.
+const BLOB_MAX = Math.floor((FN_BODY_MAX * 3) / 4);
+
+// Filenames come from whoever uploaded the file, so they are escaped before
+// being written into the oversized-file page below.
+const escHtml = (v) =>
+  String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+  );
+
+// 4 MB reads well to a person and is comfortably inside what can be sent
+// back; the min() is what guarantees the second part stays true.
+const JOB_FILE_MAX = Math.min(4 * 1024 * 1024, BLOB_MAX);
 
 // A folder path such as "Permits/Approved". At most five levels, each trimmed
 // of the characters that make a name awkward to show; "" is the job's root.
@@ -1983,13 +2011,37 @@ async function jobOr404(req, res) {
 }
 
 // Stream one stored file back to the browser.
-function sendJobFile(res, blob) {
+// Hand a stored file back to the browser.
+//
+// These URLs are opened as a navigation, not fetched, so the reply has to be
+// readable by a person: an oversized file answers with a short page saying so,
+// rather than being sent anyway and taking the whole function down with it.
+// Files stored before the cap existed are the ones that hit this.
+function sendStoredFile(res, blob) {
   const raw = blob.data;
   const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw && raw.buffer ? raw.buffer : raw);
+  if (base64Size(buf.length) > FN_BODY_MAX) {
+    const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+    res.status(413).type('html').send(
+      `<!doctype html><meta charset="utf-8">` +
+        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+        `<style>body{font:16px/1.5 system-ui,sans-serif;margin:0;padding:32px 24px;` +
+        `background:#0d0d0d;color:#f3f0ea}h1{font-size:20px;margin:0 0 12px}` +
+        `p{margin:0 0 10px;color:#9a938a}b{color:#f3f0ea}</style>` +
+        `<h1>This file is too big to open here</h1>` +
+        `<p><b>${escHtml(blob.filename || 'The file')}</b> is ${mb(buf.length)} MB. ` +
+        `Anything over about ${mb(BLOB_MAX)} MB can't be sent through the app.</p>` +
+        `<p>Ask the office to send it to you another way.</p>`
+    );
+    return;
+  }
   res.setHeader('Content-Type', blob.content_type || 'application/octet-stream');
   res.setHeader('Content-Disposition', `inline; filename="${safeName(blob.filename)}"`);
   res.send(buf);
 }
+
+// Kept as the old name so both job-file routes read the same as before.
+const sendJobFile = sendStoredFile;
 
 app.post(
   '/api/admin/schedules/:id/folders',
@@ -4094,7 +4146,7 @@ app.post(
 
 // Task file attachments. The blob lives in its own collection; only lightweight
 // metadata is mirrored onto the task so the board lists files without the data.
-const TASK_ATTACH_MAX = 4 * 1024 * 1024; // 4 MB per file (Netlify-payload safe)
+const TASK_ATTACH_MAX = JOB_FILE_MAX; // one cap, one reason — see BLOB_MAX
 const safeName = (s) => String(s || 'file').replace(/[\r\n"\\]/g, '').slice(0, 200) || 'file';
 
 app.post(
@@ -4150,11 +4202,9 @@ app.get(
       task_id: Number(req.params.id),
     });
     if (!blob) return res.status(404).json({ error: 'Attachment not found.' });
-    const raw = blob.data;
-    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw && raw.buffer ? raw.buffer : raw);
-    res.setHeader('Content-Type', blob.content_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName(blob.filename)}"`);
-    res.send(buf);
+    // Same guard as job files: an attachment too big to send back must say so
+    // rather than crash the function.
+    sendStoredFile(res, blob);
   })
 );
 
