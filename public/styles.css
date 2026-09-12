@@ -1215,8 +1215,21 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   text-align: center;
 }
 
-/* Clock in / out modal */
-.clock-modal { max-width: 400px; }
+/* Clock in / out modal.
+   The form is taller than a phone screen — more so since kms, shop time, lunch
+   and notes were added — so the panel scrolls itself and the footer stays stuck
+   to the bottom of it. Without this the Clock Out button sits below the fold
+   with nothing to scroll, and the crew cannot finish their day.
+   dvh, not vh: on iOS vh is the height with the URL bar hidden, so a vh-sized
+   panel is taller than what you can actually see. vh first as a fallback for
+   browsers that do not know dvh. */
+.clock-modal {
+  max-width: 400px;
+  max-height: 92vh;
+  max-height: 92dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .cm-head {
   display: flex;
   justify-content: space-between;
@@ -1319,6 +1332,13 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   gap: 10px;
   justify-content: flex-end;
   margin-top: 16px;
+  /* Sticks to the bottom of the scrolling panel, so "Clock Out" is on screen
+     whatever the crew has scrolled to. -1px kills a subpixel gap that would
+     let content show through underneath it. */
+  position: sticky;
+  bottom: -1px;
+  background: var(--panel);
+  padding: 10px 0 2px;
 }
 .cm-foot .btn { min-width: 110px; }
 
