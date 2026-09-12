@@ -20,6 +20,7 @@ const store = {
   counters: null,
   quotes: null,
   schedules: null,
+  jobFiles: null,
   tasks: null,
   vacations: null,
   bulletins: null,
@@ -62,6 +63,10 @@ async function doConnect() {
   store.quotes = store.db.collection('quotes');
   // Scheduled jobs: an address + description assigned to one or more employees.
   store.schedules = store.db.collection('schedules');
+  // Files attached to a scheduled job. The binary blob lives here (one doc per
+  // file); lightweight metadata is mirrored onto the job doc so the job page
+  // lists files and folders without loading any file data.
+  store.jobFiles = store.db.collection('job_files');
   // "My Tasks" board — a kanban card assigned to a single employee, with
   // status columns (todo / in_progress / done), comments, time, and history.
   store.tasks = store.db.collection('tasks');
@@ -120,6 +125,7 @@ async function doConnect() {
   await store.quotes.createIndex({ created_at: -1 });
   await store.schedules.createIndex({ date: 1 });
   await store.schedules.createIndex({ employee_ids: 1 });
+  await store.jobFiles.createIndex({ job_id: 1 });
   await store.tasks.createIndex({ status: 1, order: 1 });
   await store.tasks.createIndex({ assignee_id: 1 });
   await store.taskAttachments.createIndex({ task_id: 1 });

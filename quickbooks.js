@@ -811,12 +811,14 @@ async function listQboEmployees() {
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
-// A punch's paid length in hours. Open punches contribute nothing — they're
-// reported as a warning instead, since nobody should be paid for a shift that
-// hasn't been closed out.
+// A punch's paid length in hours: the shift itself, plus the shop/load time
+// entered at clock-out, minus the unpaid lunch. Open punches contribute nothing
+// — they're reported as a warning instead, since nobody should be paid for a
+// shift that hasn't been closed out.
 function punchHours(p) {
   if (!p.clock_out) return null;
-  return (new Date(p.clock_out) - new Date(p.clock_in)) / 3600000;
+  const raw = (new Date(p.clock_out) - new Date(p.clock_in)) / 3600000;
+  return Math.max(0, raw + (Number(p.shop_hours) || 0) - (Number(p.lunch_hours) || 0));
 }
 
 // Split one employee's days into regular and overtime, respecting both

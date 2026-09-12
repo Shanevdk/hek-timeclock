@@ -185,7 +185,10 @@
               <button class="btn ghost sm" id="tsExport">Export CSV</button>
               <button class="btn ghost sm" id="tsAdd">+ Add entry</button>
               <div class="field" style="justify-content:flex-end">
-                <label class="switch" title="Count the drive back to the shop as well">
+                <label
+                  class="switch"
+                  title="Only affects estimated distances — entries where the crew typed their own kms use that figure"
+                >
                   <span class="switch-label">Return trip</span>
                   <input type="checkbox" id="tsRoundTrip" /><span class="slider"></span>
                 </label>
@@ -766,6 +769,38 @@
             </div>
           </div>
 
+
+          <!-- Bulk bar: appears as soon as cards are ticked, and acts on every
+               selected job at once — one date, one crew change, one request. -->
+          <div class="sched-bulk" id="schedBulk" hidden>
+            <span class="sched-bulk-count" id="schedBulkCount">0 selected</span>
+            <label class="sched-bulk-field">Date
+              <input type="date" id="schedBulkDate" />
+            </label>
+            <label class="sched-bulk-field">Through
+              <input type="date" id="schedBulkEnd" />
+            </label>
+            <label class="sched-bulk-field">Time
+              <input type="time" id="schedBulkTime" />
+            </label>
+            <details class="sched-crew-menu" id="schedBulkCrewMenu">
+              <summary class="btn ghost sm">Crew ▾</summary>
+              <div class="sched-crew-pop">
+                <select id="schedBulkCrewMode">
+                  <option value="add">Add to crew</option>
+                  <option value="replace">Replace crew</option>
+                  <option value="remove">Remove from crew</option>
+                </select>
+                <div class="perm-list" id="schedBulkEmps"></div>
+              </div>
+            </details>
+            <button class="btn gold sm" id="schedBulkApply" type="button">Apply to selected</button>
+            <button class="btn ghost sm" id="schedBulkUnschedule" type="button">Unschedule</button>
+            <button class="btn ghost sm" id="schedBulkDelete" type="button">Delete</button>
+            <button class="link-btn" id="schedBulkClear" type="button">Clear selection</button>
+            <span class="sched-bulk-msg" id="schedBulkMsg"></span>
+          </div>
+
           <div class="sched-board" id="schedBoard"></div>
           <p class="status-sub" id="schedEmpty" style="display:none">No jobs scheduled yet.</p>
         </section>
@@ -809,6 +844,13 @@
                   <div class="job-field job-inline">
                     <input type="date" id="schedDate" />
                     <input type="time" id="schedTime" />
+                    <!-- Leave blank for a one-day job; set it and the job sits
+                         on every day from the start through to here. The label
+                         and its date stay welded together when the row wraps. -->
+                    <span class="job-pair">
+                      <label class="job-sub" for="schedEnd">through</label>
+                      <input type="date" id="schedEnd" />
+                    </span>
                   </div>
                 </div>
                 <div class="job-row">
@@ -834,6 +876,24 @@
               <div class="job-side">
                 <h4>Crew</h4>
                 <div class="perm-list" id="schedEmps"></div>
+
+                <h4 class="jf-head">Files</h4>
+                <!-- The job's own filing cabinet: folders you can walk into,
+                     files dropped straight onto the job. -->
+                <div class="jf" id="jfPanel" style="display:none">
+                  <div class="jf-bar">
+                    <div class="jf-crumbs" id="jfCrumbs"></div>
+                    <button class="link-btn" id="jfNewFolder" type="button">+ Folder</button>
+                  </div>
+                  <div class="jf-drop" id="jfDrop">
+                    <input type="file" id="jfFile" multiple hidden />
+                    Drop files here or
+                    <button class="link-btn" id="jfBrowse" type="button">browse</button>
+                  </div>
+                  <div class="jf-list" id="jfList"></div>
+                  <div class="msg err" id="jfMsg"></div>
+                </div>
+                <p class="jf-locked" id="jfLocked">Save the job first — then you can file things against it.</p>
               </div>
             </div>
 
@@ -1072,6 +1132,16 @@
           <input type="datetime-local" id="mIn" style="width:100%" /></div></div>
         <div class="row"><div class="field" style="flex:1"><label>Clock out (leave blank if still on the clock)</label>
           <input type="datetime-local" id="mOut" style="width:100%" /></div></div>
+        <!-- Shop/load time is added to the shift, lunch is taken off it, and
+             kms are whatever the driver entered at clock-out. -->
+        <div class="row">
+          <div class="field" style="flex:1"><label>Shop / load time (hrs, added)</label>
+            <input type="number" id="mShop" min="0" max="8" step="0.25" style="width:100%" placeholder="0" /></div>
+          <div class="field" style="flex:1"><label>Lunch (hrs, subtracted)</label>
+            <input type="number" id="mLunch" min="0" max="4" step="0.25" style="width:100%" placeholder="0" /></div>
+          <div class="field" style="flex:1"><label>Kms (blank = estimate)</label>
+            <input type="number" id="mKm" min="0" step="0.1" style="width:100%" placeholder="—" /></div>
+        </div>
         <div class="row"><div class="field" style="flex:1"><label>Work done that day</label>
           <input id="mWork" style="width:100%" placeholder="what the employee worked on" /></div></div>
         <div class="row"><div class="field" style="flex:1"><label>Missed clock-out reason</label>

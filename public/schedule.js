@@ -23,41 +23,221 @@
     return 'https://www.google.com/maps/dir/?api=1&destination=' + dest;
   }
 
+  // A job runs from `date` to `end_date` inclusive. `end_date` is null for the
+  // ordinary one-day job, so these two helpers are the only places that have to
+  // know the difference.
+  const jobDays = (job) =>
+    job.date && job.end_date ? daysBetween(job.date, job.end_date) + 1 : job.date ? 1 : 0;
+  const jobCoversDay = (job, day) =>
+    !!job.date && (job.end_date ? job.date <= day && day <= job.end_date : job.date === day);
+
   // Friendly "when" label from the stored date (YYYY-MM-DD) + time (HH:MM).
+  // A multi-day job reads as a range, so the crew can see it isn't a one-day
+  // visit before they open it.
   function fmtWhen(job) {
     if (!job.date) return 'No date set';
     const d = new Date(job.date + 'T' + (job.time || '00:00'));
-    const day = d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+    const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+    let day = d.toLocaleDateString([], opts);
+    if (job.end_date)
+      day += ' – ' + new Date(job.end_date + 'T00:00').toLocaleDateString([], opts);
     return job.time
       ? day + ' · ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       : day;
   }
 
+  // Human-readable file size for the file lists.
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+    return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + u[i];
+  }
+
+  // A rough icon for the file, so a list of names is scannable.
+  function fileIcon(f) {
+    const t = (f.content_type || '').toLowerCase();
+    const ext = (f.filename || '').split('.').pop().toLowerCase();
+    if (t.startsWith('image/')) return '🖼️';
+    if (t === 'application/pdf' || ext === 'pdf') return '📄';
+    if (['xls', 'xlsx', 'csv'].includes(ext)) return '📊';
+    if (['doc', 'docx'].includes(ext)) return '📝';
+    if (['zip', 'rar', '7z'].includes(ext)) return '🗜️';
+    return '📎';
+  }
+
+  // The folders sitting directly inside `path`, taken from the first segment of
+  // every path below it — so a folder something is filed under always shows up,
+  // even if it was never made on its own.
+  function childFolders(job, path) {
+    const prefix = path ? path + '/' : '';
+    const out = new Set();
+    const add = (p) => {
+      if (!p || !p.startsWith(prefix)) return;
+      const seg = p.slice(prefix.length).split('/')[0];
+      if (seg) out.add(seg);
+    };
+    (job.folders || []).forEach(add);
+    (job.files || []).forEach((f) => add(f.folder || ''));
+    return [...out].sort((a, b) => a.localeCompare(b));
+  }
+
+  const filesIn = (job, path) =>
+    (job.files || [])
+      .filter((f) => (f.folder || '') === path)
+      .sort((a, b) => a.filename.localeCompare(b.filename));
+
+  // How many files the job holds, folders and all — the count on the card.
+  const fileCount = (job) => (job.files || []).length;
+
+  // Read a File as base64 (strips the "data:*;base64," prefix).
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(',')[1] || '');
+      r.onerror = () => reject(new Error('Could not read the file.'));
+      r.readAsDataURL(file);
+    });
+  }
+
   // ======================= EMPLOYEE (portal) view ==========================
+  let myJobs = [];
+  let myFolder = ''; // folder open on the job page
+
   async function loadMine() {
     const list = $('mySchedList');
     if (!list) return;
-    let jobs = [];
     try {
       const d = await api('/api/my/schedules');
-      jobs = d.jobs || [];
+      myJobs = d.jobs || [];
     } catch (e) {
       list.innerHTML = `<div class="card">${esc(e.message)}</div>`;
       return;
     }
-    if ($('mySchedEmpty')) $('mySchedEmpty').style.display = jobs.length ? 'none' : 'block';
-    list.innerHTML = jobs
-      .map(
-        (j) => `<div class="job-card">
+    if ($('mySchedEmpty')) $('mySchedEmpty').style.display = myJobs.length ? 'none' : 'block';
+    list.innerHTML = myJobs
+      .map((j) => {
+        const n = fileCount(j);
+        return `<div class="job-card" data-job="${j.id}" role="button" tabindex="0">
           <div class="job-when">${esc(fmtWhen(j))}</div>
           ${j.description ? `<div class="job-desc">${esc(j.description)}</div>` : ''}
-          <a class="btn gold job-go" href="${mapsUrl(j)}" target="_blank" rel="noopener">
-            <span class="job-addr">📍 ${esc(j.address)}</span>
-            <span class="job-go-sub">Tap for directions</span>
-          </a>
-        </div>`
-      )
+          <div class="job-addr-line">📍 ${esc(j.address)}</div>
+          <div class="job-card-foot">
+            ${j.job_type && j.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(j.job_type)}</span>` : ''}
+            ${n ? `<span class="sched-tag">📎 ${n}</span>` : ''}
+            <span class="job-open-sub">Tap to open</span>
+          </div>
+        </div>`;
+      })
       .join('');
+  }
+
+  // ---- the employee's job page ----
+  // Tapping a job opens everything about it: where it is, what it is, the notes
+  // the office left for the crew, and the job's files.
+  function openMyJob(id) {
+    const j = myJobs.find((x) => x.id === id);
+    if (!j || !$('myJobBack')) return;
+    myFolder = '';
+    $('myJobBack').classList.add('open');
+    renderMyJob(j);
+  }
+  function closeMyJob() {
+    if ($('myJobBack')) $('myJobBack').classList.remove('open');
+  }
+
+  function renderMyJob(j) {
+    // The body remembers which job it is showing, so the folder clicks below
+    // can re-render the right one.
+    $('myJobBody').dataset.job = j.id;
+    $('myJobTitle').textContent =
+      (j.description || '').split('\n')[0].trim() || j.address || 'Job';
+    $('myJobWhen').textContent = fmtWhen(j);
+
+    const folders = childFolders(j, myFolder);
+    const files = filesIn(j, myFolder);
+    const crumbs = myFolder.split('/').filter(Boolean);
+    const crumbHtml =
+      `<button type="button" class="jf-crumb" data-my-crumb="">All files</button>` +
+      crumbs
+        .map((seg, i) => {
+          const path = crumbs.slice(0, i + 1).join('/');
+          return ` / <button type="button" class="jf-crumb" data-my-crumb="${esc(path)}">${esc(seg)}</button>`;
+        })
+        .join('');
+
+    const rows =
+      folders
+        .map(
+          (name) => `<div class="jf-row folder" data-my-folder="${esc(
+            myFolder ? myFolder + '/' + name : name
+          )}"><span class="jf-name">📁 ${esc(name)}</span></div>`
+        )
+        .join('') +
+      files
+        .map(
+          (f) => `<a class="jf-row" href="/api/my/schedules/${j.id}/files/${f.id}"
+            target="_blank" rel="noopener">
+            <span class="jf-name">${fileIcon(f)} ${esc(f.filename)}</span>
+            <span class="jf-size">${fmtBytes(f.size || 0)}</span>
+          </a>`
+        )
+        .join('');
+
+    $('myJobBody').innerHTML = `
+      <a class="btn gold job-go" href="${mapsUrl(j)}" target="_blank" rel="noopener">
+        <span class="job-addr">📍 ${esc(j.address)}</span>
+        <span class="job-go-sub">Tap for directions</span>
+      </a>
+      <dl class="myjob-facts">
+        <dt>Type</dt><dd>${esc(j.job_type || 'Delivery')}</dd>
+        ${j.due_date ? `<dt>Required by</dt><dd>${esc(j.due_date)}</dd>` : ''}
+        ${j.confirmed ? '<dt>Appointment</dt><dd>Confirmed</dd>' : ''}
+      </dl>
+      ${j.description ? `<div class="myjob-block"><h4>Details</h4><p>${esc(j.description)}</p></div>` : ''}
+      ${j.notes_driver ? `<div class="myjob-block"><h4>Notes for you</h4><p>${esc(j.notes_driver)}</p></div>` : ''}
+      <div class="myjob-block">
+        <h4>Files</h4>
+        <div class="jf-crumbs" id="myJobCrumbs">${crumbHtml}</div>
+        <div class="jf-list" id="myJobFiles">${
+          rows || '<div class="jf-empty">Nothing filed here.</div>'
+        }</div>
+      </div>`;
+  }
+
+  // Wire the portal's job page once, if we're on the portal.
+  if ($('mySchedList')) {
+    const open = (e) => {
+      const card = e.target.closest('[data-job]');
+      if (card) openMyJob(Number(card.dataset.job));
+    };
+    $('mySchedList').addEventListener('click', open);
+    $('mySchedList').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open(e);
+      }
+    });
+    if ($('myJobBack')) {
+      $('myJobClose').addEventListener('click', closeMyJob);
+      $('myJobBack').addEventListener('click', (e) => {
+        if (e.target === $('myJobBack')) closeMyJob();
+      });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeMyJob();
+      });
+      // Walking in and out of the job's folders.
+      $('myJobBody').addEventListener('click', (e) => {
+        const crumb = e.target.closest('[data-my-crumb]');
+        const folder = e.target.closest('[data-my-folder]');
+        const hit = crumb || folder;
+        if (!hit) return;
+        myFolder = crumb ? crumb.dataset.myCrumb : folder.dataset.myFolder;
+        const id = Number(($('myJobBody').dataset.job) || 0);
+        const j = myJobs.find((x) => x.id === id);
+        if (j) renderMyJob(j);
+      });
+    }
   }
 
   // ========================= ADMIN (dashboard) =============================
@@ -67,6 +247,10 @@
   let jobsCache = [];
   let weekStart = null; // Monday of the week on screen (YYYY-MM-DD)
   let dragId = null; // job being dragged between columns
+  let jfFolder = ''; // folder open in the job's file panel
+  // Jobs ticked on the board. The bulk bar acts on this whole set, and
+  // dragging any one of them drags every job in it.
+  const selected = new Set();
 
   // Wire the admin form once, if we're on the admin page.
   // The board only exists on the dashboard, so it's what tells the two pages
@@ -125,11 +309,14 @@
     $('schedDesc').addEventListener('input', paintHeader);
     $('schedAddr').addEventListener('input', paintHeader);
     $('schedDate').addEventListener('change', paintHeader);
+    $('schedEnd').addEventListener('change', paintHeader);
     $('jobModalBack').addEventListener('click', (e) => {
       if (e.target === $('jobModalBack')) closeForm();
     });
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && $('jobModalBack').classList.contains('open')) closeForm();
+      if (e.key !== 'Escape') return;
+      if ($('jobModalBack').classList.contains('open')) closeForm();
+      else if (selected.size) clearSelection();
     });
 
     // Takes the date off without touching anything else — the job drops back
@@ -139,7 +326,7 @@
       try {
         await api('/api/admin/schedules/' + editingId, {
           method: 'PATCH',
-          body: JSON.stringify({ date: '', time: '' }),
+          body: JSON.stringify({ date: '', end_date: '', time: '' }),
         });
         closeForm();
         await refreshJobs();
@@ -166,6 +353,15 @@
     $('schedToday').addEventListener('click', () => { weekStart = mondayOf(todayStr()); renderBoard(); });
     $('schedSearch').addEventListener('input', renderBoard);
     $('schedNew').addEventListener('click', () => openForm(null));
+    initFiles();
+
+    // ---- bulk bar ----
+    $('schedBulkApply').addEventListener('click', applyBulk);
+    $('schedBulkUnschedule').addEventListener('click', () =>
+      bulkPatch({ date: '', end_date: '', time: '' })
+    );
+    $('schedBulkDelete').addEventListener('click', deleteSelected);
+    $('schedBulkClear').addEventListener('click', clearSelection);
 
     const board = $('schedBoard');
     board.addEventListener('click', onBoardClick);
@@ -206,15 +402,27 @@
       const id = dragId;
       dragId = null;
       const to = zone.dataset.drop; // '' means back to the backlog
-      const job = jobsCache.find((j) => j.id === id);
-      if (!job || (job.date || '') === to) return;
+      // Dragging a ticked card drags every ticked card — a week gets planned
+      // a stack at a time instead of a card at a time.
+      const ids = selected.has(id) ? [...selected] : [id];
+      const movers = ids
+        .map((x) => jobsCache.find((j) => j.id === x))
+        .filter((j) => j && (j.date || '') !== to);
+      if (!movers.length) return;
       try {
         // An empty string clears the date server-side; null would be ignored,
         // because the route treats "not sent" and null the same way.
-        await api('/api/admin/schedules/' + id, {
-          method: 'PATCH',
-          body: JSON.stringify({ date: to }),
-        });
+        if (movers.length === 1) {
+          await api('/api/admin/schedules/' + movers[0].id, {
+            method: 'PATCH',
+            body: JSON.stringify({ date: to }),
+          });
+        } else {
+          await api('/api/admin/schedules/bulk', {
+            method: 'PATCH',
+            body: JSON.stringify({ ids: movers.map((j) => j.id), date: to }),
+          });
+        }
         await refreshJobs();
       } catch (err) {
         alert(err.message);
@@ -232,6 +440,10 @@
     const [y, m, d] = day.split('-').map(Number);
     return new Date(Date.UTC(y, m - 1, d) + n * DAY_MS).toISOString().slice(0, 10);
   }
+  // Whole days from `a` to `b` — how long a multi-day job runs for.
+  function daysBetween(a, b) {
+    return Math.round((new Date(b + 'T00:00') - new Date(a + 'T00:00')) / DAY_MS);
+  }
   // The Monday on or before `day`, so a week always starts the same way.
   function mondayOf(day) {
     const [y, m, d] = day.split('-').map(Number);
@@ -243,8 +455,8 @@
     return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString([], { timeZone: 'UTC', ...opts });
   };
 
-  function renderEmpChecks(selected) {
-    const sel = new Set(selected || []);
+  function renderEmpChecks(assigned) {
+    const sel = new Set(assigned || []);
     $('schedEmps').innerHTML = allEmployees.length
       ? allEmployees
           .map(
@@ -255,6 +467,23 @@
           .join('')
       : '<span style="color:var(--muted);font-size:13px">No employees yet.</span>';
   }
+  // The bulk bar's own copy of the crew list — it starts empty every time, so
+  // nothing reaches a batch of jobs unless it was ticked here.
+  function renderBulkEmps() {
+    const box = $('schedBulkEmps');
+    if (!box) return;
+    box.innerHTML = allEmployees.length
+      ? allEmployees
+          .map(
+            (e) =>
+              `<label class="perm"><input type="checkbox" value="${e.id}" /> ${esc(
+                e.name
+              )}</label>`
+          )
+          .join('')
+      : '<span style="color:var(--muted);font-size:13px">No employees yet.</span>';
+  }
+
   const collectEmps = () =>
     [...$('schedEmps').querySelectorAll('input[type="checkbox"]:checked')].map((c) =>
       Number(c.value)
@@ -269,13 +498,18 @@
       allEmployees = [];
     }
     if (editingId == null) renderEmpChecks([]);
+    renderBulkEmps();
     await refreshJobs();
   }
 
   async function refreshJobs() {
     const d = await api('/api/admin/schedules');
     jobsCache = d.jobs || [];
+    // A deleted job must not linger in the selection and get written to again.
+    const live = new Set(jobsCache.map((j) => j.id));
+    [...selected].forEach((id) => live.has(id) || selected.delete(id));
     renderBoard();
+    renderBulkBar();
   }
 
   // Initials for the crew chips on a card. Falls back to the first letters of
@@ -292,7 +526,10 @@
       .toUpperCase();
   }
 
-  function cardHtml(job) {
+  // `day` is the column the card is being drawn in. A multi-day job is drawn
+  // once per day it covers; only the card on its first day can be dragged, so
+  // "where does this job move to" always has one obvious answer.
+  function cardHtml(job, day) {
     const crew = job.employee_ids || [];
     const late = job.date && job.date < todayStr();
     const state = !crew.length ? 'nocrew' : late ? 'past' : 'ok';
@@ -300,15 +537,33 @@
     // Late against what the customer asked for — the thing worth spotting from
     // across the room.
     const overdue = job.due_date && job.date && job.date > job.due_date;
-    return `<article class="sched-card ${state}" draggable="true" data-id="${job.id}"
-              title="Click to open · drag to another day">
-      <div class="sched-card-title">${esc(title)}</div>
+    const total = jobDays(job);
+    const multi = total > 1 && day;
+    const nth = multi ? daysBetween(job.date, day) + 1 : 0;
+    const isStart = !multi || nth === 1;
+    return `<article class="sched-card ${state}${selected.has(job.id) ? ' selected' : ''}${
+              multi ? ' spans' + (isStart ? ' span-start' : ' span-mid') : ''
+            }"
+              ${isStart ? 'draggable="true"' : ''} data-id="${job.id}"
+              title="${
+                multi && !isStart
+                  ? `Day ${nth} of ${total} · click to open · drag from its first day to move it`
+                  : 'Click to open · tick (or ctrl-click) to select · drag to another day'
+              }">
+      <div class="sched-card-top">
+        <input type="checkbox" class="sched-pick" data-pick="${job.id}"${
+          selected.has(job.id) ? ' checked' : ''
+        } title="Select for bulk scheduling" />
+        <div class="sched-card-title">${esc(title)}</div>
+      </div>
+      ${multi ? `<div class="sched-span">Day ${nth} of ${total}</div>` : ''}
       <a class="sched-card-addr" href="${mapsUrl(job)}" target="_blank" rel="noopener"
          title="Open directions">📍 ${esc(job.address)}</a>
       <div class="sched-card-meta">
         ${job.time ? `<span class="sched-card-time">${esc(job.time)}</span>` : ''}
         ${job.job_type && job.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(job.job_type)}</span>` : ''}
         ${job.confirmed ? '<span class="sched-tag ok">Confirmed</span>' : ''}
+        ${fileCount(job) ? `<span class="sched-tag">📎 ${fileCount(job)}</span>` : ''}
       </div>
       ${
         job.due_date
@@ -335,10 +590,20 @@
       <div class="sched-col-head">
         <div class="sched-col-name">${opts.name}</div>
         ${opts.sub ? `<div class="sched-col-sub">${opts.sub}</div>` : ''}
+        ${
+          opts.jobs.length
+            ? `<button class="sched-col-all" type="button" data-selcol="${opts.jobs
+                .map((j) => j.id)
+                .join(',')}">${
+                opts.jobs.every((j) => selected.has(j.id)) ? 'None' : 'All'
+              }</button>`
+            : ''
+        }
         <span class="sched-col-count">${opts.jobs.length}</span>
       </div>
       <div class="sched-col-body"${opts.drop != null ? ` data-drop="${opts.drop}"` : ''}>
-        ${opts.jobs.map(cardHtml).join('') || `<p class="sched-col-empty">${opts.empty || ''}</p>`}
+        ${opts.jobs.map((j) => cardHtml(j, opts.day)).join('') ||
+          `<p class="sched-col-empty">${opts.empty || ''}</p>`}
       </div>
     </div>`;
 
@@ -376,27 +641,131 @@
           name: dayLabel(day, { weekday: 'short' }),
           sub: dayLabel(day, { month: 'short', day: 'numeric' }),
           drop: day,
-          jobs: jobs.filter((j) => j.date === day),
+          day,
+          // A job that runs over several days appears in every one of them, so
+          // the board shows who is tied up on which day rather than only where
+          // the work started.
+          jobs: jobs.filter((j) => jobCoversDay(j, day)),
           empty: '',
         })
       ),
-      // A dispatcher's checklist, not a bucket — these cards also sit in their
-      // own day column, which is why this one takes no drops.
-      columnHtml({
-        cls: 'needcrew',
-        name: 'Needs a crew',
-        sub: 'This week',
-        jobs: jobs.filter(
-          (j) => j.date && j.date >= weekStart && j.date <= weekEnd && !(j.employee_ids || []).length
-        ),
-        empty: 'Every job this week has a crew.',
-      }),
+
     ];
     board.innerHTML = cols.join('');
   }
 
+  // ---- selecting jobs ----
+  function setSelected(id, on, defer) {
+    if (on) selected.add(id);
+    else selected.delete(id);
+    if (!defer) paintSelection();
+  }
+  function clearSelection() {
+    selected.clear();
+    paintSelection();
+  }
+  // The cards carry the tick state, so both have to be repainted together.
+  function paintSelection() {
+    renderBoard();
+    renderBulkBar();
+  }
+
+  function renderBulkBar() {
+    const bar = $('schedBulk');
+    if (!bar) return;
+    bar.hidden = selected.size === 0;
+    if (!selected.size) {
+      $('schedBulkMsg').textContent = '';
+      return;
+    }
+    $('schedBulkCount').textContent =
+      selected.size + (selected.size === 1 ? ' job selected' : ' jobs selected');
+  }
+
+  // One request for the whole selection instead of one per card.
+  async function bulkPatch(body) {
+    if (!selected.size) return;
+    const msg = $('schedBulkMsg');
+    msg.textContent = 'Saving…';
+    try {
+      await api('/api/admin/schedules/bulk', {
+        method: 'PATCH',
+        body: JSON.stringify({ ids: [...selected], ...body }),
+      });
+      msg.textContent = '';
+      $('schedBulkCrewMenu').open = false;
+      await refreshJobs();
+    } catch (e) {
+      msg.textContent = e.message;
+    }
+  }
+
+  async function applyBulk() {
+    const body = {};
+    const date = $('schedBulkDate').value;
+    const end = $('schedBulkEnd').value;
+    const time = $('schedBulkTime').value;
+    if (date) body.date = date;
+    // A run needs a first day to hang off, and every selected job gets the
+    // same one — so "through" only counts alongside a date.
+    if (end) {
+      if (!date) {
+        $('schedBulkMsg').textContent = 'Pick the start date as well as the day it runs through to.';
+        return;
+      }
+      if (end < date) {
+        $('schedBulkMsg').textContent = "The last day can't be before the first.";
+        return;
+      }
+      body.end_date = end;
+    }
+    if (time) body.time = time;
+    // Crew only moves when a name is actually ticked — an empty list would
+    // otherwise wipe the crew off every selected job by accident.
+    const crew = [...$('schedBulkEmps').querySelectorAll('input:checked')].map((c) =>
+      Number(c.value)
+    );
+    if (crew.length) {
+      body.employee_ids = crew;
+      body.crew_mode = $('schedBulkCrewMode').value;
+    }
+    if (!Object.keys(body).length) {
+      $('schedBulkMsg').textContent = 'Pick a date, a time or a crew member first.';
+      return;
+    }
+    await bulkPatch(body);
+  }
+
+  async function deleteSelected() {
+    if (!selected.size) return;
+    if (!confirm(`Delete ${selected.size} job(s)? This cannot be undone.`)) return;
+    const msg = $('schedBulkMsg');
+    msg.textContent = 'Deleting…';
+    try {
+      for (const id of [...selected])
+        await api('/api/admin/schedules/' + id, { method: 'DELETE' });
+      selected.clear();
+      msg.textContent = '';
+    } catch (e) {
+      msg.textContent = e.message;
+    }
+    await refreshJobs();
+  }
+
   async function onBoardClick(ev) {
     if (ev.target.closest('a')) return; // let the address link open the map
+
+    const pick = ev.target.closest('input[data-pick]');
+    if (pick) return setSelected(Number(pick.dataset.pick), pick.checked);
+
+    // "All" on a column head ticks (or unticks) that whole day at once.
+    const colAll = ev.target.closest('button[data-selcol]');
+    if (colAll) {
+      const ids = colAll.dataset.selcol.split(',').map(Number);
+      const on = !ids.every((id) => selected.has(id));
+      ids.forEach((id) => setSelected(id, on, true));
+      return paintSelection();
+    }
     const del = ev.target.closest('button[data-del]');
     if (del) {
       ev.stopPropagation();
@@ -411,7 +780,12 @@
       return;
     }
     const card = ev.target.closest('.sched-card');
-    if (card) startEdit(Number(card.dataset.id));
+    if (!card) return;
+    const id = Number(card.dataset.id);
+    // Ctrl/cmd/shift-click picks a card up into the selection instead of
+    // opening it — quicker than aiming at the tick box.
+    if (ev.ctrlKey || ev.metaKey || ev.shiftKey) return setSelected(id, !selected.has(id));
+    startEdit(id);
   }
 
   // ---- job detail modal ----
@@ -431,9 +805,16 @@
     const title = ($('schedDesc').value || '').split('\n')[0].trim();
     $('jobTitle').textContent = title || $('schedAddr').value.trim() || 'New job';
     const d = $('schedDate').value;
-    $('jobWhen').textContent = d
-      ? dayLabel(d, { weekday: 'long', month: 'long', day: 'numeric' })
-      : 'Not scheduled';
+    const end = $('schedEnd').value;
+    const long = { weekday: 'long', month: 'long', day: 'numeric' };
+    $('jobWhen').textContent = !d
+      ? 'Not scheduled'
+      : end && end > d
+        ? dayLabel(d, { weekday: 'short', month: 'short', day: 'numeric' }) +
+          ' – ' +
+          dayLabel(end, { weekday: 'short', month: 'short', day: 'numeric' }) +
+          ' · ' + (daysBetween(d, end) + 1) + ' days'
+        : dayLabel(d, long);
     $('jobWhen').classList.toggle('unscheduled', !d);
   }
 
@@ -445,6 +826,7 @@
     picked = { lat: j.lat, lng: j.lng };
     $('schedDesc').value = j.description || '';
     $('schedDate').value = j.date || '';
+    $('schedEnd').value = j.end_date || '';
     $('schedTime').value = j.time || '';
     $('schedDue').value = j.due_date || '';
     $('schedType').value = j.job_type || 'Delivery';
@@ -455,6 +837,10 @@
     $('schedUnschedule').style.display = j.date ? '' : 'none';
     $('schedDelete').style.display = '';
     $('schedMsg').textContent = '';
+    // A job always opens at the top of its own filing cabinet.
+    jfFolder = '';
+    $('jfMsg').textContent = '';
+    renderFiles();
     paintHeader();
     openForm(j);
   }
@@ -465,6 +851,7 @@
     $('schedAddr').value = '';
     $('schedDesc').value = '';
     $('schedDate').value = '';
+    $('schedEnd').value = '';
     $('schedTime').value = '';
     $('schedDue').value = '';
     $('schedType').value = 'Delivery';
@@ -478,6 +865,9 @@
     $('schedUnschedule').style.display = 'none';
     $('schedDelete').style.display = 'none';
     $('schedMsg').textContent = '';
+    jfFolder = '';
+    if ($('jfMsg')) $('jfMsg').textContent = '';
+    renderFiles();
     paintHeader();
   }
 
@@ -490,10 +880,21 @@
       msg.textContent = 'Enter an address.';
       return;
     }
+    const end = $('schedEnd').value;
+    const start = $('schedDate').value;
+    if (end && !start) {
+      msg.textContent = 'Give the job a start date before setting the day it runs through to.';
+      return;
+    }
+    if (end && start && end < start) {
+      msg.textContent = "The last day can't be before the first.";
+      return;
+    }
     const payload = {
       address,
       description: $('schedDesc').value,
-      date: $('schedDate').value,
+      date: start,
+      end_date: end,
       time: $('schedTime').value,
       due_date: $('schedDue').value,
       job_type: $('schedType').value,
@@ -524,6 +925,285 @@
     } finally {
       $('schedSave').disabled = false;
     }
+  }
+
+
+  // ---- job files (admin) ----
+  // Folders live on the job, so an empty one made on purpose sticks around;
+  // files are uploaded into whichever folder is open.
+  const MAX_JOB_FILE = 4 * 1024 * 1024;
+
+  function currentJob() {
+    return jobsCache.find((j) => j.id === editingId) || null;
+  }
+
+  function renderFiles() {
+    if (!$('jfPanel')) return;
+    const job = currentJob();
+    // A file has to hang off something — until the job is saved there is no id
+    // to hang it on, so the panel stays shut.
+    $('jfPanel').style.display = job ? '' : 'none';
+    $('jfLocked').style.display = job ? 'none' : '';
+    if (!job) return;
+
+    const crumbs = jfFolder.split('/').filter(Boolean);
+    $('jfCrumbs').innerHTML =
+      '<button type="button" class="jf-crumb" data-jf-crumb="">All files</button>' +
+      crumbs
+        .map((seg, i) => {
+          const path = crumbs.slice(0, i + 1).join('/');
+          return ` / <button type="button" class="jf-crumb" data-jf-crumb="${esc(path)}">${esc(seg)}</button>`;
+        })
+        .join('');
+
+    const folders = childFolders(job, jfFolder);
+    const files = filesIn(job, jfFolder);
+    const rows =
+      folders
+        .map((name) => {
+          const path = jfFolder ? jfFolder + '/' + name : name;
+          return `<div class="jf-row folder" data-jf-folder="${esc(path)}" title="Open folder">
+            <span class="jf-name">📁 ${esc(name)}</span>
+            <button type="button" class="jf-del" data-jf-folder-del="${esc(path)}" title="Delete folder">✕</button>
+          </div>`;
+        })
+        .join('') +
+      files
+        .map(
+          (f) => `<div class="jf-row" draggable="true" data-jf-file="${f.id}">
+            <a class="jf-name" href="/api/admin/schedules/${job.id}/files/${f.id}"
+               target="_blank" rel="noopener" title="${esc(f.filename)}">${fileIcon(f)} ${esc(f.filename)}</a>
+            <span class="jf-size">${fmtBytes(f.size || 0)}</span>
+            <button type="button" class="jf-del" data-jf-file-del="${f.id}" title="Remove">✕</button>
+          </div>`
+        )
+        .join('');
+    $('jfList').innerHTML =
+      rows || '<div class="jf-empty">Nothing here yet — drop files in, or make a folder.</div>';
+  }
+
+  // Every change re-reads the job, so the board, the card's file count and the
+  // panel can never disagree about what is filed where.
+  async function reloadFiles() {
+    await refreshJobs();
+    renderFiles();
+  }
+
+  // The folder a dropped file came from, if the browser told us — a folder pick
+  // sets webkitRelativePath, a folder drop gets _relPath from the walk below.
+  function subPath(file) {
+    const rel = file.webkitRelativePath || file._relPath || '';
+    return rel.split('/').slice(0, -1).join('/');
+  }
+
+  async function uploadJobFiles(fileList) {
+    const job = currentJob();
+    if (!job) return;
+    const id = job.id;
+    const folder = jfFolder;
+    for (const file of [...fileList]) {
+      if (file.size > MAX_JOB_FILE) {
+        $('jfMsg').textContent = `"${file.name}" is too large (max 4 MB).`;
+        continue;
+      }
+      try {
+        $('jfMsg').textContent = `Uploading ${file.name}…`;
+        const data = await fileToBase64(file);
+        await api('/api/admin/schedules/' + id + '/files', {
+          method: 'POST',
+          body: JSON.stringify({
+            filename: file.name,
+            content_type: file.type,
+            // A dropped folder keeps its shape: what it came from is filed
+            // underneath the folder that is open.
+            folder: [folder, subPath(file)].filter(Boolean).join('/'),
+            data,
+          }),
+        });
+        $('jfMsg').textContent = '';
+      } catch (e) {
+        $('jfMsg').textContent = e.message;
+      }
+    }
+    await reloadFiles();
+  }
+
+  // Walk a dropped directory, so dropping a whole folder files everything in it
+  // instead of quietly doing nothing.
+  async function filesFromDrop(dt) {
+    const entries = [...(dt.items || [])]
+      .map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null))
+      .filter(Boolean);
+    if (!entries.some((e) => e.isDirectory)) return [...dt.files];
+
+    const out = [];
+    const walk = (entry, prefix) =>
+      entry.isDirectory ? readDir(entry, prefix) : readFile(entry, prefix);
+    const readFile = (entry, prefix) =>
+      new Promise((resolve) =>
+        entry.file((f) => {
+          f._relPath = prefix + f.name;
+          out.push(f);
+          resolve();
+        }, resolve)
+      );
+    // readEntries hands back at most a batch at a time, so it is called until
+    // it comes back empty.
+    const readDir = async (dir, prefix) => {
+      const reader = dir.createReader();
+      const kids = [];
+      for (;;) {
+        const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+        if (!batch.length) break;
+        kids.push(...batch);
+      }
+      for (const k of kids) await walk(k, prefix + dir.name + '/');
+    };
+    for (const e of entries) await walk(e, '');
+    return out;
+  }
+
+  async function newJobFolder() {
+    const job = currentJob();
+    if (!job) return;
+    const name = prompt('Folder name', 'Photos');
+    if (!name) return;
+    try {
+      await api('/api/admin/schedules/' + job.id + '/folders', {
+        method: 'POST',
+        body: JSON.stringify({ path: [jfFolder, name].filter(Boolean).join('/') }),
+      });
+      await reloadFiles();
+    } catch (e) {
+      $('jfMsg').textContent = e.message;
+    }
+  }
+
+  async function deleteJobFolder(path) {
+    const job = currentJob();
+    if (!job) return;
+    const n = (job.files || []).filter(
+      (f) => (f.folder || '') === path || (f.folder || '').startsWith(path + '/')
+    ).length;
+    if (!confirm(n ? `Delete this folder and the ${n} file(s) in it?` : 'Delete this folder?'))
+      return;
+    try {
+      await api('/api/admin/schedules/' + job.id + '/folders?path=' + encodeURIComponent(path), {
+        method: 'DELETE',
+      });
+      // Standing inside a folder that just went away would show nothing.
+      if (jfFolder === path || jfFolder.startsWith(path + '/')) jfFolder = '';
+      await reloadFiles();
+    } catch (e) {
+      $('jfMsg').textContent = e.message;
+    }
+  }
+
+  async function deleteJobFile(fileId) {
+    const job = currentJob();
+    if (!job || !confirm('Remove this file?')) return;
+    try {
+      await api('/api/admin/schedules/' + job.id + '/files/' + fileId, { method: 'DELETE' });
+      await reloadFiles();
+    } catch (e) {
+      $('jfMsg').textContent = e.message;
+    }
+  }
+
+  async function moveJobFile(fileId, folder) {
+    const job = currentJob();
+    if (!job) return;
+    try {
+      await api('/api/admin/schedules/' + job.id + '/files/' + fileId, {
+        method: 'PATCH',
+        body: JSON.stringify({ folder }),
+      });
+      await reloadFiles();
+    } catch (e) {
+      $('jfMsg').textContent = e.message;
+    }
+  }
+
+  function initFiles() {
+    if (!$('jfPanel')) return;
+    $('jfNewFolder').addEventListener('click', newJobFolder);
+    $('jfBrowse').addEventListener('click', () => $('jfFile').click());
+    $('jfFile').addEventListener('change', (e) => {
+      if (e.target.files.length) uploadJobFiles(e.target.files);
+      e.target.value = ''; // allow re-picking the same file
+    });
+
+    const drop = $('jfDrop');
+    ['dragenter', 'dragover'].forEach((ev) =>
+      drop.addEventListener(ev, (e) => {
+        e.preventDefault();
+        drop.classList.add('over');
+      })
+    );
+    ['dragleave', 'drop'].forEach((ev) =>
+      drop.addEventListener(ev, (e) => {
+        e.preventDefault();
+        drop.classList.remove('over');
+      })
+    );
+    drop.addEventListener('drop', async (e) => {
+      if (!e.dataTransfer) return;
+      const files = await filesFromDrop(e.dataTransfer);
+      if (files.length) uploadJobFiles(files);
+    });
+
+    // Walking into folders, and the per-row delete buttons.
+    $('jfList').addEventListener('click', (e) => {
+      if (e.target.closest('a')) return; // the file link opens the file
+      const folderDel = e.target.closest('[data-jf-folder-del]');
+      if (folderDel) return deleteJobFolder(folderDel.dataset.jfFolderDel);
+      const fileDel = e.target.closest('[data-jf-file-del]');
+      if (fileDel) return deleteJobFile(fileDel.dataset.jfFileDel);
+      const folder = e.target.closest('[data-jf-folder]');
+      if (folder) {
+        jfFolder = folder.dataset.jfFolder;
+        renderFiles();
+      }
+    });
+    $('jfCrumbs').addEventListener('click', (e) => {
+      const crumb = e.target.closest('[data-jf-crumb]');
+      if (!crumb) return;
+      jfFolder = crumb.dataset.jfCrumb;
+      renderFiles();
+    });
+
+    // Dragging a file onto a folder row files it in there.
+    let dragFile = null;
+    $('jfList').addEventListener('dragstart', (e) => {
+      const row = e.target.closest('[data-jf-file]');
+      if (!row) return;
+      dragFile = row.dataset.jfFile;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', dragFile);
+    });
+    $('jfList').addEventListener('dragover', (e) => {
+      const row = e.target.closest('[data-jf-folder]');
+      if (!row || !dragFile) return;
+      e.preventDefault();
+      row.classList.add('drop-over');
+    });
+    $('jfList').addEventListener('dragleave', (e) => {
+      const row = e.target.closest('[data-jf-folder]');
+      if (row) row.classList.remove('drop-over');
+    });
+    $('jfList').addEventListener('drop', (e) => {
+      const row = e.target.closest('[data-jf-folder]');
+      if (!row || !dragFile) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const id = dragFile;
+      dragFile = null;
+      moveJobFile(id, row.dataset.jfFolder);
+    });
+    $('jfList').addEventListener('dragend', () => {
+      dragFile = null;
+      $('jfList').querySelectorAll('.drop-over').forEach((r) => r.classList.remove('drop-over'));
+    });
   }
 
   window.Schedule = { loadAdmin, loadMine };

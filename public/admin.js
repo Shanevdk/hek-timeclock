@@ -858,13 +858,27 @@
           .join('')}</div>`
       : '';
 
-  // Distance travelled for a row: worked out from the jobs tagged onto it and
-  // how far each is from the shop. A dash means no job on that entry had a
-  // position — different from having travelled nothing.
-  const kmCell = (r) =>
-    r.km != null
-      ? `<strong>${r.km.toFixed(1).replace(/\.0$/, '')}</strong>`
-      : '<span style="color:var(--muted)">—</span>';
+  // Distance travelled for a row. Normally what the driver typed in at
+  // clock-out; entries from before manual entry existed fall back to the
+  // straight-line figure worked out from the jobs and the shop, marked "est"
+  // so the two are never confused. A dash means neither was available.
+  const kmCell = (r) => {
+    if (r.km == null) return '<span style="color:var(--muted)">—</span>';
+    const n = r.km.toFixed(1).replace(/\.0$/, '');
+    return r.km_manual != null
+      ? `<strong>${n}</strong>`
+      : `<strong>${n}</strong> <span style="font-size:11px;color:var(--muted)">est</span>`;
+  };
+
+  // How the paid hours were reached, when they differ from clock-in→clock-out.
+  const adjustNote = (r) => {
+    const bits = [];
+    if (r.shop_hours) bits.push('+' + r.shop_hours + ' shop');
+    if (r.lunch_hours) bits.push('−' + r.lunch_hours + ' lunch');
+    return bits.length
+      ? `<div style="font-size:11px;color:var(--muted)">${bits.join(' · ')}</div>`
+      : '';
+  };
 
   function renderTimesheet(data) {
     const entries = data.entries || [];
@@ -873,8 +887,9 @@
     $('tsKm').textContent = (data.totalKm || 0).toFixed(1).replace(/\.0$/, '');
     if (data.mileage) {
       $('tsRoundTrip').checked = data.mileage.round_trip !== false;
-      $('tsKmLabel').textContent =
-        data.mileage.round_trip !== false ? 'Km travelled (return)' : 'Km travelled (one way)';
+      // The toggle only governs rows still falling back to an estimate — the
+      // rest are whatever the crew typed in — so the label stays plain.
+      $('tsKmLabel').textContent = 'Km travelled';
     }
     $('tsEmpty').style.display = entries.length ? 'none' : 'block';
     $('tsBody').innerHTML = entries
@@ -883,7 +898,7 @@
           <td>${esc(r.name)}${r.edited ? ' <span class="badge edited">edited</span>' : ''}</td>
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
-          <td>${r.hours != null ? r.hours.toFixed(2) : '—'}</td>
+          <td>${r.hours != null ? r.hours.toFixed(2) : '—'}${adjustNote(r)}</td>
           <td>${kmCell(r)}</td>
           <td>${jobChips(r)}${r.work_done ? esc(r.work_done) : '<span style="color:var(--muted)">—</span>'}${
             r.missed_reason
@@ -951,6 +966,9 @@
     $('modalEmpRow').style.display = 'none';
     $('mIn').value = isoToLocalInput(r.clock_in);
     $('mOut').value = isoToLocalInput(r.clock_out);
+    $('mShop').value = r.shop_hours || '';
+    $('mLunch').value = r.lunch_hours || '';
+    $('mKm').value = r.km_manual != null ? r.km_manual : '';
     $('mWork').value = r.work_done || '';
     $('mReason').value = r.missed_reason || '';
     $('mNote').value = r.note || '';
@@ -965,6 +983,9 @@
     $('modalEmpRow').style.display = 'flex';
     $('mIn').value = '';
     $('mOut').value = '';
+    $('mShop').value = '';
+    $('mLunch').value = '';
+    $('mKm').value = '';
     $('mWork').value = '';
     $('mReason').value = '';
     $('mNote').value = '';
@@ -986,6 +1007,11 @@
       work_done: $('mWork').value,
       missed_reason: $('mReason').value,
       note: $('mNote').value,
+      shop_hours: Number($('mShop').value) || 0,
+      lunch_hours: Number($('mLunch').value) || 0,
+      // '' clears a hand-entered distance, putting the row back on the
+      // straight-line estimate.
+      km_manual: $('mKm').value === '' ? '' : Number($('mKm').value),
     };
     try {
       if (modalPunchId) {

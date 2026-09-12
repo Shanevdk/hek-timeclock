@@ -377,6 +377,17 @@
           .join('')}</div>`
       : '';
 
+  // Small sub-line under the hours showing how the total was reached, so a
+  // figure that doesn't match clock-in→clock-out explains itself.
+  const adjustNote = (r) => {
+    const bits = [];
+    if (r.shop_hours) bits.push('+' + r.shop_hours + ' shop');
+    if (r.lunch_hours) bits.push('−' + r.lunch_hours + ' lunch');
+    return bits.length
+      ? `<div style="font-size:11px;color:var(--muted)">${bits.join(' · ')}</div>`
+      : '';
+  };
+
   async function loadMyHours() {
     const data = await api('/api/my/timesheet?' + buildQuery());
     const entries = data.entries || [];
@@ -389,7 +400,7 @@
         (r) => `<tr>
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
-          <td>${r.hours != null ? r.hours.toFixed(2) : '—'}</td>
+          <td>${r.hours != null ? r.hours.toFixed(2) : '—'}${adjustNote(r)}</td>
           <td>${
             r.km != null
               ? r.km.toFixed(1).replace(/\.0$/, '')
@@ -476,10 +487,21 @@
   const fmtShortTime = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   // Shift length so far, e.g. "7h 32m" — shown next to the live clock so they
-  // can see the hours the punch is about to record.
-  function fmtElapsed(fromIso, to) {
-    const mins = Math.max(0, Math.round((to - new Date(fromIso)) / 60000));
+  // can see the hours the punch is about to record. `adjustHours` folds in the
+  // shop/load time and lunch they've picked, so the figure on screen is the
+  // one that will actually be paid.
+  function fmtElapsed(fromIso, to, adjustHours = 0) {
+    const mins = Math.max(
+      0,
+      Math.round((to - new Date(fromIso)) / 60000) + Math.round(adjustHours * 60)
+    );
     return Math.floor(mins / 60) + 'h ' + String(mins % 60).padStart(2, '0') + 'm';
+  }
+
+  // Net effect of the two pickers: shop/load time added, lunch taken off.
+  function clockAdjust() {
+    if ($('cmShopWrap').style.display === 'none') return 0;
+    return (Number($('cmShop').value) || 0) - (Number($('cmLunch').value) || 0);
   }
 
   // 'YYYY-MM-DDTHH:mm' in local time — the format <input type="datetime-local">
@@ -620,8 +642,22 @@
     const end = clock.missed ? null : chosenOut() || now;
     $('cmElapsed').textContent =
       clock.clockedIn && !clock.missed && clock.since && end
-        ? '· ' + fmtElapsed(clock.since, end) + ' on the clock'
+        ? '· ' + fmtElapsed(clock.since, end, clockAdjust()) + ' total'
         : '';
+  }
+
+  // Quarter-hour pickers for shop/load time and lunch. Both count in 0.25hr
+  // steps; "None" is the default so nothing is added or taken off unless they
+  // say so.
+  function hourOptions(maxHours) {
+    const opts = ['<option value="0">None</option>'];
+    // Counted in quarters rather than adding 0.25 repeatedly, so the values
+    // stay exact (0.75, not 0.7500000000000001).
+    for (let q = 1; q <= maxHours * 4; q++) {
+      const v = q / 4;
+      opts.push('<option value="' + v + '">' + v + ' hr</option>');
+    }
+    return opts.join('');
   }
 
   // Checkboxes for the jobs this employee was scheduled on that day. Ticking
@@ -632,8 +668,8 @@
     $('cmJobsWrap').style.display = show ? 'block' : 'none';
     if (!show) return;
     $('cmJobsLabel').textContent = clock.missed
-      ? 'What job did you work on that day?'
-      : 'What job did you work on today?';
+      ? 'Project — which job were you on that day?'
+      : 'Project — which job were you on today?';
     $('cmJobs').innerHTML = jobs.length
       ? jobs
           .map(
@@ -680,14 +716,28 @@
       $('cmMissedReason').value = '';
     }
     $('cmRemarksLabel').textContent = missed
-      ? 'What did you do that day?'
+      ? 'Job description — what did you work on that day?'
       : inNow
-        ? 'What did you work on today?'
+        ? 'Job description — what did you work on today?'
         : 'Remarks (optional)';
     $('cmRemarks').placeholder = inNow || missed
       ? 'e.g. installed 120ft chain-link fence at Maple St'
       : 'Remarks (optional)';
     $('cmRemarks').value = '';
+
+    // Kms, shop/load time, lunch and extra notes all belong to finishing a day.
+    const finishing = !!(inNow || missed);
+    ['cmKmWrap', 'cmShopWrap', 'cmLunchWrap', 'cmNotesWrap'].forEach((id) => {
+      $(id).style.display = finishing ? 'block' : 'none';
+    });
+    if (finishing) {
+      $('cmKm').value = '';
+      $('cmShop').innerHTML = hourOptions(8);
+      $('cmLunch').innerHTML = hourOptions(4);
+      $('cmShop').value = '0';
+      $('cmLunch').value = '0';
+      $('cmNotes').value = '';
+    }
 
     // A normal clock-out defaults to now but can be set earlier, for when they
     // left the site well before remembering to hit the button.
@@ -719,6 +769,18 @@
     }
   }
 
+  // What the clock-out and missed-clock-out forms both send on top of the
+  // work description: the hand-typed kilometres, the two time adjustments and
+  // any extra notes.
+  function extraFields() {
+    return {
+      km: $('cmKm').value === '' ? null : Number($('cmKm').value),
+      shopHours: Number($('cmShop').value) || 0,
+      lunchHours: Number($('cmLunch').value) || 0,
+      notes: $('cmNotes').value,
+    };
+  }
+
   async function confirmClock() {
     $('cmMsg').textContent = '';
     const btn = $('cmConfirm');
@@ -733,6 +795,7 @@
             workDone: $('cmRemarks').value,
             reason: $('cmMissedReason').value,
             jobIds: selectedJobIds(),
+            ...extraFields(),
           }),
         });
       } else if (clock.clockedIn) {
@@ -743,6 +806,7 @@
             remarks: $('cmRemarks').value,
             jobIds: selectedJobIds(),
             clockOut: out ? out.toISOString() : null,
+            ...extraFields(),
           }),
         });
       } else {
@@ -772,8 +836,11 @@
   $('cmConfirm').addEventListener('click', confirmClock);
   $('cmCancel').addEventListener('click', closeClockModal);
   $('cmTime').addEventListener('click', tickNow);
-  // Keep the "on the clock" total in step with a hand-picked finish time.
+  // Keep the total in step with a hand-picked finish time and the two
+  // adjustments.
   $('cmOut').addEventListener('change', tickNow);
+  $('cmShop').addEventListener('change', tickNow);
+  $('cmLunch').addEventListener('change', tickNow);
   $('clockModalBack').addEventListener('click', (e) => {
     if (e.target === $('clockModalBack')) closeClockModal();
   });

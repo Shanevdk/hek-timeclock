@@ -180,6 +180,21 @@
           <p class="status-sub" id="mySchedEmpty" style="display:none">No jobs assigned to you yet.</p>
         </section>
 
+        <!-- Job page — opened by tapping a job on "My schedule". Everything
+             about that job: where, what, the office's notes, and its files. -->
+        <div class="modal-back" id="myJobBack">
+          <div class="modal myjob-modal">
+            <div class="myjob-head">
+              <div>
+                <h3 id="myJobTitle">Job</h3>
+                <div class="job-when" id="myJobWhen"></div>
+              </div>
+              <button class="link-btn" id="myJobClose" type="button" title="Close">✕</button>
+            </div>
+            <div class="myjob-body" id="myJobBody"></div>
+          </div>
+        </div>
+
         <!-- TIME OFF (request vacation days; admin approves or declines) -->
         <section class="section" id="tab-timeoff">
           <div class="card" style="margin-bottom:16px">
@@ -371,12 +386,46 @@
 
         <!-- Jobs from the schedule for the day being clocked out of -->
         <div id="cmJobsWrap" style="display:none">
-          <label id="cmJobsLabel">What job did you work on today?</label>
+          <label id="cmJobsLabel">Project</label>
           <div class="cm-jobs" id="cmJobs"></div>
         </div>
 
         <label for="cmRemarks" id="cmRemarksLabel">Remarks (optional)</label>
         <textarea id="cmRemarks" rows="3" placeholder="Remarks (optional)"></textarea>
+
+        <!-- Kilometres are typed in rather than worked out from GPS: phones with
+             location turned off and addresses the map didn't know made the
+             calculated figure unreliable. -->
+        <div id="cmKmWrap" style="display:none">
+          <label for="cmKm">Kms driven</label>
+          <input
+            type="number"
+            id="cmKm"
+            class="cm-input"
+            min="0"
+            step="0.1"
+            inputmode="decimal"
+            placeholder="e.g. 48"
+          />
+        </div>
+
+        <!-- Shop/load time is added to the shift; lunch is taken off it. -->
+        <div id="cmShopWrap" style="display:none">
+          <label for="cmShop">Shop / load time</label>
+          <select id="cmShop" class="cm-input"></select>
+          <p class="cm-hint">Added to your total time.</p>
+        </div>
+
+        <div id="cmLunchWrap" style="display:none">
+          <label for="cmLunch">Lunch</label>
+          <select id="cmLunch" class="cm-input"></select>
+          <p class="cm-hint">Taken off your total time.</p>
+        </div>
+
+        <div id="cmNotesWrap" style="display:none">
+          <label for="cmNotes">Additional notes (optional)</label>
+          <textarea id="cmNotes" rows="2" placeholder="Anything else the office should know"></textarea>
+        </div>
 
         <div id="cmReasonWrap" style="display:none">
           <label for="cmMissedReason">Why didn’t you clock out?</label>

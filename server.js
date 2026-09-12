@@ -545,6 +545,41 @@ async function getOpenPunch(employeeId) {
   );
 }
 
+// ---- Shop/load time, lunch and manual kilometres -------------------------
+// Three things the crew enters by hand at clock-out:
+//   shop_hours  time spent loading up at the shop, ADDED to the shift
+//   lunch_hours the unpaid break, SUBTRACTED from it
+//   km_manual   kilometres driven, typed in rather than worked out from GPS —
+//               the computed figure was never reliable (location turned off,
+//               an address the geocoder didn't know), so the odometer wins.
+// The first two are picked from quarter-hour steps; anything else is rounded
+// onto the nearest quarter so the stored value always matches an option.
+const MAX_SHOP_HOURS = 8;
+const MAX_LUNCH_HOURS = 4;
+
+function quarterHours(v, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(max, Math.round(n * 4) / 4);
+}
+
+// Typed-in kilometres. null means "not entered" — distinct from a real 0.
+function manualKm(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.min(100000, Math.round(n * 10) / 10);
+}
+
+// Paid hours for a punch: the clock-in→clock-out span, plus shop/load time,
+// minus lunch. Never negative, and null while the punch is still open.
+function paidHours(row) {
+  if (!row.clock_out) return null;
+  const raw = (new Date(row.clock_out) - new Date(row.clock_in)) / 3600000;
+  const net = raw + (Number(row.shop_hours) || 0) - (Number(row.lunch_hours) || 0);
+  return Math.max(0, net);
+}
+
 // ---- Jobs worked (scheduled jobs tagged onto a punch) ---------------------
 // At clock-out the employee ticks off which of their scheduled jobs they were
 // on that day. `day` is a local YYYY-MM-DD, which is exactly how schedule dates
@@ -557,7 +592,18 @@ async function jobsOnDay(employeeId, day) {
   const docs = await store.schedules
     .find({
       employee_ids: employeeId,
-      ...(day ? { $or: [{ date: day }, { date: null }] } : { date: null }),
+      ...(day
+        ? {
+            $or: [
+              { date: day },
+              // A multi-day job is on offer every day of its run, not just the
+              // day it started — otherwise a crew on a three-day install could
+              // only tag the job on day one.
+              { date: { $lte: day }, end_date: { $gte: day } },
+              { date: null },
+            ],
+          }
+        : { date: null }),
     })
     .toArray();
   return docs.sort(scheduleSort);
@@ -616,6 +662,10 @@ async function saveMileageSettings(body) {
 // Fill in each row's job distances and the row total. Punches recorded before
 // positions were snapshotted fall back to looking the job up by id, so old
 // timesheets still get mileage as long as the job still exists.
+//
+// A hand-entered figure always wins: `km_manual` is what the driver read off
+// the odometer, and the straight-line calculation is only a fallback for
+// entries recorded before manual entry existed.
 async function attachMileage(rows) {
   const needsLookup = new Set();
   for (const r of rows)
@@ -647,7 +697,9 @@ async function attachMileage(rows) {
     });
     // null, not 0, when nothing could be worked out — "no distance known" and
     // "travelled nothing" are different answers.
-    r.km = known ? Math.round(total * 10) / 10 : null;
+    const computed = known ? Math.round(total * 10) / 10 : null;
+    r.km = r.km_manual != null ? r.km_manual : computed;
+    r.km_computed = computed;
   }
   return rows;
 }
@@ -911,6 +963,9 @@ app.post(
       jobs: [],
       missed_reason: null,
       note: remarks,
+      shop_hours: 0,
+      lunch_hours: 0,
+      km_manual: null,
       edited: false,
       clock_in_lat: lat,
       clock_in_lng: lng,
@@ -932,6 +987,13 @@ app.post(
     if (!workDone)
       return res.status(400).json({ error: 'Please enter what you worked on today.' });
     const jobs = await pickJobs(req.employee._id, localDay(open.clock_in), req.body?.jobIds);
+    const shopHours = quarterHours(req.body?.shopHours, MAX_SHOP_HOURS);
+    const lunchHours = quarterHours(req.body?.lunchHours, MAX_LUNCH_HOURS);
+    const km = manualKm(req.body?.km);
+    // Anything they typed under "additional notes" joins whatever they said on
+    // the way in, so neither remark is lost.
+    const extra = String(req.body?.notes || '').trim().slice(0, 1000);
+    const note = [open.note, extra].filter(Boolean).join('\n') || null;
     const now = new Date();
 
     // They may finish the punch at an earlier time than "now" — e.g. they left
@@ -954,9 +1016,27 @@ app.post(
       backdated = now.getTime() - out.getTime() > 60000;
     }
 
+    // A lunch longer than the shift itself would pay them for negative time.
+    if (
+      lunchHours > 0 &&
+      paidHours({ clock_in: open.clock_in, clock_out: out, shop_hours: shopHours, lunch_hours: lunchHours }) <= 0
+    )
+      return res.status(400).json({ error: "Your lunch break is longer than the time you were on the clock." });
+
     await store.punches.updateOne(
       { _id: open._id },
-      { $set: { clock_out: out, work_done: workDone, jobs, ...(backdated ? { edited: true } : {}) } }
+      {
+        $set: {
+          clock_out: out,
+          work_done: workDone,
+          jobs,
+          shop_hours: shopHours,
+          lunch_hours: lunchHours,
+          km_manual: km,
+          note,
+          ...(backdated ? { edited: true } : {}),
+        },
+      }
     );
     res.json({ clockedIn: false, since: iso(open.clock_in), until: iso(out) });
   })
@@ -990,9 +1070,32 @@ app.post(
       return res.status(400).json({ error: 'Finish time must be after your clock-in.' });
 
     const jobs = await pickJobs(req.employee._id, localDay(p.clock_in), req.body?.jobIds);
+    const shopHours = quarterHours(req.body?.shopHours, MAX_SHOP_HOURS);
+    const lunchHours = quarterHours(req.body?.lunchHours, MAX_LUNCH_HOURS);
+    const km = manualKm(req.body?.km);
+    const extra = String(req.body?.notes || '').trim().slice(0, 1000);
+    const note = [p.note, extra].filter(Boolean).join('\n') || null;
+    if (
+      lunchHours > 0 &&
+      paidHours({ clock_in: p.clock_in, clock_out: co, shop_hours: shopHours, lunch_hours: lunchHours }) <= 0
+    )
+      return res.status(400).json({ error: "Your lunch break is longer than the time you were on the clock." });
+
     await store.punches.updateOne(
       { _id: p._id },
-      { $set: { clock_out: co, work_done: work, jobs, missed_reason: why, edited: true } }
+      {
+        $set: {
+          clock_out: co,
+          work_done: work,
+          jobs,
+          missed_reason: why,
+          shop_hours: shopHours,
+          lunch_hours: lunchHours,
+          km_manual: km,
+          note,
+          edited: true,
+        },
+      }
     );
     res.json({ ok: true });
   })
@@ -1004,6 +1107,37 @@ app.get(
   wrap(async (req, res) => {
     const docs = await store.schedules.find({ employee_ids: req.employee._id }).toArray();
     res.json({ jobs: docs.map(publicScheduleView).sort(scheduleSort) });
+  })
+);
+
+// One job the crew member is on — the job page they land on from their
+// schedule. Same view as the list, so it carries the address, the driver
+// notes and the job's files.
+app.get(
+  '/api/my/schedules/:id',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const doc = await store.schedules.findOne({
+      _id: Number(req.params.id),
+      employee_ids: req.employee._id,
+    });
+    if (!doc) return res.status(404).json({ error: 'Job not found.' });
+    res.json(publicScheduleView(doc));
+  })
+);
+
+// A file off one of their own jobs. The job has to be theirs, and the file has
+// to be on that job — an id alone opens nothing.
+app.get(
+  '/api/my/schedules/:id/files/:fileId',
+  requireEmployee,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const job = await store.schedules.findOne({ _id: id, employee_ids: req.employee._id });
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    const blob = await store.jobFiles.findOne({ _id: req.params.fileId, job_id: id });
+    if (!blob) return res.status(404).json({ error: 'File not found.' });
+    sendJobFile(res, blob);
   })
 );
 
@@ -1500,6 +1634,42 @@ app.delete(
 const cleanDate = (s) => (/^\d{4}-\d{2}-\d{2}$/.test(s || '') ? s : null);
 const cleanTime = (s) => (/^\d{2}:\d{2}$/.test(s || '') ? s : null);
 
+// ---- Multi-day jobs ------------------------------------------------------
+// A job runs from `date` to `end_date` inclusive. `end_date` is null for the
+// ordinary one-day job, which is every job booked before this existed — so the
+// absent field and "finishes the day it starts" mean the same thing, and the
+// single-day path needs no migration.
+//
+// Normalised on the way in so the stored pair is always sane: no start means no
+// range at all, and an end that isn't genuinely later than the start collapses
+// back to a single day.
+function cleanRange(date, endDate) {
+  const start = cleanDate(date);
+  const end = cleanDate(endDate);
+  if (!start || !end || end <= start) return { date: start, end_date: null };
+  return { date: start, end_date: end };
+}
+
+// Whole days a job covers. Used to keep a run the same length when it is
+// dragged to a different start day.
+const DAY_MS = 86400000;
+function daySpan(date, endDate) {
+  if (!date || !endDate) return 0;
+  return Math.round((new Date(endDate + 'T00:00') - new Date(date + 'T00:00')) / DAY_MS);
+}
+function addDaysStr(day, n) {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d) + n * DAY_MS).toISOString().slice(0, 10);
+}
+
+// Moving a job to a new start day takes its whole run along: a three-day job
+// dropped on Thursday finishes on Saturday, it doesn't shrink to Thursday.
+function shiftedEnd(doc, newDate) {
+  const span = daySpan(doc.date, doc.end_date);
+  if (!span || !newDate) return null;
+  return addDaysStr(newDate, span);
+}
+
 // What kind of visit this is. Anything unrecognised falls back to a delivery,
 // which is the common case.
 const JOB_TYPES = ['Delivery', 'Install', 'Service', 'Pickup'];
@@ -1535,6 +1705,8 @@ function publicScheduleView(d) {
     address: d.address,
     description: d.description || null,
     date: d.date || null,
+    // Last day of a multi-day job; null when it starts and finishes the same day.
+    end_date: d.end_date || null,
     time: d.time || null,
     due_date: d.due_date || null,
     job_type: d.job_type || 'Delivery',
@@ -1544,6 +1716,10 @@ function publicScheduleView(d) {
     confirmed: !!d.confirmed,
     lat: d.lat ?? null,
     lng: d.lng ?? null,
+    // The job's own filing cabinet. Metadata only — the blobs are fetched one
+    // at a time from the file route.
+    folders: [...(d.folders || [])].sort(),
+    files: (d.files || []).map((f) => ({ ...f, at: iso(f.at) })),
   };
 }
 
@@ -1622,7 +1798,9 @@ app.post(
       _id,
       address,
       description: (req.body?.description || '').trim() || null,
-      date: cleanDate(req.body?.date),
+      // A job can run over several days: `date` is the first, `end_date` the
+      // last (null when it's a single day).
+      ...cleanRange(req.body?.date, req.body?.end_date),
       time: cleanTime(req.body?.time),
       // When the customer needs it by — independent of the day it's booked on,
       // which is what makes a late booking visible.
@@ -1642,6 +1820,67 @@ app.post(
   })
 );
 
+// Bulk edit — planning a week means putting the same date (and usually the
+// same crew) on a stack of jobs at once, so the board can send one request for
+// a whole selection. Registered before "/:id" so "bulk" isn't read as a job id.
+app.patch(
+  '/api/admin/schedules/bulk',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids)
+      ? [...new Set(req.body.ids.map(Number).filter((n) => Number.isInteger(n)))]
+      : [];
+    if (!ids.length) return res.status(400).json({ error: 'No jobs selected.' });
+
+    // Only the fields a bulk edit can sensibly share — address and the notes
+    // belong to one job each, so they're deliberately not here.
+    const set = { updated_at: new Date() };
+    // A bulk range always starts from a start date — an end day on its own has
+    // nothing to anchor to, and must never be read as "clear the dates".
+    if (req.body?.date != null)
+      Object.assign(set, cleanRange(req.body.date, req.body?.end_date));
+    if (req.body?.time != null) set.time = cleanTime(req.body.time);
+    if (req.body?.due_date != null) set.due_date = cleanDate(req.body.due_date);
+    if (req.body?.job_type != null) set.job_type = cleanJobType(req.body.job_type);
+    if (req.body?.confirmed != null) set.confirmed = !!req.body.confirmed;
+
+    const update = { $set: set };
+    if (req.body?.employee_ids != null) {
+      const crew = await cleanEmployeeIds(req.body.employee_ids);
+      const mode = String(req.body?.crew_mode || 'replace');
+      // add/remove leave the rest of each crew alone — the usual case when the
+      // selected jobs already have different people on them.
+      if (mode === 'add' && crew.length) update.$addToSet = { employee_ids: { $each: crew } };
+      else if (mode === 'remove' && crew.length) update.$pullAll = { employee_ids: crew };
+      else if (mode === 'replace') set.employee_ids = crew;
+    }
+
+    // A new start day slides each multi-day run along by its own length, which
+    // one updateMany can't express — so those are written individually and the
+    // single-day jobs still go in one shot. Sending an explicit end_date means
+    // the whole selection was given the same run, so no shifting is needed.
+    let ranged = [];
+    if (req.body?.date != null && req.body?.end_date == null) {
+      ranged = (await store.schedules.find({ _id: { $in: ids } }).toArray()).filter(
+        (d) => d.end_date
+      );
+      for (const d of ranged) {
+        const moved = cleanRange(set.date, shiftedEnd(d, set.date));
+        await store.schedules.updateOne(
+          { _id: d._id },
+          { ...update, $set: { ...set, ...moved } }
+        );
+      }
+    }
+
+    const rest = ids.filter((id) => !ranged.some((d) => d._id === id));
+    const r = rest.length
+      ? await store.schedules.updateMany({ _id: { $in: rest } }, update)
+      : { modifiedCount: 0 };
+    res.json({ ok: true, updated: (r.modifiedCount ?? rest.length) + ranged.length });
+  })
+);
+
 app.patch(
   '/api/admin/schedules/:id',
   requireAdmin,
@@ -1658,7 +1897,17 @@ app.patch(
     }
     if (req.body?.description != null)
       set.description = String(req.body.description).trim() || null;
-    if (req.body?.date != null) set.date = cleanDate(req.body.date);
+    // Start and end move together. When only the start is sent — dragging a
+    // card to another day — the run keeps its length and slides with it; when
+    // the form sends both, they're taken as given.
+    if (req.body?.date != null || req.body?.end_date != null) {
+      const start = req.body?.date != null ? cleanDate(req.body.date) : doc.date || null;
+      const end =
+        req.body?.end_date != null
+          ? cleanDate(req.body.end_date)
+          : shiftedEnd(doc, start);
+      Object.assign(set, cleanRange(start, end));
+    }
     if (req.body?.time != null) set.time = cleanTime(req.body.time);
     if (req.body?.due_date != null) set.due_date = cleanDate(req.body.due_date);
     if (req.body?.job_type != null) set.job_type = cleanJobType(req.body.job_type);
@@ -1682,7 +1931,209 @@ app.delete(
   '/api/admin/schedules/:id',
   requireAdmin,
   wrap(async (req, res) => {
-    await store.schedules.deleteOne({ _id: Number(req.params.id) });
+    const id = Number(req.params.id);
+    await store.schedules.deleteOne({ _id: id });
+    await store.jobFiles.deleteMany({ job_id: id }); // don't leave orphan blobs
+    res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Job files — every scheduled job has its own filing cabinet: folders (kept on
+// the job document, so an empty one sticks around) and files (the blob in
+// job_files, lightweight metadata mirrored onto the job so listing a job never
+// loads file data). The crew sees the same shelf in the portal, read-only.
+// ---------------------------------------------------------------------------
+
+const JOB_FILE_MAX = 4 * 1024 * 1024; // 4 MB per file — same cap as task attachments
+
+// A folder path such as "Permits/Approved". At most five levels, each trimmed
+// of the characters that make a name awkward to show; "" is the job's root.
+function cleanFolder(s) {
+  return String(s == null ? '' : s)
+    .split('/')
+    .map((p) =>
+      p
+        .trim()
+        .replace(/[\:*?"<>|]/g, '')
+        .replace(/^\.+|\.+$/g, '')
+        .trim()
+        .slice(0, 60)
+    )
+    .filter(Boolean)
+    .slice(0, 5)
+    .join('/');
+}
+
+// A folder path and every folder above it: "a/b/c" -> ["a", "a/b", "a/b/c"].
+const ancestors = (path) => path.split('/').map((_, i, all) => all.slice(0, i + 1).join('/'));
+
+// Matches a folder and everything nested under it — deleting a folder takes
+// its subfolders with it, the way a file manager does.
+const underFolder = (path) => (p) => p === path || p.startsWith(path + '/');
+
+// Load the job or answer 404. Returns null once the response has been sent.
+async function jobOr404(req, res) {
+  const doc = await store.schedules.findOne({ _id: Number(req.params.id) });
+  if (!doc) {
+    res.status(404).json({ error: 'Job not found.' });
+    return null;
+  }
+  return doc;
+}
+
+// Stream one stored file back to the browser.
+function sendJobFile(res, blob) {
+  const raw = blob.data;
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw && raw.buffer ? raw.buffer : raw);
+  res.setHeader('Content-Type', blob.content_type || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `inline; filename="${safeName(blob.filename)}"`);
+  res.send(buf);
+}
+
+app.post(
+  '/api/admin/schedules/:id/folders',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const job = await jobOr404(req, res);
+    if (!job) return;
+    const path = cleanFolder(req.body?.path);
+    if (!path) return res.status(400).json({ error: 'Give the folder a name.' });
+    if ((job.folders || []).includes(path))
+      return res.status(400).json({ error: 'That folder already exists.' });
+    await store.schedules.updateOne(
+      { _id: job._id },
+      { $addToSet: { folders: { $each: ancestors(path) } }, $set: { updated_at: new Date() } }
+    );
+    res.json({ path });
+  })
+);
+
+app.delete(
+  '/api/admin/schedules/:id/folders',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const job = await jobOr404(req, res);
+    if (!job) return;
+    const path = cleanFolder(req.query.path);
+    if (!path) return res.status(400).json({ error: 'No folder given.' });
+    const hit = underFolder(path);
+    const doomed = (job.files || []).filter((f) => hit(f.folder || ''));
+    if (doomed.length) await store.jobFiles.deleteMany({ _id: { $in: doomed.map((f) => f.id) } });
+    await store.schedules.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          folders: (job.folders || []).filter((p) => !hit(p)),
+          files: (job.files || []).filter((f) => !hit(f.folder || '')),
+          updated_at: new Date(),
+        },
+      }
+    );
+    res.json({ ok: true, removed: doomed.length });
+  })
+);
+
+app.post(
+  '/api/admin/schedules/:id/files',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const job = await jobOr404(req, res);
+    if (!job) return;
+    const { filename, content_type, data } = req.body || {};
+    if (!data || typeof data !== 'string')
+      return res.status(400).json({ error: 'No file data received.' });
+    let buf;
+    try {
+      buf = Buffer.from(data, 'base64');
+    } catch (e) {
+      return res.status(400).json({ error: 'Could not read that file.' });
+    }
+    if (!buf.length) return res.status(400).json({ error: 'That file is empty.' });
+    if (buf.length > JOB_FILE_MAX)
+      return res.status(400).json({ error: 'File is too large (max 4 MB).' });
+
+    const fileId = crypto.randomUUID();
+    const meta = {
+      id: fileId,
+      filename: safeName(filename),
+      folder: cleanFolder(req.body?.folder),
+      content_type: String(content_type || 'application/octet-stream').slice(0, 120),
+      size: buf.length,
+      uploaded_by: actorName(req),
+      at: new Date(),
+    };
+    await store.jobFiles.insertOne({
+      _id: fileId,
+      job_id: job._id,
+      filename: meta.filename,
+      content_type: meta.content_type,
+      data: buf,
+    });
+    // Dropping a file into a folder that was never created explicitly (a
+    // drag-and-drop of a whole folder does this) files the folder too.
+    const update = { $push: { files: meta }, $set: { updated_at: new Date() } };
+    // Filing into "Permits/Approved" registers "Permits" as well, so the folder
+    // you walk through on the way exists in its own right.
+    if (meta.folder) update.$addToSet = { folders: { $each: ancestors(meta.folder) } };
+    await store.schedules.updateOne({ _id: job._id }, update);
+    res.json({ ...meta, at: iso(meta.at) });
+  })
+);
+
+app.get(
+  '/api/admin/schedules/:id/files/:fileId',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const blob = await store.jobFiles.findOne({
+      _id: req.params.fileId,
+      job_id: Number(req.params.id),
+    });
+    if (!blob) return res.status(404).json({ error: 'File not found.' });
+    sendJobFile(res, blob);
+  })
+);
+
+// Rename a file, or move it to another folder.
+app.patch(
+  '/api/admin/schedules/:id/files/:fileId',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const job = await jobOr404(req, res);
+    if (!job) return;
+    const file = (job.files || []).find((f) => f.id === req.params.fileId);
+    if (!file) return res.status(404).json({ error: 'File not found.' });
+
+    const set = { updated_at: new Date() };
+    if (req.body?.filename != null) {
+      const name = safeName(req.body.filename).trim();
+      if (!name) return res.status(400).json({ error: 'Give the file a name.' });
+      set['files.$[f].filename'] = name;
+    }
+    if (req.body?.folder != null) set['files.$[f].folder'] = cleanFolder(req.body.folder);
+    await store.schedules.updateOne({ _id: job._id }, { $set: set }, {
+      arrayFilters: [{ 'f.id': file.id }],
+    });
+    if (set['files.$[f].filename'])
+      await store.jobFiles.updateOne(
+        { _id: file.id },
+        { $set: { filename: set['files.$[f].filename'] } }
+      );
+    res.json({ ok: true });
+  })
+);
+
+app.delete(
+  '/api/admin/schedules/:id/files/:fileId',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const fileId = req.params.fileId;
+    await store.jobFiles.deleteOne({ _id: fileId, job_id: id });
+    await store.schedules.updateOne(
+      { _id: id },
+      { $pull: { files: { id: fileId } }, $set: { updated_at: new Date() } }
+    );
     res.json({ ok: true });
   })
 );
@@ -1837,6 +2288,9 @@ async function timesheetRows({ employeeId, from, to }) {
       jobs: r.jobs || [],
       missed_reason: r.missed_reason,
       note: r.note,
+      shop_hours: Number(r.shop_hours) || 0,
+      lunch_hours: Number(r.lunch_hours) || 0,
+      km_manual: r.km_manual ?? null,
       edited: r.edited,
       clock_in_lat: r.clock_in_lat ?? null,
       clock_in_lng: r.clock_in_lng ?? null,
@@ -1845,9 +2299,8 @@ async function timesheetRows({ employeeId, from, to }) {
 }
 
 function hoursOf(row) {
-  if (!row.clock_out) return null;
-  const ms = new Date(row.clock_out) - new Date(row.clock_in);
-  return Math.round((ms / 3600000) * 100) / 100;
+  const h = paidHours(row);
+  return h == null ? null : Math.round(h * 100) / 100;
 }
 
 app.get(
@@ -1925,6 +2378,9 @@ app.post(
       work_done: work_done || null,
       missed_reason: null,
       note: note || null,
+      shop_hours: quarterHours(req.body?.shop_hours, MAX_SHOP_HOURS),
+      lunch_hours: quarterHours(req.body?.lunch_hours, MAX_LUNCH_HOURS),
+      km_manual: manualKm(req.body?.km_manual),
       edited: true,
     });
     res.json({ id: _id });
@@ -1958,6 +2414,26 @@ app.patch(
     const workDone = req.body?.work_done != null ? req.body.work_done : p.work_done;
     const missedReason =
       req.body?.missed_reason != null ? req.body.missed_reason : p.missed_reason;
+    const shopHours =
+      req.body?.shop_hours != null
+        ? quarterHours(req.body.shop_hours, MAX_SHOP_HOURS)
+        : Number(p.shop_hours) || 0;
+    const lunchHours =
+      req.body?.lunch_hours != null
+        ? quarterHours(req.body.lunch_hours, MAX_LUNCH_HOURS)
+        : Number(p.lunch_hours) || 0;
+    // '' clears a hand-entered distance and puts the row back on the computed
+    // figure; leaving the field out keeps whatever is already stored.
+    const km =
+      req.body?.km_manual !== undefined ? manualKm(req.body.km_manual) : p.km_manual ?? null;
+
+    if (
+      co &&
+      lunchHours > 0 &&
+      paidHours({ clock_in: ci, clock_out: co, shop_hours: shopHours, lunch_hours: lunchHours }) <= 0
+    )
+      return res.status(400).json({ error: 'Lunch is longer than the time on the clock.' });
+
     await store.punches.updateOne(
       { _id: id },
       {
@@ -1967,6 +2443,9 @@ app.patch(
           work_done: workDone,
           missed_reason: missedReason,
           note,
+          shop_hours: shopHours,
+          lunch_hours: lunchHours,
+          km_manual: km,
           edited: true,
         },
       }
@@ -2007,6 +2486,8 @@ app.get(
       'Employee',
       'Clock In',
       'Clock Out',
+      'Shop/Load Hours',
+      'Lunch Hours',
       'Hours',
       'Jobs',
       'Km',
@@ -2022,6 +2503,8 @@ app.get(
           csvCell(r.name),
           csvCell(iso(r.clock_in)),
           csvCell(iso(r.clock_out) || ''),
+          csvCell(r.shop_hours || ''),
+          csvCell(r.lunch_hours || ''),
           csvCell(hoursOf(r) ?? ''),
           csvCell((r.jobs || []).map(jobLabel).join('; ')),
           csvCell(r.km ?? ''),
