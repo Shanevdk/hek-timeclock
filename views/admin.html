@@ -758,10 +758,10 @@
                between columns to move or unschedule a job. -->
           <div class="sched-toolbar">
             <div class="sched-week">
-              <button class="btn ghost sm" id="schedPrev" type="button" title="Previous week">←</button>
+              <button class="btn ghost sm" id="schedPrev" type="button" title="Back one week">←</button>
               <div class="sched-range" id="schedRange"></div>
-              <button class="btn ghost sm" id="schedNext" type="button" title="Next week">→</button>
-              <button class="btn ghost sm" id="schedToday" type="button">This week</button>
+              <button class="btn ghost sm" id="schedNext" type="button" title="Forward one week">→</button>
+              <button class="btn ghost sm" id="schedToday" type="button">Back to today</button>
             </div>
             <div class="sched-tools">
               <input type="search" id="schedSearch" placeholder="Search address or job…" />
@@ -802,6 +802,25 @@
           </div>
 
           <div class="sched-board" id="schedBoard"></div>
+
+          <!-- Shown only while a card is being dragged. An HTML5 drag will not
+               scroll the page on its own, and the grid runs several screens
+               deep, so holding the pointer over one of these walks the board
+               under the card. -->
+          <div class="sched-scroll" id="schedScroll" aria-hidden="true">
+            <button type="button" id="schedScrollUp" aria-label="Scroll up while dragging">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 15l7-7 7 7" />
+              </svg>
+            </button>
+            <button type="button" id="schedScrollDown" aria-label="Scroll down while dragging">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 9l7 7 7-7" />
+              </svg>
+            </button>
+          </div>
           <p class="status-sub" id="schedEmpty" style="display:none">No jobs scheduled yet.</p>
         </section>
 

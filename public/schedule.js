@@ -350,10 +350,16 @@
     // ---- board ----
     $('schedPrev').addEventListener('click', () => { weekStart = addDays(weekStart, -7); renderBoard(); });
     $('schedNext').addEventListener('click', () => { weekStart = addDays(weekStart, 7); renderBoard(); });
-    $('schedToday').addEventListener('click', () => { weekStart = mondayOf(todayStr()); renderBoard(); });
+    $('schedToday').addEventListener('click', () => {
+      weekStart = mondayOf(todayStr());
+      renderBoard();
+      // The run starts at today's week, so the top of the board IS today.
+      $('schedBoard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
     $('schedSearch').addEventListener('input', renderBoard);
     $('schedNew').addEventListener('click', () => openForm(null));
     initFiles();
+    initScrollPad();
 
     // ---- bulk bar ----
     $('schedBulkApply').addEventListener('click', applyBulk);
@@ -377,9 +383,11 @@
       e.dataTransfer.effectAllowed = 'move';
       // Firefox needs something in the payload before it will start a drag.
       e.dataTransfer.setData('text/plain', String(dragId));
+      showScrollPad(true);
     });
     board.addEventListener('dragend', () => {
       dragId = null;
+      showScrollPad(false);
       board.querySelectorAll('.dragging').forEach((c) => c.classList.remove('dragging'));
       board.querySelectorAll('.drop-over').forEach((c) => c.classList.remove('drop-over'));
     });
@@ -430,6 +438,60 @@
     });
   }
 
+  // ---- drag scroll pad ----
+  // A native HTML5 drag does not scroll the page, and the board now runs
+  // several screens deep, so a card cannot reach a week that is off-screen on
+  // its own. These two buttons only exist while a card is in hand: hold the
+  // pointer over one and the page walks under the card until you leave it.
+  let scrollTimer = null; // interval handle while a button is held
+
+  function showScrollPad(on) {
+    const pad = $("schedScroll");
+    if (!pad) return;
+    pad.classList.toggle("on", on);
+    pad.setAttribute("aria-hidden", on ? "false" : "true");
+    if (!on) stopScrolling();
+  }
+
+  function stopScrolling() {
+    if (scrollTimer) clearInterval(scrollTimer);
+    scrollTimer = null;
+    const pad = $("schedScroll");
+    if (pad) pad.querySelectorAll("button").forEach((b) => b.classList.remove("pulling"));
+  }
+
+  function startScrolling(btn, step) {
+    stopScrolling();
+    btn.classList.add("pulling");
+    // A timer rather than requestAnimationFrame: rAF is suspended outright
+    // whenever the tab is not painting, which would leave the button looking
+    // active while nothing moved. A timer only slows down.
+    scrollTimer = setInterval(() => window.scrollBy(0, step), 16);
+  }
+
+  function initScrollPad() {
+    const pad = $("schedScroll");
+    if (!pad) return;
+    const speeds = { schedScrollUp: -12, schedScrollDown: 12 }; // px per frame
+    for (const [id, step] of Object.entries(speeds)) {
+      const btn = $(id);
+      if (!btn) continue;
+      // dragover, not mouseenter: while a drag is in progress the pointer
+      // events never fire, and dragover is the only signal the button gets.
+      btn.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        if (!scrollTimer) startScrolling(btn, step);
+      });
+      btn.addEventListener("dragleave", stopScrolling);
+      // Dropping ON the button should do nothing but stop the scroll — it is
+      // not a day, so there is no date to move the job to.
+      btn.addEventListener("drop", (e) => {
+        e.preventDefault();
+        stopScrolling();
+      });
+    }
+  }
   // ---- dates ----
   const DAY_MS = 86400000;
   const todayStr = () => {
@@ -585,27 +647,74 @@
     </article>`;
   }
 
-  const columnHtml = (opts) =>
-    `<div class="sched-col ${opts.cls || ''}">
-      <div class="sched-col-head">
-        <div class="sched-col-name">${opts.name}</div>
-        ${opts.sub ? `<div class="sched-col-sub">${opts.sub}</div>` : ''}
+  // How many weeks the board draws at once. The board is a continuous run of
+  // weeks rather than one week at a time — planning an install that lands three
+  // weeks out shouldn't mean paging there and losing sight of where it came
+  // from.
+  const WEEKS_SHOWN = 8;
+
+  // Mon–Sat. Sunday is deliberately not a column: nothing is booked on it, and
+  // dropping it makes every other day wider.
+  const DAYS_PER_WEEK = 6;
+
+  // "Dec 14", but "Jan 1, 2027" once the date leaves the current year — the
+  // year only earns its space when it has actually changed.
+  function cellDate(day) {
+    const thisYear = new Date().getFullYear();
+    const [y] = day.split('-').map(Number);
+    return dayLabel(
+      day,
+      y === thisYear
+        ? { month: 'short', day: 'numeric' }
+        : { month: 'short', day: 'numeric', year: 'numeric' }
+    );
+  }
+
+  // Everyone with nothing booked that day, by initials. This is the number the
+  // office actually schedules against — who is still free — so it sits on every
+  // day whether or not anything is booked.
+  function unbookedOn(jobs, day) {
+    const busy = new Set();
+    for (const j of jobs)
+      if (jobCoversDay(j, day)) for (const id of j.employee_ids || []) busy.add(id);
+    return allEmployees
+      .filter((e) => !busy.has(e.id))
+      .map((e) => initialsFor(e.id))
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  function dayCellHtml(day, jobs, today) {
+    const dayJobs = jobs.filter((j) => jobCoversDay(j, day));
+    const free = unbookedOn(jobs, day);
+    const cls =
+      'sched-day' +
+      (day === today ? ' is-today' : '') +
+      (day < today ? ' is-past' : '');
+    return `<div class="${cls}">
+      <div class="sched-day-head">
+        <span class="sched-day-name">${dayLabel(day, { weekday: 'short' })}</span>
         ${
-          opts.jobs.length
-            ? `<button class="sched-col-all" type="button" data-selcol="${opts.jobs
+          dayJobs.length
+            ? `<button class="sched-day-all" type="button" data-selcol="${dayJobs
                 .map((j) => j.id)
                 .join(',')}">${
-                opts.jobs.every((j) => selected.has(j.id)) ? 'None' : 'All'
+                dayJobs.every((j) => selected.has(j.id)) ? 'None' : 'All'
               }</button>`
             : ''
         }
-        <span class="sched-col-count">${opts.jobs.length}</span>
+        <span class="sched-day-date">${cellDate(day)}</span>
       </div>
-      <div class="sched-col-body"${opts.drop != null ? ` data-drop="${opts.drop}"` : ''}>
-        ${opts.jobs.map((j) => cardHtml(j, opts.day)).join('') ||
-          `<p class="sched-col-empty">${opts.empty || ''}</p>`}
+      <div class="sched-day-body" data-drop="${day}">
+        ${dayJobs.map((j) => cardHtml(j, day)).join('')}
+      </div>
+      <div class="sched-day-free">
+        <div class="sched-free-label">Unbooked:</div>
+        <div class="sched-free-list">${
+          free.length ? esc(free.join(', ')) : '<em>Everyone is booked</em>'
+        }</div>
       </div>
     </div>`;
+  }
 
   function renderBoard() {
     const board = $('schedBoard');
@@ -617,41 +726,50 @@
       (j.description || '').toLowerCase().includes(needle);
 
     const jobs = jobsCache.filter(match);
-    const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
-    const weekEnd = days[6];
+    const today = todayStr();
+    const lastDay = addDays(weekStart, WEEKS_SHOWN * 7 - (7 - DAYS_PER_WEEK) - 1);
     $('schedRange').textContent =
       dayLabel(weekStart, { month: 'short', day: 'numeric' }) +
       ' – ' +
-      dayLabel(weekEnd, { month: 'short', day: 'numeric', year: 'numeric' });
+      dayLabel(lastDay, { month: 'short', day: 'numeric', year: 'numeric' });
     $('schedEmpty').style.display = jobsCache.length ? 'none' : 'block';
 
-    const today = todayStr();
-    const cols = [
-      columnHtml({
-        cls: 'backlog',
-        name: 'To be scheduled',
-        sub: 'No date yet',
-        drop: '',
-        jobs: jobs.filter((j) => !j.date),
-        empty: 'Everything has a date.',
-      }),
-      ...days.map((day) =>
-        columnHtml({
-          cls: 'day' + (day === today ? ' is-today' : '') + (day < today ? ' is-past' : ''),
-          name: dayLabel(day, { weekday: 'short' }),
-          sub: dayLabel(day, { month: 'short', day: 'numeric' }),
-          drop: day,
-          day,
-          // A job that runs over several days appears in every one of them, so
-          // the board shows who is tied up on which day rather than only where
-          // the work started.
-          jobs: jobs.filter((j) => jobCoversDay(j, day)),
-          empty: '',
-        })
-      ),
+    // Jobs with no date at all live above the calendar rather than in a column
+    // of their own — they belong to no week, and a full-height backlog beside a
+    // multi-week grid would be mostly empty space.
+    const loose = jobs.filter((j) => !j.date);
+    const backlog = `<div class="sched-backlog">
+      <div class="sched-backlog-head">
+        <span class="sched-backlog-name">To be scheduled</span>
+        ${
+          loose.length
+            ? `<button class="sched-day-all" type="button" data-selcol="${loose
+                .map((j) => j.id)
+                .join(',')}">${
+                loose.every((j) => selected.has(j.id)) ? 'None' : 'All'
+              }</button>`
+            : ''
+        }
+        <span class="sched-backlog-count">${loose.length}</span>
+      </div>
+      <div class="sched-backlog-body" data-drop="">
+        ${
+          loose.map((j) => cardHtml(j, null)).join('') ||
+          '<p class="sched-col-empty">Everything has a date. Drop a card here to unschedule it.</p>'
+        }
+      </div>
+    </div>`;
 
-    ];
-    board.innerHTML = cols.join('');
+    let weeks = '';
+    for (let w = 0; w < WEEKS_SHOWN; w++) {
+      const monday = addDays(weekStart, w * 7);
+      let cells = '';
+      for (let d = 0; d < DAYS_PER_WEEK; d++)
+        cells += dayCellHtml(addDays(monday, d), jobs, today);
+      weeks += `<div class="sched-week-row">${cells}</div>`;
+    }
+
+    board.innerHTML = backlog + '<div class="sched-weeks">' + weeks + '</div>';
   }
 
   // ---- selecting jobs ----

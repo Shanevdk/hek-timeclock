@@ -10,6 +10,8 @@
   --line: #e3ddd2;
   --text: #22201c;
   --muted: #6f685f;
+  --sched-head: #5d6678;      /* schedule day bar */
+  --sched-head-text: #ffffff;
   --green: #2f9257;
   --red: #c0453b;
   color-scheme: light;
@@ -24,6 +26,8 @@
   --line: #2c2c2c;
   --text: #f3f0ea;
   --muted: #9a938a;
+  --sched-head: #3a4150;
+  --sched-head-text: #e8ecf4;
   --green: #3fae6a;
   --red: #d15b52;
   color-scheme: dark;
@@ -39,6 +43,8 @@
     --line: #2c2c2c;
     --text: #f3f0ea;
     --muted: #9a938a;
+  --sched-head: #3a4150;
+  --sched-head-text: #e8ecf4;
     --green: #3fae6a;
     --red: #d15b52;
     color-scheme: dark;
@@ -1796,45 +1802,105 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 
 /* One row of columns that scrolls sideways — a week never fits a laptop, and
    squeezing it would make the cards unreadable. */
-.sched-board {
-  display: flex;
-  gap: 10px;
-  overflow-x: auto;
-  padding-bottom: 10px;
-  align-items: flex-start;
-}
-.sched-col {
-  flex: 0 0 210px;
-  background: var(--panel);
+/* ---- schedule board: a continuous run of weeks ----
+   Weeks stack downward instead of the board paging one week at a time, so an
+   install three weeks out is visible without losing sight of this week. Six
+   columns, Mon-Sat: nothing is booked on Sunday and dropping it makes every
+   other day wider. */
+.sched-board { padding-bottom: 10px; }
+
+.sched-weeks {
   border: 1px solid var(--line);
   border-radius: 12px;
+  overflow: hidden;
+}
+.sched-week-row {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+}
+/* Only between rows — the outer edge is the container's own border. */
+.sched-week-row + .sched-week-row { border-top: 1px solid var(--line); }
+
+.sched-day { display: flex; flex-direction: column; min-width: 0; }
+.sched-day + .sched-day { border-left: 1px solid var(--line); }
+
+/* The dark bar that names the day: weekday on the left, date hard right. */
+.sched-day-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  background: var(--sched-head);
+  color: var(--sched-head-text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.sched-day-name { font-weight: 600; }
+.sched-day-date { margin-left: auto; font-weight: 600; white-space: nowrap; }
+.sched-day.is-today .sched-day-head { background: var(--gold); color: var(--black); }
+.sched-day.is-past .sched-day-head { opacity: .72; }
+
+.sched-day-body {
+  padding: 7px;
   display: flex;
   flex-direction: column;
-  max-height: 68vh;
-}
-.sched-col.backlog { flex-basis: 260px; }
-
-/* Days already gone recede — but only just. Fading them properly makes half a
-   normal mid-week board unreadable, which is worse than the clutter. */
-.sched-col.is-past .sched-col-body { background: var(--panel-2); }
-.sched-col.is-past .sched-col-name,
-.sched-col.is-past .sched-col-sub { color: var(--muted); }
-.sched-col.is-today { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
-
-.sched-col-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--line);
-  position: sticky;
-  top: 0;
+  gap: 7px;
   background: var(--panel);
-  border-radius: 12px 12px 0 0;
+  /* Keeps an empty day a big enough target to drop a card onto. */
+  min-height: 96px;
+  flex: 1;
 }
-.sched-col-name { font-weight: 700; font-size: 14px; }
-.sched-col-sub { color: var(--muted); font-size: 12.5px; }
-.sched-col-count {
+.sched-day.is-past .sched-day-body { background: var(--panel-2); }
+.sched-day-body.drop-over {
+  background: rgba(200, 155, 92, .14);
+  outline: 2px dashed var(--gold);
+  outline-offset: -3px;
+}
+
+/* Who is still free that day — the number the office schedules against, so it
+   sits on every day whether or not anything is booked. */
+.sched-day-free {
+  border-top: 1px solid var(--line);
+  padding: 5px 7px 7px;
+  text-align: center;
+  background: var(--panel);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.sched-day.is-past .sched-day-free { background: var(--panel-2); }
+.sched-free-label { font-weight: 700; color: var(--text); }
+.sched-free-list { color: var(--muted); word-break: break-word; }
+.sched-free-list em { color: var(--muted); opacity: .8; }
+
+.sched-day-all {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  opacity: .75;
+  font-size: 11px;
+  font-weight: 700;
+}
+.sched-day-all:hover { opacity: 1; text-decoration: underline; }
+
+/* Jobs with no date belong to no week, so they sit above the calendar rather
+   than in a full-height column beside it that would be mostly empty. */
+.sched-backlog {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  margin-bottom: 12px;
+}
+.sched-backlog-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.sched-backlog-name { font-weight: 700; font-size: 13.5px; }
+.sched-backlog-count {
   margin-left: auto;
   min-width: 20px;
   padding: 0 6px;
@@ -1845,19 +1911,52 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   line-height: 19px;
   text-align: center;
 }
-.sched-col.is-today .sched-col-count { background: var(--gold); color: var(--black); }
-
-.sched-col-body {
+.sched-backlog-body {
   padding: 10px;
   display: flex;
-  flex-direction: column;
   gap: 8px;
-  overflow-y: auto;
-  /* Keeps an empty day a big enough target to drop a card onto. */
-  min-height: 90px;
-  flex: 1;
+  overflow-x: auto;
+  min-height: 74px;
+  align-items: flex-start;
 }
-.sched-col-body.drop-over { background: rgba(200, 155, 92, .14); outline: 2px dashed var(--gold); outline-offset: -4px; }
+.sched-backlog-body > .sched-card { flex: 0 0 230px; }
+.sched-backlog-body.drop-over {
+  background: rgba(200, 155, 92, .14);
+  outline: 2px dashed var(--gold);
+  outline-offset: -4px;
+}
+
+/* ---- drag scroll buttons ----
+   The grid is taller than the screen, and an HTML5 drag won't scroll the page
+   on its own. These appear only while a card is in hand: hold the pointer over
+   one and the board scrolls under the card. */
+.sched-scroll {
+  position: fixed;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  display: none;
+  gap: 14px;
+  z-index: 60;
+}
+.sched-scroll.on { display: flex; }
+.sched-scroll button {
+  width: 74px;
+  height: 66px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+  cursor: pointer;
+  color: var(--muted);
+}
+.sched-scroll button:hover,
+.sched-scroll button.pulling { border-color: var(--gold); color: var(--gold); }
+.sched-scroll svg { width: 40px; height: 40px; pointer-events: none; }
+
 .sched-col-empty { color: var(--muted); font-size: 12.5px; margin: 4px 2px; }
 
 .sched-card {
@@ -1912,8 +2011,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .sched-card:hover .sched-del { opacity: 1; }
 
 @media (max-width: 680px) {
-  .sched-tools input[type='search'] { width: 140px; }
-  .sched-col { max-height: none; }
+  .sched-tools input[type='search'] { width: 140px; }
 }
 
 /* ---- Schedule: job detail modal ---- */
