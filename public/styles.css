@@ -448,10 +448,16 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
    drawer — e.g. the clock button — is never buried under it. */
 .modal-back {
   position: fixed; inset: 0; background: rgba(0,0,0,.7);
-  display: none; align-items: center; justify-content: center; padding: 16px; z-index: 70;
+  display: none; align-items: flex-start; justify-content: center; padding: 16px; z-index: 70;
+  /* The overlay is what scrolls: a modal taller than a phone screen would
+     otherwise be clipped top and bottom with no way to reach either end.
+     margin:auto on the box centres it when it fits and lets it grow into a
+     scrolling page when it doesn't. */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .modal-back.open { display: flex; }
-.modal { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 22px; max-width: 420px; width: 100%; }
+.modal { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 22px; max-width: 420px; width: 100%; margin: auto; }
 .modal h3 { margin-top: 0; }
 .modal .row { margin-bottom: 12px; }
 
@@ -2493,3 +2499,64 @@ a.jf-name:hover { color: var(--gold); text-decoration: underline; }
   cursor: pointer;
 }
 .sched-col-all:hover { color: var(--gold); text-decoration: underline; }
+
+/* ---- Schedule board on a phone ----
+   Six columns can't share a phone's width: every card wrapped one letter per
+   line. Below 680px the days of a week stack top to bottom instead. Each day
+   is a full-width block, a day with nothing booked collapses to a thin strip
+   (still a drop target), and the unbooked list sits on one line under the
+   cards rather than in a footer of its own. */
+@media (max-width: 680px) {
+  .sched-week-row { grid-template-columns: 1fr; }
+  .sched-day + .sched-day { border-left: 0; border-top: 1px solid var(--line); }
+  .sched-week-row + .sched-week-row { border-top: 4px solid var(--line); }
+
+  .sched-day-head { font-size: 13px; padding: 6px 10px; }
+  .sched-day-body { min-height: 0; padding: 8px; }
+  .sched-day.is-empty .sched-day-body { min-height: 22px; padding: 4px 8px; }
+  .sched-day.is-empty .sched-day-free { border-top: 0; padding-top: 0; }
+
+  .sched-day-free {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-start;
+    text-align: left;
+    padding: 4px 10px 6px;
+  }
+  .sched-free-list { flex: 1; min-width: 0; }
+
+  /* Cards are wide now, so the crew lane and its cards can breathe. */
+  .sched-group:has(.named) > .sched-card { margin: 0 8px; }
+  .sched-card-title { font-size: 14px; }
+  .sched-card-addr { font-size: 12.5px; }
+  /* Touch has no hover, so the per-card delete and open buttons stay visible. */
+  .sched-card .sched-del,
+  .sched-card .sched-card-open { opacity: .75; }
+
+  /* The backlog scrolls sideways; a card at 230px is fine, but let it use
+     more of the width on a narrow screen when it's the only one. */
+  .sched-backlog-body > .sched-card { flex: 0 0 min(230px, 78vw); }
+
+  /* Scroll buttons for dragging sit clear of the phone's home bar. */
+  .sched-scroll { bottom: 18px; }
+  .sched-scroll button { width: 64px; height: 56px; }
+}
+
+/* ---- Job modal on a phone ----
+   The rows stack label-over-field below 680px, but a stacked flex row keeps
+   align-items: flex-start, so every field box shrank to its placeholder.
+   Stretch them to the full width, and give the inline "Required by" and
+   "through" sub-labels a line of their own above their date so the row reads
+   top to bottom instead of wrapping mid-sentence. */
+@media (max-width: 680px) {
+  .job-row { align-items: stretch; }
+  .job-row > label:empty { display: none; }
+  .job-field { width: 100%; }
+  .job-inline { gap: 8px 10px; }
+  .job-inline > select { flex: 1 1 100%; }
+  .job-inline > input[type='date'],
+  .job-inline > input[type='time'] { flex: 1 1 40%; }
+  .job-pair { flex: 1 1 100%; flex-direction: column; align-items: stretch; gap: 4px; }
+  .job-pair .job-sub { padding-top: 4px; }
+  .job-side .perm-list { max-height: none; }
+}

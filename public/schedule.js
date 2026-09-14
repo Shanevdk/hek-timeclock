@@ -753,7 +753,10 @@
     const cls =
       'sched-day' +
       (day === today ? ' is-today' : '') +
-      (day < today ? ' is-past' : '');
+      (day < today ? ' is-past' : '') +
+      // On a phone the days stack, so a day with nothing on it shrinks to a
+      // strip instead of holding a column's worth of blank space.
+      (dayJobs.length ? '' : ' is-empty');
     return `<div class="${cls}">
       <div class="sched-day-head">
         <span class="sched-day-name">${dayLabel(day, { weekday: 'short' })}</span>
