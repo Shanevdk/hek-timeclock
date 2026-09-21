@@ -110,6 +110,93 @@ Render pick **New + → Blueprint** and set the same environment variables above
 | `CRON_SECRET` | Lets the scheduled QuickBooks sync and inbox scan run on Vercel. Without it those endpoints stay closed. |
 | `ANTHROPIC_API_KEY` | Lets the AI inbox agent read email. Optional — leave blank to switch it off. |
 | `MAIL_ENCRYPTION_KEY` | Optional. Keys the mail-password encryption off its own secret instead of `SESSION_SECRET`. |
+| `S3_BUCKET` / `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | The bucket file attachments are uploaded to. Blank locally = files kept on disk under `.storage/`. See **File attachments** below. |
+| `ATTACH_MAX_BYTES` | Largest attachment accepted, in bytes. Default 1 GB. |
+
+## File attachments (up to 1 GB)
+
+Job files and task attachments are uploaded **straight from the browser to an
+S3-compatible bucket**. MongoDB stores only the metadata — filename, size,
+folder, who uploaded it, and the object's storage key — and links it to the job
+or task. The app never carries the bytes.
+
+That is not a preference, it is a requirement: a Netlify Function refuses a
+request over ~6 MB and a response over 6 MB, and a MongoDB document can never
+exceed 16 MB. Attachments used to be base64'd into the request body and kept in
+the document, which capped them near 4 MB and produced
+`Function.ResponseSizeTooLarge` on the way back out.
+
+How a file moves now:
+
+1. The browser asks the app for permission: `POST …/files/upload-url` with the
+   name, type and size. The app checks who is asking, records a `pending` row,
+   and returns one presigned `PUT` URL per 10 MB part.
+2. The browser `PUT`s the parts directly to the bucket, three at a time, with
+   per-part retries. A dropped connection costs one part, not the whole upload.
+3. `POST …/files/<id>/complete` stitches the parts together, confirms the real
+   size against the bucket, and files the metadata onto the record.
+
+Downloads are a **302 redirect** to a presigned `GET` URL that lives five
+minutes. Authorisation happens in the app first — the admin routes require an
+admin, and the crew's route only matches a job the employee is actually assigned
+to — so a signed URL is only ever issued to someone already entitled to the file.
+Tapping a file views it inline (phones preview images and PDFs); the `⤓` button
+adds `?download=1` and forces a save.
+
+Attachments uploaded before this change still have their bytes in MongoDB and are
+served the old way, so nothing had to be migrated.
+
+### Setting up the bucket (Cloudflare R2)
+
+R2 is the default because it charges nothing for egress, which matters when crews
+pull large files on phones. AWS S3, Backblaze B2 and Supabase Storage all work by
+pointing `S3_ENDPOINT` elsewhere.
+
+1. In the Cloudflare dashboard: **R2 → Create bucket**. Name it e.g.
+   `hek-attachments`. Keep it **private** — public access must stay off.
+2. **R2 → Manage API tokens → Create API token**, permission **Object Read &
+   Write**, scoped to that bucket. Copy the Access Key ID and Secret.
+3. Note your account ID — the endpoint is
+   `https://<account-id>.r2.cloudflarestorage.com`.
+4. Set these in Netlify (**Site configuration → Environment variables**) and in
+   your local `.env`:
+
+   ```
+   S3_BUCKET=hek-attachments
+   S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+   S3_REGION=auto
+   S3_ACCESS_KEY_ID=…
+   S3_SECRET_ACCESS_KEY=…
+   ```
+
+5. **Add CORS to the bucket** — without it the browser's `PUT` fails and the
+   upload appears to do nothing. In R2 → your bucket → Settings → CORS policy:
+
+   ```json
+   [
+     {
+       "AllowedOrigins": ["https://your-site.netlify.app"],
+       "AllowedMethods": ["PUT", "GET", "HEAD"],
+       "AllowedHeaders": ["content-type"],
+       "ExposeHeaders": ["ETag"],
+       "MaxAgeSeconds": 3600
+     }
+   ]
+   ```
+
+   `ExposeHeaders: ["ETag"]` is the part people miss: the browser has to read
+   each part's ETag to report it back, and without it every multipart upload
+   fails at the final step.
+
+Leave the `S3_*` variables blank when running locally and files are kept on disk
+under `.storage/` instead, served through signed app routes — the same three-step
+flow, no cloud account needed. That driver is never used once deployed: a
+serverless filesystem is read-only and wiped between invocations, so a deployed
+site with no bucket configured refuses uploads with a clear message rather than
+pretending to store something.
+
+`ATTACH_MAX_BYTES` sets the ceiling (default 1 GB) and is enforced twice: before
+the upload starts, and against the object's true size once it lands.
 
 ## Quotes and invoices
 

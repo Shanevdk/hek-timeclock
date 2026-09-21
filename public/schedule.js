@@ -90,16 +90,6 @@
   // How many files the job holds, folders and all — the count on the card.
   const fileCount = (job) => (job.files || []).length;
 
-  // Read a File as base64 (strips the "data:*;base64," prefix).
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(String(r.result).split(',')[1] || '');
-      r.onerror = () => reject(new Error('Could not read the file.'));
-      r.readAsDataURL(file);
-    });
-  }
-
   // ======================= EMPLOYEE (portal) view ==========================
   let myJobs = [];
   let myFolder = ''; // folder open on the job page
@@ -1116,7 +1106,9 @@
   // ---- job files (admin) ----
   // Folders live on the job, so an empty one made on purpose sticks around;
   // files are uploaded into whichever folder is open.
-  const MAX_JOB_FILE = 4 * 1024 * 1024;
+  // Matches ATTACH_MAX_BYTES on the server. Only used to refuse an oversized
+  // file before anything is uploaded — the server enforces the real limit.
+  const MAX_JOB_FILE = 1024 * 1024 * 1024;
 
   function currentJob() {
     return jobsCache.find((j) => j.id === editingId) || null;
@@ -1159,6 +1151,8 @@
             <a class="jf-name" href="/api/admin/schedules/${job.id}/files/${f.id}"
                target="_blank" rel="noopener" title="${esc(f.filename)}">${fileIcon(f)} ${esc(f.filename)}</a>
             <span class="jf-size">${fmtBytes(f.size || 0)}</span>
+            <a class="jf-dl" href="/api/admin/schedules/${job.id}/files/${f.id}?download=1"
+               title="Download">⤓</a>
             <button type="button" class="jf-del" data-jf-file-del="${f.id}" title="Remove">✕</button>
           </div>`
         )
@@ -1186,28 +1180,31 @@
     if (!job) return;
     const id = job.id;
     const folder = jfFolder;
-    for (const file of [...fileList]) {
+    const files = [...fileList];
+    // Files go up one at a time on purpose: several gigabyte uploads at once
+    // just make each other slower, and one progress figure is readable.
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const label = files.length > 1 ? `(${i + 1}/${files.length}) ${file.name}` : file.name;
       if (file.size > MAX_JOB_FILE) {
-        $('jfMsg').textContent = `"${file.name}" is too large (max 4 MB).`;
+        $('jfMsg').textContent = `"${file.name}" is too large (max 1 GB).`;
         continue;
       }
       try {
-        $('jfMsg').textContent = `Uploading ${file.name}…`;
-        const data = await fileToBase64(file);
-        await api('/api/admin/schedules/' + id + '/files', {
-          method: 'POST',
-          body: JSON.stringify({
-            filename: file.name,
-            content_type: file.type,
-            // A dropped folder keeps its shape: what it came from is filed
-            // underneath the folder that is open.
-            folder: [folder, subPath(file)].filter(Boolean).join('/'),
-            data,
-          }),
+        $('jfMsg').textContent = `Uploading ${label}… 0%`;
+        await window.HEKUpload.upload({
+          base: '/api/admin/schedules/' + id + '/files',
+          file,
+          // A dropped folder keeps its shape: what it came from is filed
+          // underneath the folder that is open.
+          extra: { folder: [folder, subPath(file)].filter(Boolean).join('/') },
+          onProgress: (frac) => {
+            $('jfMsg').textContent = `Uploading ${label}… ${Math.round(frac * 100)}%`;
+          },
         });
         $('jfMsg').textContent = '';
       } catch (e) {
-        $('jfMsg').textContent = e.message;
+        $('jfMsg').textContent = `${file.name}: ${e.message}`;
       }
     }
     await reloadFiles();

@@ -4,10 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0d0d0d" />
-    <!-- Set the saved theme before first paint so there is no flash. -->
+    <!-- Set the saved theme and glass level before first paint so there is no
+         flash. liquid.js owns both keys afterwards; this is only the head
+         start, and it must not throw on a browser with storage switched off. -->
     <script>
       try { document.documentElement.dataset.theme = localStorage.getItem('hek-theme') || 'system'; }
       catch (e) { document.documentElement.dataset.theme = 'system'; }
+      try {
+        var lq = Number(localStorage.getItem('hek-liquid'));
+        if (!isFinite(lq)) lq = 55;
+        lq = Math.min(100, Math.max(0, lq));
+        document.documentElement.style.setProperty('--liquid', lq / 100);
+        if (lq <= 0) document.documentElement.dataset.liquid = 'off';
+      } catch (e) { /* default from the stylesheet */ }
     </script>
     <title>HEK Fencing — Sign in</title>
 
@@ -51,6 +60,10 @@
                autocapitalize="none" autocorrect="off" spellcheck="false" />
         <button class="btn gold" id="loginBtn" style="margin-top:14px">Sign in</button>
         <div class="msg err" id="loginMsg"></div>
+        <!-- Theme only. How much glass is a preference you set once you are in,
+             from Settings in the dashboard — it does not belong on the way past
+             a sign-in box. The saved level still applies here, since liquid.js
+             reads it on every page. -->
         <div class="theme-row">
           <div class="theme-toggle" role="group" aria-label="Color theme">
             <button type="button" data-theme-choice="system" title="Match system" aria-label="System theme">◐</button>
@@ -445,8 +458,10 @@
     <script src="/md.js"></script>
     <script src="/portal.js"></script>
     <script src="/quotes.js"></script>
+    <script src="/uploader.js"></script>
     <script src="/schedule.js"></script>
     <script src="/pricing.js"></script>
     <script src="/theme.js"></script>
+    <script src="/liquid.js"></script>
   </body>
 </html>

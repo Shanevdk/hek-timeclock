@@ -51,6 +51,196 @@
   }
 }
 
+/* ---- Liquid glass ---------------------------------------------------------
+   The surfaces that float over the page — the phone drawer and its top bar,
+   the settings panel, the account box — are treated as a sheet of glass rather
+   than a painted panel: the page shows through, blurred and slightly more
+   saturated, with a bright hairline along the lit edge and a soft shadow under
+   it. Kept as tokens so the whole material re-tints in one place, and so the
+   opaque fallbacks below only have to override colour.
+
+   Defined separately from the palette above rather than inside it, because the
+   palette is stated three times (light, dark, and system-dark) and this only
+   needs the two states. */
+/* ---- one dial ----
+   Everything below is a function of --liquid, a 0-to-1 scalar the Settings
+   slider writes onto <html>. At 0 the app is flat opaque panels, exactly as it
+   was before glass existed; at 1 the surfaces are thin, heavily blurred and
+   brightly lit. Nothing else in the stylesheet reads --liquid directly — it is
+   spent here, on the tokens, so one number re-materialises the whole app.
+
+   0 must stay a real escape hatch: someone on a slow phone, or anyone who finds
+   translucency hard to read, turns it down and gets solid panels back with no
+   blur left running. */
+:root {
+  --liquid: .55;
+
+  /* Blur costs the most on a weak GPU, so it is the thing that actually
+     reaches zero rather than tapering to a cheap-looking 2px. */
+  /* 24px, not 30px. Blur is the one term here that scales with layer area,
+     and the desktop sidebar below is now a blurred layer where it used to be a
+     painted one. Trimming the top of the range pays for that and more; at the
+     default dial position the difference is 16.5px against 13.2px, which is
+     not a difference anyone can point to on a screenshot. */
+  --lq-blur: calc(var(--liquid) * 24px);
+  --lq-sat: calc(100% + var(--liquid) * 115%);
+  /* Glass is optical, not milky. It does not only soften what is behind it —
+     it lifts contrast and carries a little light, and that is the difference
+     between a sheet of glass and a sheet of tracing paper. These two ride the
+     same backdrop pass as the blur, so they cost no extra compositor layer,
+     and they are what keeps a thin surface from washing out at the top of the
+     dial. Light lifts; dark sinks, so text over a dark panel keeps its
+     ground. */
+  --lq-contrast: calc(100% + var(--liquid) * 24%);
+  --lq-bright: calc(100% + var(--liquid) * 4%);
+  --glass-blur:
+    blur(var(--lq-blur)) saturate(var(--lq-sat))
+    contrast(var(--lq-contrast)) brightness(var(--lq-bright));
+
+  /* Thinner as the dial rises. The floor is set by legibility: text over a
+     surface below about .40 alpha starts fighting whatever is behind it. */
+  --glass-tint: rgba(255, 255, 255, calc(.98 - var(--liquid) * .56));
+  --glass-tint-2: rgba(255, 255, 255, calc(.92 - var(--liquid) * .52));
+  --glass-edge: rgba(34, 32, 28, calc(.15 + var(--liquid) * .03));
+  --glass-hair: rgba(255, 255, 255, calc(.30 + var(--liquid) * .62));
+  --glass-sheen: rgba(255, 255, 255, calc(var(--liquid) * .55));
+  /* The rim. A dark outer edge alone draws a box; what reads as glass is the
+     bright ring just inside it, where the sheet turns and catches the light
+     all the way round. This one token does more for the material than the
+     blur does. */
+  --glass-rim: rgba(255, 255, 255, calc(.20 + var(--liquid) * .48));
+  /* The room's own light, warmed by the palette's gold, pooling along the
+     bottom of a surface the way a lit edge bounces back up into it. Kept far
+     below a colour you would name — an accent, not a tint. */
+  --glass-accent: hsl(36 62% 58% / calc(var(--liquid) * .11));
+  --glass-shade:
+    0 calc(4px + var(--liquid) * 16px) calc(10px + var(--liquid) * 36px)
+      rgba(34, 32, 28, calc(.06 + var(--liquid) * .12)),
+    0 2px 8px rgba(34, 32, 28, .07);
+  /* Tier two, for the surfaces that genuinely float over the page — a modal,
+     the phone drawer, the settings popover. Depth in a stack of glass is read
+     off shadow size, so the things in front need a visibly bigger, softer one
+     than the sheets lying flat on the page. */
+  --glass-shade-hi:
+    0 calc(10px + var(--liquid) * 26px) calc(26px + var(--liquid) * 58px)
+      rgba(34, 32, 28, calc(.11 + var(--liquid) * .15)),
+    0 2px 10px rgba(34, 32, 28, .10);
+  --glass-inner:
+    inset 0 0 0 1px var(--glass-rim),
+    inset 0 1px 0 var(--glass-hair),
+    inset 0 -1px 0 rgba(255, 255, 255, calc(var(--liquid) * .30));
+  --glass-veil: rgba(34, 32, 28, calc(.18 + var(--liquid) * .10));
+  /* Glass reads as a pebble, not a box: the corners round as it thickens. */
+  --glass-radius: calc(12px + var(--liquid) * 10px);
+
+  /* Gloss, in three passes: light gathering along the top, one soft diagonal
+     sweep across the face, and the warm bounce pooling at the bottom. Stated
+     once here so every glass surface catches the light from the same place —
+     which is what makes a screenful of them read as one material rather than
+     a pile of separately decorated boxes. */
+  --glass-gloss:
+    linear-gradient(180deg, var(--glass-sheen) 0%, transparent 40%),
+    linear-gradient(118deg, transparent 16%, var(--glass-sheen) 33%, transparent 54%),
+    radial-gradient(130% 92% at 50% 118%, var(--glass-accent), transparent 72%);
+}
+
+:root[data-theme='dark'] {
+  --glass-tint: rgba(30, 30, 30, calc(.97 - var(--liquid) * .52));
+  --glass-tint-2: rgba(40, 40, 40, calc(.90 - var(--liquid) * .56));
+  --glass-edge: rgba(0, 0, 0, calc(.30 + var(--liquid) * .30));
+  --glass-hair: rgba(255, 255, 255, calc(.04 + var(--liquid) * .18));
+  --glass-sheen: rgba(255, 255, 255, calc(var(--liquid) * .13));
+  --glass-rim: rgba(255, 255, 255, calc(.05 + var(--liquid) * .14));
+  --glass-accent: hsl(36 70% 56% / calc(var(--liquid) * .09));
+  /* Dark glass sinks its backdrop instead of lifting it: brightening behind a
+     dark panel turns it to grey haze and takes the text down with it. */
+  --lq-bright: calc(100% - var(--liquid) * 12%);
+  --glass-shade:
+    0 calc(4px + var(--liquid) * 16px) calc(10px + var(--liquid) * 40px)
+      rgba(0, 0, 0, calc(.30 + var(--liquid) * .34)),
+    0 2px 10px rgba(0, 0, 0, .45);
+  --glass-shade-hi:
+    0 calc(10px + var(--liquid) * 26px) calc(26px + var(--liquid) * 62px)
+      rgba(0, 0, 0, calc(.42 + var(--liquid) * .30)),
+    0 2px 12px rgba(0, 0, 0, .55);
+  --glass-inner:
+    inset 0 0 0 1px var(--glass-rim),
+    inset 0 1px 0 var(--glass-hair),
+    inset 0 -1px 0 rgba(255, 255, 255, calc(var(--liquid) * .06));
+  --glass-veil: rgba(0, 0, 0, calc(.30 + var(--liquid) * .18));
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] {
+    --glass-tint: rgba(30, 30, 30, calc(.97 - var(--liquid) * .52));
+    --glass-tint-2: rgba(40, 40, 40, calc(.90 - var(--liquid) * .56));
+    --glass-edge: rgba(0, 0, 0, calc(.30 + var(--liquid) * .30));
+    --glass-hair: rgba(255, 255, 255, calc(.04 + var(--liquid) * .18));
+    --glass-sheen: rgba(255, 255, 255, calc(var(--liquid) * .13));
+    --glass-rim: rgba(255, 255, 255, calc(.05 + var(--liquid) * .14));
+    --glass-accent: hsl(36 70% 56% / calc(var(--liquid) * .09));
+    /* Dark glass sinks its backdrop instead of lifting it: brightening behind a
+       dark panel turns it to grey haze and takes the text down with it. */
+    --lq-bright: calc(100% - var(--liquid) * 12%);
+    --glass-shade:
+      0 calc(4px + var(--liquid) * 16px) calc(10px + var(--liquid) * 40px)
+        rgba(0, 0, 0, calc(.30 + var(--liquid) * .34)),
+      0 2px 10px rgba(0, 0, 0, .45);
+    --glass-shade-hi:
+      0 calc(10px + var(--liquid) * 26px) calc(26px + var(--liquid) * 62px)
+        rgba(0, 0, 0, calc(.42 + var(--liquid) * .30)),
+      0 2px 12px rgba(0, 0, 0, .55);
+    --glass-inner:
+      inset 0 0 0 1px var(--glass-rim),
+      inset 0 1px 0 var(--glass-hair),
+      inset 0 -1px 0 rgba(255, 255, 255, calc(var(--liquid) * .06));
+    --glass-veil: rgba(0, 0, 0, calc(.30 + var(--liquid) * .18));
+  }
+}
+
+/* The material itself. Opaque by default and translucent only where the
+   browser can actually blur what is behind it — a see-through panel over an
+   unblurred page is unreadable, which is the one outcome worse than a solid
+   one. */
+.glass {
+  background: var(--panel);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--glass-shade), var(--glass-inner);
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass {
+    background: var(--glass-tint);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+}
+
+/* Someone who has asked their system for less transparency gets the panel
+   back, shadow and all. */
+@media (prefers-reduced-transparency: reduce) {
+  .glass {
+    background: var(--panel);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .glass::before { display: none; }
+}
+
+/* The specular pass: light gathering along the top, a soft sweep across the
+   face, and the warm bounce pooling at the foot. Non-interactive and behind
+   the content. The alphas already ride --liquid, so this carries no opacity of
+   its own — at the bottom of the dial the gradients are simply transparent. */
+.glass-lit { position: relative; isolation: isolate; }
+.glass-lit::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  background: var(--glass-gloss);
+}
+
 * { box-sizing: border-box; }
 
 body {
@@ -148,10 +338,13 @@ h1, h2 { font-weight: 700; }
 /* Full-height sidebar layout */
 .admin-layout { display: flex; min-height: 100vh; }
 
+/* No background here on purpose. On a phone this is a sheet of glass and the
+   colour comes from .glass; on a desktop the min-width rule near the phone
+   menu section paints it back to a solid panel. A background set here would
+   outrank .glass by source order and quietly make the drawer opaque. */
 .sidebar {
   width: 240px;
   flex-shrink: 0;
-  background: var(--panel);
   border-right: 1px solid var(--line);
   display: flex;
   flex-direction: column;
@@ -295,15 +488,18 @@ h1, h2 { font-weight: 700; }
     align-items: center;
     gap: 8px;
     padding: 8px 12px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--glass-edge);
     position: sticky;
     top: 0;
     z-index: 40;
+    /* A bar, not a floating card: keep the glass, drop the lifted shadow. */
+    box-shadow: var(--glass-inner);
   }
   .mobile-brand { font-weight: 800; letter-spacing: 3px; color: var(--gold); font-size: 17px; }
   .mobile-brand small { color: var(--text); font-weight: 600; letter-spacing: 2px; font-size: 10px; margin-left: 6px; }
 
+  /* The drawer is a sheet of glass slid over the page — rounded on the side
+     that leaves the edge, so it reads as an object rather than a wall. */
   .sidebar {
     position: fixed;
     top: 0;
@@ -312,24 +508,37 @@ h1, h2 { font-weight: 700; }
     width: 260px;
     max-width: 82vw;
     z-index: 60;
-    border-right: 1px solid var(--line);
+    border: none;
+    border-right: 1px solid var(--glass-edge);
+    border-radius: 0 calc(var(--glass-radius) * 1.8) calc(var(--glass-radius) * 1.8) 0;
+    /* The one surface most obviously in front of the page, so it takes the
+       floating tier. */
+    box-shadow: var(--glass-shade-hi), var(--glass-inner);
     transform: translateX(-100%);
-    transition: transform .25s ease;
-    box-shadow: 2px 0 18px rgba(0, 0, 0, .35);
+    transition: transform .28s cubic-bezier(.32, .72, 0, 1);
   }
   .sidebar.open { transform: translateX(0); }
 
+  /* Lighter than a blackout, and blurred in its own right: the drawer's blur
+     needs something legible behind it to bend, and a flat 50% black leaves it
+     nothing to work with. */
   .sidebar-backdrop {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, .5);
+    background: var(--glass-veil);
     opacity: 0;
     pointer-events: none;
-    transition: opacity .25s ease;
+    transition: opacity .28s ease;
     z-index: 50;
   }
   .sidebar-backdrop.open { opacity: 1; pointer-events: auto; }
+  @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .sidebar-backdrop {
+      -webkit-backdrop-filter: blur(2px);
+      backdrop-filter: blur(2px);
+    }
+  }
 
   /* The clock button moves out of the drawer and into the top bar, so punching
      in on a phone is one tap. The sidebar keeps the full status line. The
@@ -606,9 +815,11 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 
 /* ---- Signed-in user + settings (sidebar footer) ---- */
 .user-area { margin-top: 6px; }
+/* Background, border and shadow come from .glass — see the material near the
+   top of this file. Anything set here would outrank it by source order. */
 .user-bar {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+  padding: 8px 10px; border-radius: 14px;
 }
 .user-id { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .avatar {
@@ -624,8 +835,9 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 }
 .gear-btn:hover, .gear-btn.open { color: var(--gold); background: var(--panel); }
 .gear-btn.open { transform: rotate(45deg); }
+/* Likewise glass — only the shape and spacing belong here. */
 .settings-menu {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  border-radius: 16px;
   padding: 12px; margin-bottom: 8px;
 }
 .settings-menu .menu-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 8px; }
@@ -2128,7 +2340,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .sched-card:hover .sched-del { opacity: 1; }
 
 @media (max-width: 680px) {
-  .sched-tools input[type='search'] { width: 140px; }
+  .sched-tools input[type='search'] { width: 140px; }
 }
 
 /* ---- Schedule: job detail modal ---- */
@@ -2500,6 +2712,23 @@ a.jf-name:hover { color: var(--gold); text-decoration: underline; }
 }
 .sched-col-all:hover { color: var(--gold); text-decoration: underline; }
 
+/* ---- Attachments: save-as beside the view link ----
+   Tapping a file name opens it (a phone previews images and PDFs inline); this
+   is the "keep a copy" affordance next to it. Sized like the delete button so
+   the row keeps one rhythm. */
+.jf-dl,
+.tm-att-dl {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+.jf-dl:hover,
+.tm-att-dl:hover { color: var(--gold); }
+
 /* ---- Schedule board on a phone ----
    Six columns can't share a phone's width: every card wrapped one letter per
    line. Below 680px the days of a week stack top to bottom instead. Each day
@@ -2559,4 +2788,370 @@ a.jf-name:hover { color: var(--gold); text-decoration: underline; }
   .job-pair { flex: 1 1 100%; flex-direction: column; align-items: stretch; gap: 4px; }
   .job-pair .job-sub { padding-top: 4px; }
   .job-side .perm-list { max-height: none; }
+}
+
+/* The gear panel holds the theme switch and the glass slider, and the drawer it
+   sits in is only so tall. Capped so the panel scrolls on its own rather than
+   squeezing the nav above it down to nothing. */
+@media (max-width: 680px) {
+  .settings-menu {
+    max-height: 62vh;
+    overflow-y: auto;
+  }
+}
+
+/* On a desktop the sidebar is part of the page frame, not a sheet floating
+   over it — so it keeps the glass tokens' edge colour and nothing else. */
+@media (min-width: 681px) {
+  /* The desktop sidebar keeps the material but not the lift: it is a column of
+     the page frame, so it takes no drop shadow and no rounded corners, only the
+     hairline down its inner edge. It is glass rather than a painted panel
+     because there is now a lit wash behind the whole page for it to pick up —
+     the one solid column in a screen of glass was the flattest thing on it. */
+  .sidebar.glass {
+    border: none;
+    border-right: 1px solid var(--glass-edge);
+    box-shadow: inset -1px 0 0 var(--glass-hair);
+  }
+
+  /* The account box, by contrast, sits *on* that column rather than over the
+     page. Blurring a surface that is itself already blurring costs a second
+     pass for no visible gain, so it takes the tint and the rim only. */
+  .user-bar.glass {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+
+/* ---- The lit tab ----
+   The selected tab picks up the same specular treatment as the sheet it sits
+   on, so the gold reads as lit glass rather than a flat swatch. */
+.tab.active {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .45), 0 2px 10px rgba(169, 127, 67, .28);
+}
+@media (prefers-reduced-transparency: reduce) {
+  .tab.active { box-shadow: none; }
+}
+
+/* ===========================================================================
+   Liquid glass, everywhere
+   ---------------------------------------------------------------------------
+   The tokens at the top of this file already describe the material and already
+   scale with --liquid. This section is what spends them: it takes the surfaces
+   that were flat painted panels — cards, bars, modals, the schedule board, form
+   controls — and re-lays them as sheets of that same glass.
+
+   Two rules keep it from turning into mush:
+
+   1. Only containers blur. backdrop-filter is the expensive part and it does
+      not stack usefully: a card blurring a board that is already blurring the
+      page costs twice and looks the same. So the big sheets blur, and small
+      things inside them (cards, chips, crew lanes) take the tint and the
+      hairline only.
+   2. Text always wins. Tint alpha has a floor, and anything carrying small
+      grey text keeps a surface solid enough to read against a busy page.
+
+   At --liquid: 0 the JS also stamps data-liquid="off" on <html>, and the block
+   at the very bottom strips every blur back out — not merely down to a small
+   radius, out. A dial labelled "none" that leaves compositing work running is
+   a lie to whoever turned it down.
+   =========================================================================== */
+
+/* ---- the light behind the glass ----
+   Blur needs something worth blurring. Against one flat fill a 30px blur is
+   invisible — it is still that same flat fill. These soft washes, in the
+   palette's own gold and a cool counterweight, are what the surfaces pick up
+   and smear as you move over them. Fixed, so they read as light in the room
+   rather than as part of the page, and they fade out entirely as the dial
+   drops to nothing. */
+body::before {
+  content: '';
+  position: fixed;
+  /* inset:0, not an overscan. A layer bled out past the viewport is area every
+     backdrop-filter on the page has to sample, and on a large window that alone
+     was enough to stall the compositor. */
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: calc(var(--liquid) * .9);
+  background:
+    radial-gradient(42vmax 42vmax at 12% 8%, hsl(36 62% 58% / .46), transparent 62%),
+    radial-gradient(38vmax 38vmax at 88% 18%, hsl(210 52% 54% / .32), transparent 60%),
+    radial-gradient(46vmax 46vmax at 72% 92%, hsl(26 64% 52% / .36), transparent 64%);
+}
+:root[data-theme='dark'] body::before {
+  background:
+    radial-gradient(42vmax 42vmax at 12% 8%, hsl(36 65% 46% / .55), transparent 62%),
+    radial-gradient(38vmax 38vmax at 88% 18%, hsl(210 55% 44% / .45), transparent 60%),
+    radial-gradient(46vmax 46vmax at 72% 92%, hsl(28 60% 40% / .48), transparent 64%);
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] body::before {
+    background:
+      radial-gradient(42vmax 42vmax at 12% 8%, hsl(36 60% 40% / .30), transparent 62%),
+      radial-gradient(38vmax 38vmax at 88% 18%, hsl(210 50% 38% / .24), transparent 60%),
+      radial-gradient(46vmax 46vmax at 72% 92%, hsl(28 55% 34% / .26), transparent 64%);
+  }
+}
+
+/* ---- sheets: the surfaces that blur ---------------------------------------
+   One list, one material. Everything here is a container big enough that the
+   blur behind it is worth paying for. */
+/* Keep this list short and keep it to big things. Each entry is a separate
+   compositor layer that resamples everything behind it on every frame, and the
+   dashboard puts a lot of these on screen at once — an earlier draft that also
+   blurred every .stat tile and every scroll button was enough to freeze the
+   renderer outright on a large dark window. Small surfaces take the tint and
+   the hairline below instead, which is most of the look for none of the cost. */
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .card,
+  .modal,
+  .topbar,
+  .sched-weeks,
+  .sched-backlog {
+    background: var(--glass-tint);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+}
+/* Blurred or not, these carry the same tint, so the two groups look like one
+   material. */
+.stat,
+.emp-card,
+.sched-scroll button {
+  background: var(--glass-tint);
+}
+
+.card,
+.modal,
+.stat,
+.emp-card {
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shade), var(--glass-inner);
+}
+
+/* The same gloss .glass-lit draws, from the same token. Layered onto the tint
+   as a background image rather than a pseudo-element, because several of these
+   cards already use ::before for something else. */
+.card,
+.modal,
+.stat,
+.emp-card {
+  background-image: var(--glass-gloss);
+}
+
+/* ---- depth ----
+   Two tiers, and the difference between them is the whole of "layered": the
+   sheets above lie on the page, while these float over it and say so with a
+   larger, softer shadow. Without the gap a screen of glass reads as one flat
+   plane no matter how well each surface is lit. */
+.modal,
+.settings-menu {
+  box-shadow: var(--glass-shade-hi), var(--glass-inner);
+}
+
+.topbar {
+  border-color: var(--glass-edge);
+}
+.sched-weeks,
+.sched-backlog {
+  border-color: var(--glass-edge);
+  border-radius: var(--glass-radius);
+  box-shadow: var(--glass-shade);
+}
+
+/* ---- panes inside the sheets ----
+   Tint and hairline, no blur: they sit on a surface that has already done it. */
+.sched-day-body,
+.sched-day-free {
+  background: var(--glass-tint-2);
+}
+.sched-day.is-past .sched-day-body,
+.sched-day.is-past .sched-day-free {
+  background: var(--glass-tint-2);
+  opacity: .82;
+}
+.sched-card,
+.job-card,
+.tm-card {
+  background: var(--glass-tint);
+  border-color: var(--glass-edge);
+  border-radius: calc(var(--glass-radius) * .62);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, calc(var(--liquid) * .10)), var(--glass-inner);
+}
+.sched-day + .sched-day,
+.sched-week-row + .sched-week-row {
+  border-color: var(--glass-edge);
+}
+
+/* The day bar keeps its own colour — it is the board's one piece of signage,
+   and washing it out costs more than the material gains. It takes the hairline
+   only, so it sits in the same light as everything around it. */
+.sched-day-head {
+  box-shadow: inset 0 1px 0 var(--glass-hair);
+}
+
+/* ---- controls ----
+   Buttons and fields are small and numerous, so they take the cheap half of
+   the material: a translucent fill and the lit top edge, no blur. */
+input,
+select,
+textarea,
+.btn,
+.theme-toggle {
+  background: var(--glass-tint-2);
+  border-color: var(--glass-edge);
+  box-shadow: inset 0 1px 0 var(--glass-hair);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  background: var(--glass-tint);
+}
+/* The gold button is the page's one solid call to action. It stays solid —
+   glass on a primary button reads as disabled. */
+.btn.gold {
+  background: var(--gold);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, calc(var(--liquid) * .35));
+}
+
+/* ---- the veil behind a modal ----
+   Already a token; this lets it blur the page underneath, which is what
+   separates a sheet of glass from a grey rectangle. */
+.modal-back {
+  background: var(--glass-veil);
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .modal-back {
+    -webkit-backdrop-filter: blur(calc(var(--liquid) * 12px));
+    backdrop-filter: blur(calc(var(--liquid) * 12px));
+  }
+}
+
+/* ---- the slider itself ----
+   Lives in the Settings panel under the theme switch, and on the sign-in card.
+   Track and thumb are made of the material they control, so dragging it
+   previews itself. */
+.lq-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 4px;
+}
+.lq-row input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  padding: 0;
+  margin: 0;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+.lq-value {
+  flex: 0 0 auto;
+  min-width: 34px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.lq-hint {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+/* The slider lives in the Settings panel and nowhere else, so it needs no
+   centred variant. The rules that placed it on the sign-in card were removed
+   with it. */
+
+/* ---- off means off --------------------------------------------------------
+   Stamped on <html> when the slider reaches zero. Every backdrop-filter in the
+   app is torn out here rather than left running at a small radius: a
+   compositing pass nobody can see is exactly the cost someone turning this
+   down is trying to avoid. Surfaces go back to the painted panels the app had
+   before any of this existed. */
+:root[data-liquid='off'] body::before { display: none; }
+:root[data-liquid='off'] .glass,
+:root[data-liquid='off'] .card,
+:root[data-liquid='off'] .modal,
+:root[data-liquid='off'] .stat,
+:root[data-liquid='off'] .topbar,
+:root[data-liquid='off'] .sidebar,
+:root[data-liquid='off'] .mobile-bar,
+:root[data-liquid='off'] .settings-menu,
+:root[data-liquid='off'] .user-bar,
+:root[data-liquid='off'] .sched-weeks,
+:root[data-liquid='off'] .sched-backlog,
+:root[data-liquid='off'] .emp-card,
+:root[data-liquid='off'] .sched-scroll button,
+:root[data-liquid='off'] .modal-back {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root[data-liquid='off'] .glass,
+:root[data-liquid='off'] .card,
+:root[data-liquid='off'] .modal,
+:root[data-liquid='off'] .stat,
+:root[data-liquid='off'] .emp-card,
+:root[data-liquid='off'] .sched-card,
+:root[data-liquid='off'] .job-card,
+:root[data-liquid='off'] .tm-card,
+:root[data-liquid='off'] .topbar {
+  background: var(--panel);
+  background-image: none;
+}
+:root[data-liquid='off'] .sched-day-body,
+:root[data-liquid='off'] .sched-day-free,
+:root[data-liquid='off'] input,
+:root[data-liquid='off'] select,
+:root[data-liquid='off'] textarea,
+:root[data-liquid='off'] .theme-toggle {
+  background: var(--panel-2);
+}
+:root[data-liquid='off'] .btn.gold { background: var(--gold); }
+:root[data-liquid='off'] .modal-back { background: rgba(0, 0, 0, .7); }
+:root[data-liquid='off'] .glass-lit::before { display: none; }
+
+/* Someone who has asked their system for less transparency gets the same
+   treatment without having to find the slider. */
+@media (prefers-reduced-transparency: reduce) {
+  body::before { display: none; }
+  .card,
+  .modal,
+  .stat,
+  .topbar,
+  .sched-weeks,
+  .sched-backlog,
+  .emp-card,
+  .sched-scroll button,
+  .modal-back {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .card,
+  .modal,
+  .stat,
+  .emp-card,
+  .sched-card,
+  .job-card,
+  .tm-card,
+  .topbar {
+    background: var(--panel);
+    background-image: none;
+  }
+  .modal-back { background: rgba(0, 0, 0, .7); }
+}
+
+/* A phone is where blur costs the most and the screen is smallest, so the
+   material is held thinner than the dial asks for. The dial still works — this
+   only caps the top end. */
+@media (max-width: 680px) {
+  :root { --lq-blur: calc(var(--liquid) * 18px); }
 }

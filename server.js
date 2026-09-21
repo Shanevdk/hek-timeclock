@@ -20,6 +20,14 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const cookieSession = require('cookie-session');
+// Attachment bytes live in object storage, never in a request body or a MongoDB
+// document — see storage.js for why and for the two drivers.
+const {
+  storage,
+  MAX_UPLOAD_BYTES,
+  buildKey,
+  disposition: storageDisposition,
+} = require('./storage');
 const { connect, store } = require('./db');
 const qbo = require('./quickbooks');
 const rateBook = require('./ratebook');
@@ -71,9 +79,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Raised from the 100kb default so task file attachments (sent as base64 JSON,
-// capped at 4 MB each server-side ≈ 5.4 MB encoded) fit in the request body.
-// Kept under Netlify Functions' ~6 MB request payload limit for production.
+// Raised from the 100kb default for the app's larger JSON payloads (an estimate
+// with its options, a ratebook import). File attachments no longer travel this
+// way at all — they go straight to object storage from the browser (storage.js),
+// so no request body needs to be anywhere near this size.
 app.use(express.json({ limit: '6mb' }));
 app.use(
   cookieSession({
@@ -84,6 +93,63 @@ app.use(
     sameSite: 'lax',
   })
 );
+
+// ---------------------------------------------------------------------------
+// Local-disk storage endpoints.
+//
+// Only mounted when there is no bucket configured (a laptop with no cloud
+// account). They stand in for presigned S3 URLs: the signed token in the query
+// string IS the authorisation, exactly as the signature is in a presigned URL,
+// and it names one operation on one object and expires.
+// ---------------------------------------------------------------------------
+if (storage.mode === 'local') {
+  const fsp = require('fs/promises');
+  const nodePath = require('path');
+
+  // One part of a multipart upload. express.json ignores this request (wrong
+  // content type), so the raw body is still here to be read.
+  app.put(
+    '/api/storage/local/part',
+    // type:() => true, not '*/*': a Blob slice carries no MIME type, so the
+    // browser sends the part with NO Content-Type header at all — and a matcher
+    // based on the header skips exactly those requests, leaving req.body empty.
+    express.raw({ type: () => true, limit: '64mb' }),
+    (req, res) => {
+      const t = storage.verify(req.query.token);
+      if (!t || t.op !== 'put')
+        return res.status(403).json({ error: 'This upload link has expired.' });
+      const dest = storage.partPath(t.uploadId, t.part);
+      fsp
+        .mkdir(nodePath.dirname(dest), { recursive: true })
+        .then(() => fsp.writeFile(dest, req.body))
+        .then(() => {
+          // The client echoes this back on completion, the way it reports an
+          // S3 ETag, so both drivers take the same completion payload.
+          res.setHeader(
+            'ETag',
+            '"' + crypto.createHash('md5').update(req.body).digest('hex') + '"'
+          );
+          res.json({ ok: true });
+        })
+        .catch((err) => {
+          console.error('local part write failed:', err.message);
+          res.status(500).json({ error: 'Could not store that part.' });
+        });
+    }
+  );
+
+  // A finished object. Streamed from disk, so size is not a concern here — this
+  // driver never runs on a serverless host.
+  app.get('/api/storage/local/object', (req, res) => {
+    const t = storage.verify(req.query.token);
+    if (!t || t.op !== 'get') return res.status(403).type('text').send('This link has expired.');
+    res.setHeader('Content-Type', t.ct || 'application/octet-stream');
+    res.setHeader('Content-Disposition', storageDisposition(t.filename, t.download));
+    res.sendFile(storage.objectPath(t.key), (err) => {
+      if (err && !res.headersSent) res.status(404).type('text').send('That file is gone.');
+    });
+  });
+}
 
 // Count every request for the dev dashboard. This runs on 'finish', i.e. after
 // the response has been sent, so measuring never slows anybody down, and a
@@ -1137,7 +1203,7 @@ app.get(
     if (!job) return res.status(404).json({ error: 'Job not found.' });
     const blob = await store.jobFiles.findOne({ _id: req.params.fileId, job_id: id });
     if (!blob) return res.status(404).json({ error: 'File not found.' });
-    sendJobFile(res, blob);
+    await serveAttachment(req, res, blob);
   })
 );
 
@@ -1933,7 +1999,9 @@ app.delete(
   wrap(async (req, res) => {
     const id = Number(req.params.id);
     await store.schedules.deleteOne({ _id: id });
-    await store.jobFiles.deleteMany({ job_id: id }); // don't leave orphan blobs
+    // Don't leave orphans — in the database or in the bucket.
+    await dropStored(await store.jobFiles.find({ job_id: id }).toArray());
+    await store.jobFiles.deleteMany({ job_id: id });
     res.json({ ok: true });
   })
 );
@@ -1945,16 +2013,17 @@ app.delete(
 // loads file data). The crew sees the same shelf in the portal, read-only.
 // ---------------------------------------------------------------------------
 
-// ---- Serverless response ceiling -----------------------------------------
+// ---- Serverless response ceiling (legacy attachments only) ---------------
 // Netlify Functions cap a response at 6 MB, and serverless-http base64-encodes
 // binary bodies on the way out, which inflates them by 4/3. So a file small
-// enough to store can still be too big to hand back — and when that happens the
-// platform kills the whole invocation with its own "This function has crashed"
-// page, which tells the crew nothing and looks like the app is down.
+// enough to store could still be too big to hand back — and when that happened
+// the platform killed the whole invocation with its own "This function has
+// crashed" page, which told the crew nothing and looked like the app was down.
 //
-// The ceiling is therefore stated once, here. Upload caps are derived from it
-// rather than picked to sit near it by coincidence, and every stored file is
-// measured against it before it is sent.
+// New attachments never come through here: they are uploaded straight to object
+// storage and read back through a redirect, so no file size can reach this
+// ceiling (see storage.js). What remains is the reader for attachments stored in
+// the database before that change — those are still measured before being sent.
 const FN_RESPONSE_MAX = 6291556; // bytes, Netlify's documented limit
 // Headers, the response envelope, and a long multi-byte filename all ride along
 // with the body and count towards the same budget.
@@ -1970,10 +2039,6 @@ const escHtml = (v) =>
   String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
   );
-
-// 4 MB reads well to a person and is comfortably inside what can be sent
-// back; the min() is what guarantees the second part stays true.
-const JOB_FILE_MAX = Math.min(4 * 1024 * 1024, BLOB_MAX);
 
 // A folder path such as "Permits/Approved". At most five levels, each trimmed
 // of the characters that make a name awkward to show; "" is the job's root.
@@ -2043,6 +2108,80 @@ function sendStoredFile(res, blob) {
 // Kept as the old name so both job-file routes read the same as before.
 const sendJobFile = sendStoredFile;
 
+// ---- attachments in object storage ---------------------------------------
+//
+// The three steps of an upload are: ask for URLs, PUT the parts straight to
+// storage, then tell the app it landed. The app never sees a byte, which is what
+// lifts the old 4 MB ceiling to 1 GB.
+
+const GB = 1024 * 1024 * 1024;
+const uploadLimitLabel = () =>
+  MAX_UPLOAD_BYTES % GB === 0
+    ? MAX_UPLOAD_BYTES / GB + ' GB'
+    : Math.round(MAX_UPLOAD_BYTES / (1024 * 1024)) + ' MB';
+
+// What the client says it is about to send. Size is all that can be checked
+// before the bytes exist — it is checked again against the stored object, since
+// a browser can claim anything.
+function plannedUpload(body, res) {
+  const size = Number(body?.size);
+  if (!Number.isFinite(size) || size <= 0) {
+    res.status(400).json({ error: 'That file looks empty.' });
+    return null;
+  }
+  if (size > MAX_UPLOAD_BYTES) {
+    res.status(413).json({ error: `File is too large (max ${uploadLimitLabel()}).` });
+    return null;
+  }
+  return {
+    filename: safeName(body?.filename),
+    content_type: String(body?.content_type || 'application/octet-stream').slice(0, 120),
+    size,
+  };
+}
+
+// The parts list a client reports on completion, cleaned up.
+const cleanParts = (list) =>
+  (Array.isArray(list) ? list : [])
+    .map((p) => ({ partNumber: Number(p?.partNumber), etag: p?.etag ? String(p.etag) : undefined }))
+    .filter((p) => Number.isInteger(p.partNumber) && p.partNumber > 0);
+
+// Hand back a stored attachment.
+//
+// Authorisation has already happened in the route — that is the whole point of
+// coming through the app at all. What goes back is a 302 to a signed URL that
+// lives five minutes, so the response is a few hundred bytes and the 6 MB
+// function ceiling can no longer be reached. Files uploaded before this change
+// still have their bytes in MongoDB and are sent the old way.
+async function serveAttachment(req, res, doc) {
+  if (doc.storage_key) {
+    if (doc.status && doc.status !== 'ready')
+      return res.status(409).json({ error: 'That file is still uploading.' });
+    const url = await storage.presignGet({
+      key: doc.storage_key,
+      filename: doc.filename,
+      contentType: doc.content_type,
+      // Tapping a row views it (phones open images and PDFs inline); the
+      // download button asks for it as a file.
+      download: req.query.download === '1',
+    });
+    return res.redirect(302, url);
+  }
+  return sendStoredFile(res, doc); // legacy blob, still in the database
+}
+
+// Forget the bytes behind attachment rows: a half-finished upload is aborted, a
+// finished object deleted. Legacy in-database blobs need nothing — deleting the
+// row is deleting the bytes.
+async function dropStored(docs) {
+  for (const d of docs || []) {
+    if (!d || !d.storage_key) continue;
+    if (d.status === 'pending' && d.upload_id)
+      await storage.abortUpload({ key: d.storage_key, uploadId: d.upload_id });
+    await storage.remove({ key: d.storage_key });
+  }
+}
+
 app.post(
   '/api/admin/schedules/:id/folders',
   requireAdmin,
@@ -2071,7 +2210,12 @@ app.delete(
     if (!path) return res.status(400).json({ error: 'No folder given.' });
     const hit = underFolder(path);
     const doomed = (job.files || []).filter((f) => hit(f.folder || ''));
-    if (doomed.length) await store.jobFiles.deleteMany({ _id: { $in: doomed.map((f) => f.id) } });
+    if (doomed.length) {
+      const ids = doomed.map((f) => f.id);
+      // Read the rows before dropping them: the storage keys live there.
+      await dropStored(await store.jobFiles.find({ _id: { $in: ids } }).toArray());
+      await store.jobFiles.deleteMany({ _id: { $in: ids } });
+    }
     await store.schedules.updateOne(
       { _id: job._id },
       {
@@ -2086,50 +2230,113 @@ app.delete(
   })
 );
 
+// Step 1: authorise the upload and hand back one signed URL per part.
 app.post(
-  '/api/admin/schedules/:id/files',
+  '/api/admin/schedules/:id/files/upload-url',
   requireAdmin,
   wrap(async (req, res) => {
     const job = await jobOr404(req, res);
     if (!job) return;
-    const { filename, content_type, data } = req.body || {};
-    if (!data || typeof data !== 'string')
-      return res.status(400).json({ error: 'No file data received.' });
-    let buf;
-    try {
-      buf = Buffer.from(data, 'base64');
-    } catch (e) {
-      return res.status(400).json({ error: 'Could not read that file.' });
-    }
-    if (!buf.length) return res.status(400).json({ error: 'That file is empty.' });
-    if (buf.length > JOB_FILE_MAX)
-      return res.status(400).json({ error: 'File is too large (max 4 MB).' });
+    const plan = plannedUpload(req.body, res);
+    if (!plan) return;
 
     const fileId = crypto.randomUUID();
-    const meta = {
-      id: fileId,
-      filename: safeName(filename),
-      folder: cleanFolder(req.body?.folder),
-      content_type: String(content_type || 'application/octet-stream').slice(0, 120),
-      size: buf.length,
-      uploaded_by: actorName(req),
-      at: new Date(),
-    };
+    const key = buildKey('jobs/' + job._id, fileId, plan.filename);
+    const up = await storage.createUpload({
+      key,
+      contentType: plan.content_type,
+      size: plan.size,
+    });
+    // The row exists from the moment the upload starts. An upload that is never
+    // finished is then a visible pending row rather than an orphaned object
+    // nothing in the database knows about.
     await store.jobFiles.insertOne({
       _id: fileId,
       job_id: job._id,
-      filename: meta.filename,
-      content_type: meta.content_type,
-      data: buf,
+      filename: plan.filename,
+      content_type: plan.content_type,
+      size: plan.size,
+      folder: cleanFolder(req.body?.folder),
+      storage_key: key,
+      storage_mode: storage.mode,
+      upload_id: up.uploadId,
+      status: 'pending',
+      uploaded_by: actorName(req),
+      created_at: new Date(),
     });
-    // Dropping a file into a folder that was never created explicitly (a
-    // drag-and-drop of a whole folder does this) files the folder too.
+    res.json({ fileId, partSize: up.partSize, parts: up.parts });
+  })
+);
+
+// Step 3: the parts are all in storage — stitch them together and file the
+// metadata onto the job, in the same shape the board has always read.
+app.post(
+  '/api/admin/schedules/:id/files/:fileId/complete',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const job = await jobOr404(req, res);
+    if (!job) return;
+    const doc = await store.jobFiles.findOne({ _id: req.params.fileId, job_id: job._id });
+    if (!doc) return res.status(404).json({ error: 'Upload not found.' });
+    // A retried completion (flaky connection at the last step) must not file the
+    // same attachment twice.
+    if (doc.status === 'ready') {
+      const existing = (job.files || []).find((f) => f.id === doc._id);
+      return res.json(existing || { id: doc._id, filename: doc.filename, size: doc.size });
+    }
+
+    const parts = cleanParts(req.body?.parts);
+    if (!parts.length) return res.status(400).json({ error: 'No uploaded parts reported.' });
+    await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
+
+    // Trust the object, not the claim: its real length is what gets recorded,
+    // and it enforces the cap even if the browser lied at step 1.
+    const head = await storage.head({ key: doc.storage_key });
+    if (!head) return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    if (head.size > MAX_UPLOAD_BYTES) {
+      await storage.remove({ key: doc.storage_key });
+      await store.jobFiles.deleteOne({ _id: doc._id });
+      return res.status(413).json({ error: `File is too large (max ${uploadLimitLabel()}).` });
+    }
+
+    await store.jobFiles.updateOne(
+      { _id: doc._id },
+      { $set: { status: 'ready', size: head.size, upload_id: null, at: new Date() } }
+    );
+    const meta = {
+      id: doc._id,
+      filename: doc.filename,
+      folder: doc.folder || '',
+      content_type: doc.content_type,
+      size: head.size,
+      uploaded_by: doc.uploaded_by,
+      at: new Date(),
+    };
     const update = { $push: { files: meta }, $set: { updated_at: new Date() } };
     // Filing into "Permits/Approved" registers "Permits" as well, so the folder
     // you walk through on the way exists in its own right.
     if (meta.folder) update.$addToSet = { folders: { $each: ancestors(meta.folder) } };
     await store.schedules.updateOne({ _id: job._id }, update);
     res.json({ ...meta, at: iso(meta.at) });
+  })
+);
+
+// A cancelled or failed upload cleans up after itself, so a half-sent gigabyte
+// is not billed for ever.
+app.post(
+  '/api/admin/schedules/:id/files/:fileId/abort',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const doc = await store.jobFiles.findOne({
+      _id: req.params.fileId,
+      job_id: Number(req.params.id),
+      status: 'pending',
+    });
+    if (doc) {
+      await dropStored([doc]);
+      await store.jobFiles.deleteOne({ _id: doc._id });
+    }
+    res.json({ ok: true });
   })
 );
 
@@ -2142,7 +2349,7 @@ app.get(
       job_id: Number(req.params.id),
     });
     if (!blob) return res.status(404).json({ error: 'File not found.' });
-    sendJobFile(res, blob);
+    await serveAttachment(req, res, blob);
   })
 );
 
@@ -2181,6 +2388,8 @@ app.delete(
   wrap(async (req, res) => {
     const id = Number(req.params.id);
     const fileId = req.params.fileId;
+    const doc = await store.jobFiles.findOne({ _id: fileId, job_id: id });
+    await dropStored([doc]);
     await store.jobFiles.deleteOne({ _id: fileId, job_id: id });
     await store.schedules.updateOne(
       { _id: id },
@@ -4144,52 +4353,105 @@ app.post(
   })
 );
 
-// Task file attachments. The blob lives in its own collection; only lightweight
-// metadata is mirrored onto the task so the board lists files without the data.
-const TASK_ATTACH_MAX = JOB_FILE_MAX; // one cap, one reason — see BLOB_MAX
+// Task file attachments. Same three-step upload as job files — the bytes go
+// browser-to-storage and only metadata is mirrored onto the task, so the board
+// lists attachments without loading anything.
 const safeName = (s) => String(s || 'file').replace(/[\r\n"\\]/g, '').slice(0, 200) || 'file';
 
 app.post(
-  '/api/admin/tasks/:id/attachments',
+  '/api/admin/tasks/:id/attachments/upload-url',
   requireAdmin,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
     const t = await store.tasks.findOne({ _id: id });
     if (!t) return res.status(404).json({ error: 'Task not found.' });
-    const { filename, content_type, data } = req.body || {};
-    if (!data || typeof data !== 'string')
-      return res.status(400).json({ error: 'No file data received.' });
-    let buf;
-    try {
-      buf = Buffer.from(data, 'base64');
-    } catch (e) {
-      return res.status(400).json({ error: 'Could not read that file.' });
-    }
-    if (!buf.length) return res.status(400).json({ error: 'That file is empty.' });
-    if (buf.length > TASK_ATTACH_MAX)
-      return res.status(400).json({ error: 'File is too large (max 4 MB).' });
+    const plan = plannedUpload(req.body, res);
+    if (!plan) return;
 
     const attId = crypto.randomUUID();
-    const meta = {
-      id: attId,
-      filename: safeName(filename),
-      content_type: String(content_type || 'application/octet-stream').slice(0, 120),
-      size: buf.length,
-      uploaded_by: actorName(req),
-      at: new Date(),
-    };
+    const key = buildKey('tasks/' + id, attId, plan.filename);
+    const up = await storage.createUpload({
+      key,
+      contentType: plan.content_type,
+      size: plan.size,
+    });
     await store.taskAttachments.insertOne({
       _id: attId,
       task_id: id,
-      filename: meta.filename,
-      content_type: meta.content_type,
-      data: buf,
+      filename: plan.filename,
+      content_type: plan.content_type,
+      size: plan.size,
+      storage_key: key,
+      storage_mode: storage.mode,
+      upload_id: up.uploadId,
+      status: 'pending',
+      uploaded_by: actorName(req),
+      created_at: new Date(),
     });
+    res.json({ fileId: attId, partSize: up.partSize, parts: up.parts });
+  })
+);
+
+app.post(
+  '/api/admin/tasks/:id/attachments/:attId/complete',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const t = await store.tasks.findOne({ _id: id });
+    if (!t) return res.status(404).json({ error: 'Task not found.' });
+    const doc = await store.taskAttachments.findOne({ _id: req.params.attId, task_id: id });
+    if (!doc) return res.status(404).json({ error: 'Upload not found.' });
+    if (doc.status === 'ready') {
+      const existing = (t.attachments || []).find((a) => a.id === doc._id);
+      return res.json(existing || { id: doc._id, filename: doc.filename, size: doc.size });
+    }
+
+    const parts = cleanParts(req.body?.parts);
+    if (!parts.length) return res.status(400).json({ error: 'No uploaded parts reported.' });
+    await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
+
+    const head = await storage.head({ key: doc.storage_key });
+    if (!head) return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    if (head.size > MAX_UPLOAD_BYTES) {
+      await storage.remove({ key: doc.storage_key });
+      await store.taskAttachments.deleteOne({ _id: doc._id });
+      return res.status(413).json({ error: `File is too large (max ${uploadLimitLabel()}).` });
+    }
+
+    await store.taskAttachments.updateOne(
+      { _id: doc._id },
+      { $set: { status: 'ready', size: head.size, upload_id: null, at: new Date() } }
+    );
+    const meta = {
+      id: doc._id,
+      filename: doc.filename,
+      content_type: doc.content_type,
+      size: head.size,
+      uploaded_by: doc.uploaded_by,
+      at: new Date(),
+    };
     await store.tasks.updateOne(
       { _id: id },
       { $push: { attachments: meta }, $set: { updated_at: new Date() } }
     );
     res.json({ ...meta, at: iso(meta.at) });
+  })
+);
+
+app.post(
+  '/api/admin/tasks/:id/attachments/:attId/abort',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const doc = await store.taskAttachments.findOne({
+      _id: req.params.attId,
+      task_id: Number(req.params.id),
+      status: 'pending',
+    });
+    if (doc) {
+      await dropStored([doc]);
+      await store.taskAttachments.deleteOne({ _id: doc._id });
+    }
+    res.json({ ok: true });
   })
 );
 
@@ -4202,9 +4464,9 @@ app.get(
       task_id: Number(req.params.id),
     });
     if (!blob) return res.status(404).json({ error: 'Attachment not found.' });
-    // Same guard as job files: an attachment too big to send back must say so
-    // rather than crash the function.
-    sendStoredFile(res, blob);
+    // Same as job files: a redirect to signed storage, with the old in-database
+    // blobs still served directly.
+    await serveAttachment(req, res, blob);
   })
 );
 
@@ -4214,6 +4476,8 @@ app.delete(
   wrap(async (req, res) => {
     const id = Number(req.params.id);
     const attId = req.params.attId;
+    const doc = await store.taskAttachments.findOne({ _id: attId, task_id: id });
+    await dropStored([doc]);
     await store.taskAttachments.deleteOne({ _id: attId, task_id: id });
     await store.tasks.updateOne(
       { _id: id },

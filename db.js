@@ -63,16 +63,18 @@ async function doConnect() {
   store.quotes = store.db.collection('quotes');
   // Scheduled jobs: an address + description assigned to one or more employees.
   store.schedules = store.db.collection('schedules');
-  // Files attached to a scheduled job. The binary blob lives here (one doc per
-  // file); lightweight metadata is mirrored onto the job doc so the job page
-  // lists files and folders without loading any file data.
+  // Files attached to a scheduled job. One doc per file, holding the object
+  // storage key and the metadata; lightweight metadata is also mirrored onto the
+  // job doc so the job page lists files and folders without a second query.
+  // Docs created before attachments moved to object storage still carry the
+  // bytes in a "data" field and are served the old way — see storage.js.
   store.jobFiles = store.db.collection('job_files');
   // "My Tasks" board — a kanban card assigned to a single employee, with
   // status columns (todo / in_progress / done), comments, time, and history.
   store.tasks = store.db.collection('tasks');
-  // File attachments for tasks. The binary blob lives here (one doc per file);
-  // lightweight metadata is mirrored onto the task doc so the board can list
-  // attachments without loading the file data.
+  // File attachments for tasks. Same shape as job files: the storage key plus
+  // metadata, mirrored onto the task doc for listing. Older docs keep their bytes
+  // in "data".
   store.taskAttachments = store.db.collection('task_attachments');
   // Time-off requests: an employee asks for a date range; the admin approves or
   // declines it. Statuses: pending / approved / declined.
@@ -126,9 +128,13 @@ async function doConnect() {
   await store.schedules.createIndex({ date: 1 });
   await store.schedules.createIndex({ employee_ids: 1 });
   await store.jobFiles.createIndex({ job_id: 1 });
+  // Finds uploads that were started and never finished, so abandoned objects can
+  // be swept up instead of being paid for indefinitely.
+  await store.jobFiles.createIndex({ status: 1, created_at: 1 });
   await store.tasks.createIndex({ status: 1, order: 1 });
   await store.tasks.createIndex({ assignee_id: 1 });
   await store.taskAttachments.createIndex({ task_id: 1 });
+  await store.taskAttachments.createIndex({ status: 1, created_at: 1 });
   await store.vacations.createIndex({ employee_id: 1 });
   await store.vacations.createIndex({ status: 1, created_at: -1 });
   await store.bulletins.createIndex({ status: 1, published_at: -1 });

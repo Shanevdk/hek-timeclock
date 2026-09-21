@@ -58,7 +58,8 @@
     if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
     return (n / (1024 * 1024)).toFixed(1) + ' MB';
   }
-  const MAX_ATTACH = 4 * 1024 * 1024;
+  // Server-enforced; this only refuses an oversized file early.
+  const MAX_ATTACH = 1024 * 1024 * 1024;
 
   // -------------------------------------------------------------- load + render
   async function loadAdmin() {
@@ -351,20 +352,12 @@
         (a) => `<div class="tm-att" data-att="${a.id}">
           <a class="tm-att-name" href="/api/admin/tasks/${t.id}/attachments/${a.id}" target="_blank" rel="noopener" title="${esc(a.filename)}">📎 ${esc(a.filename)}</a>
           <span class="tm-att-size">${fmtBytes(a.size || 0)}</span>
+          <a class="tm-att-dl" href="/api/admin/tasks/${t.id}/attachments/${a.id}?download=1"
+             title="Download">⤓</a>
           <button type="button" class="tm-att-del" data-att-del="${a.id}" title="Remove">✕</button>
         </div>`
       )
       .join('');
-  }
-
-  // Read a File as base64 (strips the "data:*;base64," prefix).
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(String(r.result).split(',')[1] || '');
-      r.onerror = () => reject(new Error('Could not read the file.'));
-      r.readAsDataURL(file);
-    });
   }
 
   async function uploadFiles(fileList) {
@@ -373,15 +366,19 @@
     const files = [...fileList];
     for (const file of files) {
       if (file.size > MAX_ATTACH) {
-        $('tmMsg').textContent = `"${file.name}" is too large (max 4 MB).`;
+        $('tmMsg').textContent = `"${file.name}" is too large (max 1 GB).`;
         continue;
       }
       try {
-        $('tmMsg').textContent = `Uploading ${file.name}…`;
-        const data = await fileToBase64(file);
-        const meta = await api('/api/admin/tasks/' + id + '/attachments', {
-          method: 'POST',
-          body: JSON.stringify({ filename: file.name, content_type: file.type, data }),
+        $('tmMsg').textContent = `Uploading ${file.name}… 0%`;
+        // Straight to storage in parts — the app never carries the bytes, so the
+        // old ~4 MB serverless ceiling no longer applies. See public/uploader.js.
+        const meta = await window.HEKUpload.upload({
+          base: '/api/admin/tasks/' + id + '/attachments',
+          file,
+          onProgress: (frac) => {
+            $('tmMsg').textContent = `Uploading ${file.name}… ${Math.round(frac * 100)}%`;
+          },
         });
         const t = byId(id);
         if (t) {
