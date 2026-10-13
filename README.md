@@ -110,7 +110,7 @@ Render pick **New + → Blueprint** and set the same environment variables above
 | `CRON_SECRET` | Lets the scheduled QuickBooks sync and inbox scan run on Vercel. Without it those endpoints stay closed. |
 | `ANTHROPIC_API_KEY` | Lets the AI inbox agent read email. Optional — leave blank to switch it off. |
 | `MAIL_ENCRYPTION_KEY` | Optional. Keys the mail-password encryption off its own secret instead of `SESSION_SECRET`. |
-| `S3_BUCKET` / `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | The bucket file attachments are uploaded to. Blank locally = files kept on disk under `.storage/`. See **File attachments** below. |
+| `S3_BUCKET` / `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | The bucket file attachments are uploaded to. Blank locally = files kept on disk under `.storage/`; blank when deployed = files up to 4 MB kept in MongoDB. See **File attachments** below. |
 | `ATTACH_MAX_BYTES` | Largest attachment accepted, in bytes. Default 1 GB. |
 
 ## File attachments (up to 1 GB)
@@ -191,9 +191,13 @@ pointing `S3_ENDPOINT` elsewhere.
 Leave the `S3_*` variables blank when running locally and files are kept on disk
 under `.storage/` instead, served through signed app routes — the same three-step
 flow, no cloud account needed. That driver is never used once deployed: a
-serverless filesystem is read-only and wiped between invocations, so a deployed
-site with no bucket configured refuses uploads with a clear message rather than
-pretending to store something.
+serverless filesystem is read-only and wiped between invocations.
+
+A deployed site with no bucket configured keeps attachments in MongoDB instead
+(a `file_chunks` collection), again through signed app routes. Every byte then
+passes through a serverless function, so files there are capped at **4 MB** —
+anything bigger is refused by name. Set up the bucket above to lift that to
+1 GB; files already stored in MongoDB keep working after you do.
 
 `ATTACH_MAX_BYTES` sets the ceiling (default 1 GB) and is enforced twice: before
 the upload starts, and against the object's true size once it lands.

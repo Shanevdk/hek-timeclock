@@ -83,7 +83,10 @@ app.use((req, res, next) => {
 // with its options, a ratebook import). File attachments no longer travel this
 // way at all — they go straight to object storage from the browser (storage.js),
 // so no request body needs to be anywhere near this size.
-app.use(express.json({ limit: '6mb' }));
+// Storage part uploads are raw bytes and are read by their own route: a part of
+// a .json file must not be parsed here and arrive at that route as an object.
+const jsonBody = express.json({ limit: '6mb' });
+app.use((req, res, next) => (req.path.startsWith('/api/storage/') ? next() : jsonBody(req, res, next)));
 app.use(
   cookieSession({
     name: 'hek_sess',
@@ -148,6 +151,58 @@ if (storage.mode === 'local') {
     res.sendFile(storage.objectPath(t.key), (err) => {
       if (err && !res.headersSent) res.status(404).type('text').send('That file is gone.');
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB storage endpoints.
+//
+// Only mounted on a deployed site with no bucket (see storage.js). The same
+// signed-token scheme as the local driver; the bytes live in MongoDB instead of
+// on a disk the serverless host would throw away.
+// ---------------------------------------------------------------------------
+if (storage.mode === 'db') {
+  app.put(
+    '/api/storage/db/part',
+    // type:() => true for the same reason as the local driver: a Blob slice
+    // can arrive with no Content-Type at all.
+    express.raw({ type: () => true, limit: storage.partBytes + 64 * 1024 }),
+    (req, res) => {
+      const t = storage.verify(req.query.token);
+      if (!t || t.op !== 'put')
+        return res.status(403).json({ error: 'This upload link has expired.' });
+      const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      storage
+        .putPart({ uploadId: t.uploadId, part: t.part, bytes })
+        .then(() => {
+          // Echoed back on completion the way an S3 ETag is.
+          res.setHeader('ETag', '"' + crypto.createHash('md5').update(bytes).digest('hex') + '"');
+          res.json({ ok: true });
+        })
+        .catch((err) => {
+          console.error('db part write failed:', err.message);
+          res.status(500).json({ error: 'Could not store that part.' });
+        });
+    }
+  );
+
+  // A finished object, read back out of its chunks. Small by construction —
+  // the driver caps uploads at what one function response can carry.
+  app.get('/api/storage/db/object', (req, res) => {
+    const t = storage.verify(req.query.token);
+    if (!t || t.op !== 'get') return res.status(403).type('text').send('This link has expired.');
+    storage
+      .read({ key: t.key })
+      .then((buf) => {
+        if (!buf) return res.status(404).type('text').send('That file is gone.');
+        res.setHeader('Content-Type', t.ct || 'application/octet-stream');
+        res.setHeader('Content-Disposition', storageDisposition(t.filename, t.download));
+        res.send(buf);
+      })
+      .catch((err) => {
+        console.error('db object read failed:', err.message);
+        if (!res.headersSent) res.status(500).type('text').send('Could not read that file.');
+      });
   });
 }
 
@@ -536,7 +591,13 @@ const wrap = (fn) => (req, res) =>
         timezone: TIMEZONE,
       })
       .catch(() => {});
-    if (!res.headersSent) res.status(500).json({ error: 'Server error.' });
+    if (res.headersSent) return;
+    // Some errors are written for the person who hit them — file storage that
+    // isn't set up, or a bucket refusing the upload. Those say so, rather than
+    // leaving the office staring at "Server error." with nothing to act on.
+    if (err && err.expose && err.message)
+      return res.status(err.status || 500).json({ error: err.message });
+    res.status(500).json({ error: 'Server error.' });
   });
 
 // ---------------------------------------------------------------------------
@@ -4906,6 +4967,8 @@ app.use((err, req, res, next) => {
     })
     .catch(() => {});
   if (res.headersSent) return next(err);
+  if (err && err.expose && err.message)
+    return res.status(err.status || 500).json({ error: err.message });
   res.status(500).json({ error: 'Server error.' });
 });
 
