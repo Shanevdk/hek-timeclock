@@ -175,11 +175,14 @@ app.use((req, res, next) => {
 // with its options, a ratebook import). File attachments no longer travel this
 // way at all — they go straight to object storage from the browser (storage.js),
 // so no request body needs to be anywhere near this size.
-// Not on the local driver's part uploads: those are raw file bytes, and a part
-// of a .json file arrives labelled application/json — parsing it here would eat
-// (or refuse) the very bytes the route has to store.
+// Not on the storage drivers' part uploads (local and db): those are raw file
+// bytes read by their own routes, and a part of a .json file arrives labelled
+// application/json — parsing it here would eat (or refuse) the very bytes the
+// route has to store. Any letter case, the way Express matches the routes.
 const jsonBody = express.json({ limit: '6mb' });
-app.use((req, res, next) => (/^\/api\/storage\/local\/part$/i.test(req.path) ? next() : jsonBody(req, res, next)));
+app.use((req, res, next) =>
+  /^\/api\/storage\/(local|db)\/part$/i.test(req.path) ? next() : jsonBody(req, res, next)
+);
 app.use(
   cookieSession({
     name: 'hek_sess',
@@ -363,6 +366,69 @@ if (storage.mode === 'local') {
     res.sendFile(storage.objectPath(t.key), (err) => {
       if (err && !res.headersSent) res.status(404).type('text').send('That file is gone.');
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB storage endpoints.
+//
+// Only mounted on a deployed site with no bucket (see storage.js). The same
+// signed-token scheme as the local driver; the bytes live in MongoDB instead of
+// on a disk the host would throw away.
+// ---------------------------------------------------------------------------
+if (storage.mode === 'db') {
+  app.put(
+    '/api/storage/db/part',
+    // The token is checked before a byte of the body is read, as for the
+    // local driver: no upload link, nothing buffered.
+    (req, res, next) => {
+      const t = storage.verify(req.query.token);
+      if (!t || t.op !== 'put')
+        return res.status(403).json({ error: 'This upload link has expired.' });
+      req.uploadToken = t;
+      next();
+    },
+    // type:() => true for the same reason as the local driver: a Blob slice
+    // can arrive with no Content-Type at all.
+    express.raw({ type: () => true, limit: storage.partBytes + 64 * 1024 }),
+    (req, res) => {
+      const t = req.uploadToken;
+      const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      storage
+        .putPart({ uploadId: t.uploadId, part: t.part, bytes })
+        .then(() => {
+          // Echoed back on completion the way an S3 ETag is.
+          res.setHeader('ETag', '"' + crypto.createHash('md5').update(bytes).digest('hex') + '"');
+          res.json({ ok: true });
+        })
+        .catch((err) => {
+          console.error('db part write failed:', err.message);
+          res.status(500).json({ error: 'Could not store that part.' });
+        });
+    }
+  );
+
+  // A finished object, read back out of its chunks. Small by construction —
+  // the driver caps uploads at what one function response can carry.
+  app.get('/api/storage/db/object', (req, res) => {
+    const t = storage.verify(req.query.token);
+    if (!t || t.op !== 'get') return res.status(403).type('text').send('This link has expired.');
+    storage
+      .read({ key: t.key })
+      .then((buf) => {
+        if (!buf) return res.status(404).type('text').send('That file is gone.');
+        // Served from our own address, like the local driver: anything that
+        // could run script only ever goes out as a download, never sniffed.
+        const out = storageServing(t.ct, t.download);
+        res.setHeader('Content-Type', out.contentType);
+        res.setHeader('Content-Disposition', storageDisposition(t.filename, out.download));
+        storageGuard(res, out.contentType);
+        res.send(buf);
+      })
+      .catch((err) => {
+        console.error('db object read failed:', err.message);
+        if (!res.headersSent) res.status(500).type('text').send('Could not read that file.');
+      });
   });
 }
 
@@ -818,13 +884,15 @@ function requireMyFeature(perm) {
 }
 
 // What an error means for the reply. A deliberate refusal — bad input, a body
-// too large to read, a service that isn't set up — keeps its own status and
-// says what it is; anything else is a fault: logged, kept for the dev
-// dashboard, and answered with a plain "Server error."
+// too large to read — keeps its own status and says what it is. Anything on
+// the server's side is a fault: logged and kept for the dev dashboard. Its
+// reply is a plain "Server error." unless it was written for the person who
+// hit it (err.expose) — file storage that isn't set up, a bucket refusing an
+// upload — which says so, so the office isn't left with nothing to act on.
 function errorReply(err) {
   const status = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
   const shown = status < 500 || (err && err.expose === true);
-  return { status, fault: !shown, message: shown ? err.message : 'Server error.' };
+  return { status, fault: status >= 500, message: shown ? err.message : 'Server error.' };
 }
 
 // Only what a fault needs: never the whole error object, which for a body that

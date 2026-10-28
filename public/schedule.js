@@ -351,10 +351,6 @@
   // Jobs ticked on the board. The bulk bar acts on this whole set, and
   // dragging any one of them drags every job in it.
   const selected = new Set();
-  // True while the stylesheet stacks a week's days into one column (a phone).
-  // A Sunday column is laid out inline, which would beat that rule as well, so
-  // renderBoard checks this first. Declared up here: initAdmin runs right below.
-  const stacked = window.matchMedia('(max-width: 680px)');
 
   // ---- reading the board, and changing it ----
   // The board's usual read — the year or so the server sends unasked, and
@@ -492,11 +488,6 @@
       $('schedBoard').scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
     $('schedSearch').addEventListener('input', renderBoard);
-    // Crossing the phone breakpoint changes how a Sunday column is laid out —
-    // redraw, once there is a board to redraw.
-    stacked.addEventListener('change', () => {
-      if (weekStart) renderBoard();
-    });
     $('schedNew').addEventListener('click', () => openForm(null));
     initFiles();
     initScrollPad();
@@ -959,15 +950,14 @@
                   : 'Click to open · tick (or ctrl-click) to select · drag to another day'
               }">
       <div class="sched-card-top">
-        <input type="checkbox" class="sched-pick" data-pick="${job.id}"${
-          selected.has(job.id) ? ' checked' : ''
-        } title="Select for bulk scheduling" />
         <div class="sched-card-title">${esc(title)}</div>
         <div class="sched-card-icons">
           ${job.notes_driver ? '<span title="Notes for the crew">📄</span>' : ''}
           ${fileCount(job) ? `<span title="${fileCount(job)} file(s)">📎</span>` : ''}
-          ${live.length > 1 ? `<span class="sched-x">× ${live.length}</span>` : ''}
         </div>
+        <input type="checkbox" class="sched-pick" data-pick="${job.id}"${
+          selected.has(job.id) ? ' checked' : ''
+        } title="Select for bulk scheduling" />
       </div>
       ${lines.map((l) => `<div class="sched-card-line">${esc(l)}</div>`).join('')}
       ${multi ? `<div class="sched-span">Day ${nth} of ${total}</div>` : ''}
@@ -988,61 +978,16 @@
       ${crew.length ? `<div class="sched-card-crew">${crew.map(chipHtml).join('')}</div>` : ''}
       ${live.length ? '' : '<div class="sched-unassigned">Unassigned</div>'}
       <button class="link-btn danger sched-del" data-del="${job.id}" title="Delete">✕</button>
-      <span class="sched-card-open" aria-hidden="true">↗</span>
     </article>`;
   }
 
-  // Inside a day, jobs sit under whoever is on them — one lane per crew member,
-  // then everything still unassigned. A dispatcher reads the board by person
-  // ("what is Coltyn on for Tuesday"), not as an undifferentiated pile of cards.
-  // A job with several people on it appears in each of their lanes and carries a
-  // × count, so nobody has to open it to see that it is shared.
-  function groupsForDay(dayJobs) {
-    const byEmp = new Map();
-    const loose = [];
-    for (const j of dayJobs) {
-      // Lanes are only for people who can be booked: a job with nobody active
-      // left on it waits under Unassigned.
-      const crew = (j.employee_ids || []).filter((id) => !isInactive(id));
-      if (!crew.length) {
-        loose.push(j);
-        continue;
-      }
-      for (const id of crew) {
-        if (!byEmp.has(id)) byEmp.set(id, []);
-        byEmp.get(id).push(j);
-      }
-    }
-    const groups = [...byEmp.entries()]
-      .map(([id, jobs]) => ({
-        id,
-        name: (allEmployees.find((e) => e.id === id) || {}).name || '(removed)',
-        jobs,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    if (loose.length) groups.push({ id: null, name: 'Unassigned', jobs: loose });
-    return groups;
-  }
-
-  // A stable colour per crew member, so the same person reads as the same colour
-  // on every day of every week. Derived from the id rather than stored, so
-  // adding somebody never recolours anyone else.
-  const crewHue = (id) => (Number(id) * 47) % 360;
-
-  function groupHtml(g, day) {
-    const cards = g.jobs.map((j) => cardHtml(j, day)).join('');
-    if (g.id == null)
-      return `<section class="sched-group loose">
-        <div class="sched-group-head">Unassigned (${g.jobs.length})</div>
-        ${cards}
-      </section>`;
-    return `<section class="sched-group" style="--crew-hue:${crewHue(g.id)}">
-      <div class="sched-group-head named">
-        <span class="sched-group-name">${esc(g.name)}</span>
-        <span class="sched-group-count">${g.jobs.length}</span>
-      </div>
-      ${cards}
-    </section>`;
+  // Inside a day the jobs run in the order the crews will reach them: by start
+  // time, then anything without a time, then by name so the order is stable.
+  function byTime(a, b) {
+    const ta = a.time || '99:99';
+    const tb = b.time || '99:99';
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return (a.description || a.address || '').localeCompare(b.description || b.address || '');
   }
 
   // How many weeks the board draws at once. The board is a continuous run of
@@ -1069,9 +1014,9 @@
     );
   }
 
-  // Everyone with nothing booked that day, by initials. This is the number the
-  // office actually schedules against — who is still free — so it sits on every
-  // day whether or not anything is booked.
+  // Everyone with nothing booked that day. This is the number the office
+  // actually schedules against — who is still free — so it sits on every day
+  // whether or not anything is booked.
   function unbookedOn(jobs, day) {
     const busy = new Set();
     for (const j of jobs)
@@ -1079,12 +1024,15 @@
     // Someone inactive can't be booked, however empty their day looks.
     return activeEmployees()
       .filter((e) => !busy.has(e.id))
-      .map((e) => initialsFor(e.id))
-      .sort((a, b) => a.localeCompare(b));
+      .map((e) => ({ initials: initialsFor(e.id), name: e.name || '' }))
+      .sort((a, b) => a.initials.localeCompare(b.initials));
   }
 
+  // One day is one panel: the day and date, how many jobs it holds, the jobs in
+  // time order, and who is still free. The whole panel is the drop target, so a
+  // card can land on the heading of a day that has nothing in it yet.
   function dayCellHtml(day, jobs, today) {
-    const dayJobs = jobs.filter((j) => jobCoversDay(j, day));
+    const dayJobs = jobs.filter((j) => jobCoversDay(j, day)).sort(byTime);
     // Against every job, not just those the search shows: someone booked on a
     // job the search hides is still booked.
     const free = unbookedOn(jobsCache, day);
@@ -1092,12 +1040,13 @@
       'sched-day' +
       (day === today ? ' is-today' : '') +
       (day < today ? ' is-past' : '') +
-      // On a phone the days stack, so a day with nothing on it shrinks to a
-      // strip instead of holding a column's worth of blank space.
+      // On a phone the days stack, so a day with nothing on it shrinks to its
+      // heading instead of holding a column's worth of blank space.
       (dayJobs.length ? '' : ' is-empty');
-    return `<div class="${cls}">
+    return `<div class="${cls}" data-drop="${day}">
       <div class="sched-day-head">
         <span class="sched-day-name">${dayLabel(day, { weekday: 'short' })}</span>
+        <span class="sched-day-date">${cellDate(day)}</span>
         ${
           dayJobs.length
             ? `<button class="sched-day-all" type="button" data-selcol="${dayJobs
@@ -1107,16 +1056,20 @@
               }</button>`
             : ''
         }
-        <span class="sched-day-date">${cellDate(day)}</span>
+        <span class="sched-day-count">${dayJobs.length}</span>
       </div>
-      <div class="sched-day-body" data-drop="${day}">
-        ${groupsForDay(dayJobs).map((g) => groupHtml(g, day)).join('')}
+      <div class="sched-day-body">
+        ${dayJobs.map((j) => cardHtml(j, day)).join('')}
       </div>
-      <div class="sched-day-free">
-        <div class="sched-free-label">Unbooked:</div>
-        <div class="sched-free-list">${
-          free.length ? esc(free.join(', ')) : '<em>Everyone is booked</em>'
-        }</div>
+      <div class="sched-day-free" title="${esc(
+        free.length ? 'Unbooked: ' + free.map((f) => f.name).join(', ') : 'Everyone is booked'
+      )}">
+        <span class="sched-free-label">Unbooked</span>
+        <span class="sched-free-list">${
+          free.length
+            ? esc(free.map((f) => f.initials).join(', '))
+            : '<em>Everyone is booked</em>'
+        }</span>
       </div>
     </div>`;
   }
@@ -1173,11 +1126,12 @@
       for (let d = 0; d < days; d++)
         cells += dayCellHtml(addDays(monday, d), jobs, today);
       lastDay = addDays(monday, days - 1);
-      // The stylesheet only knows six columns; see `stacked` for the phone.
-      const wide = days > DAYS_PER_WEEK && !stacked.matches;
-      weeks += `<div class="sched-week-row"${
-        wide ? ` style="grid-template-columns:repeat(${days}, 1fr)"` : ''
-      }>${cells}</div>`;
+      // has-sun: the stylesheet gives a week with its Sunday a seventh column
+      // when the board is wide enough for days side by side.
+      weeks += `<section class="sched-wk">
+        <div class="sched-wk-label">Week of ${cellDate(monday)}</div>
+        <div class="sched-week-row${days > DAYS_PER_WEEK ? ' has-sun' : ''}">${cells}</div>
+      </section>`;
     }
     $('schedRange').textContent =
       dayLabel(weekStart, { month: 'short', day: 'numeric' }) +
@@ -1189,6 +1143,9 @@
     const back = board.querySelector('.sched-backlog-body');
     const left = back ? back.scrollLeft : 0;
     const refocus = focusAgain(board);
+    // While anything is ticked every card shows its tick box, not just the
+    // one under the pointer.
+    board.classList.toggle('selecting', selected.size > 0);
     board.innerHTML = backlog + '<div class="sched-weeks">' + weeks + '</div>';
     if (left) board.querySelector('.sched-backlog-body').scrollLeft = left;
     if (refocus) refocus();
