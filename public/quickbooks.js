@@ -23,6 +23,22 @@
   let ourEmployees = []; // ours, for the matching table
   let wired = false;
   let banner = null; // message carried over from the OAuth redirect
+  let periodAsked = 0; // numbers each pay-period read, so only the latest paints
+
+  // The two reads here that never leave this server: the connection status and
+  // the push history. Everything else under /api/admin/quickbooks that reads
+  // (items, tax codes, QuickBooks' employees) asks Intuit, so nothing ever
+  // fetches those ahead of time. Kept in memory only — the status carries the
+  // Intuit app's settings.
+  const STATUS = '/api/admin/quickbooks/status';
+  const RUNS = '/api/admin/quickbooks/runs';
+
+  // Whether someone is typing in a field inside `box` right now. A refresh
+  // landing mid-entry must not put the server's older values back.
+  const typing = (box) => {
+    const a = document.activeElement;
+    return !!box && !!a && box.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+  };
 
   // ---- helpers ----
   const n2 = (v) => (Number(v) || 0).toFixed(2);
@@ -82,7 +98,7 @@
       const expires = s.refresh_expires_at ? new Date(s.refresh_expires_at) : null;
       // Intuit expires the connection roughly every 100 days even when it is in
       // constant use, so this is worth showing before payroll day finds out.
-      const soon = expires && expires - Date.now() < 14 * 24 * DAY_MS;
+      const soon = expires && expires - Date.now() < 14 * DAY_MS;
       $('qbConn').innerHTML =
         `<p class="qb-state on">Connected to <strong>${esc(s.company || 'QuickBooks company ' + s.realm_id)}</strong></p>` +
         `<p class="status-sub qb-lead">Connected ${prettyWhen(s.connected_at)}` +
@@ -91,6 +107,10 @@
           ? ` · access ${soon ? '<strong>expires</strong>' : 'expires'} ${prettyDay(expires.toISOString().slice(0, 10))}`
           : '') +
         '</p>' +
+        // Reconnect renews the sign-in in place (an expired or revoked one, or
+        // after the app keys changed) and keeps the record of what was pushed —
+        // unlike Disconnect, which is for leaving QuickBooks altogether.
+        '<button class="btn ghost sm" id="qbConnect">Reconnect</button> ' +
         '<button class="btn ghost sm" id="qbDisconnect">Disconnect</button>';
     }
 
@@ -116,6 +136,10 @@
     const c = $('qbConnect');
     if (c)
       c.addEventListener('click', () => {
+        // Busy from the press until the browser has left, so a second click
+        // can't start a second sign-in; a spinner if the hand-off is slow. If
+        // the page is somehow still here a while later, the button comes back.
+        Snappy.busy(c, () => new Promise((resolve) => setTimeout(resolve, 10000)));
         // A full page navigation, not a fetch: Intuit's consent screen has to be
         // shown to the person clicking, and it sends the browser back here.
         window.location.href = '/api/admin/quickbooks/connect';
@@ -125,14 +149,14 @@
       d.addEventListener('click', async () => {
         if (
           !confirm(
-            'Disconnect QuickBooks?\n\nHours already pushed stay in QuickBooks, but this app ' +
-              'will forget which entries it created — reconnecting and syncing the same period ' +
-              'again would add a second copy of those hours.'
+            'Disconnect QuickBooks?\n\nHours and invoices already pushed stay in QuickBooks. ' +
+              'If the sign-in has expired, use Reconnect instead.'
           )
         )
           return;
         try {
-          status = await api('/api/admin/quickbooks/disconnect', { method: 'POST' });
+          // Waits for QuickBooks to let go: busy at once, spinner if slow.
+          status = await Snappy.busy(d, () => api('/api/admin/quickbooks/disconnect', { method: 'POST' }));
           qboEmployees = null;
           renderConnection();
           renderSettings();
@@ -191,19 +215,24 @@
     $('qbClearSecret').style.display = c.has_secret && src.client_secret === 'settings' ? '' : 'none';
   }
 
+  // The saves below say nothing the moment they start: the button goes busy
+  // at once (no second press), and shows a spinner only if the wait is
+  // noticeable.
   async function saveCredentials() {
-    say('qbCredsMsg', 'Saving…');
+    say('qbCredsMsg', '');
     try {
       const wasConnected = status && status.connected;
-      status = await api('/api/admin/quickbooks/credentials', {
-        method: 'PATCH',
-        body: JSON.stringify({
-          client_id: $('qbClientId').value,
-          client_secret: $('qbClientSecret').value || undefined,
-          redirect_uri: $('qbRedirectUri').value,
-          production: $('qbEnvironment').value === 'production',
-        }),
-      });
+      status = await Snappy.busy($('qbSaveCreds'), () =>
+        api('/api/admin/quickbooks/credentials', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            client_id: $('qbClientId').value,
+            client_secret: $('qbClientSecret').value || undefined,
+            redirect_uri: $('qbRedirectUri').value,
+            production: $('qbEnvironment').value === 'production',
+          }),
+        })
+      );
       renderCredentials();
       renderConnection();
       say(
@@ -233,20 +262,22 @@
   }
 
   async function saveSettings() {
-    say('qbSettingsMsg', 'Saving…');
+    say('qbSettingsMsg', '');
     try {
-      status = await api('/api/admin/quickbooks/settings', {
-        method: 'PATCH',
-        body: JSON.stringify({
-          period_anchor: $('qbAnchor').value,
-          period_days: $('qbLength').value,
-          ot_weekly: $('qbOtWeekly').value || 0,
-          ot_daily: $('qbOtDaily').value || 0,
-          regular_item_id: $('qbRegItem').value,
-          overtime_item_id: $('qbOtItem').value,
-          auto_sync: $('qbAuto').checked,
-        }),
-      });
+      status = await Snappy.busy($('qbSaveSettings'), () =>
+        api('/api/admin/quickbooks/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            period_anchor: $('qbAnchor').value,
+            period_days: $('qbLength').value,
+            ot_weekly: $('qbOtWeekly').value || 0,
+            ot_daily: $('qbOtDaily').value || 0,
+            regular_item_id: $('qbRegItem').value,
+            overtime_item_id: $('qbOtItem').value,
+            auto_sync: $('qbAuto').checked,
+          }),
+        })
+      );
       renderSettings();
       renderConnection();
       say('qbSettingsMsg', 'Saved.', 'ok');
@@ -266,7 +297,8 @@
   async function loadInvoiceOptions({ force } = {}) {
     if (!status || !status.connected) return;
     if (!force && qboItems && qboTaxCodes) return renderInvoiceSettings();
-    say('qbInvoiceMsg', 'Loading from QuickBooks…');
+    // Intuit can be slow; the line saying so appears only if it is (.wait).
+    say('qbInvoiceMsg', 'Loading from QuickBooks…', 'wait');
     try {
       const [i, t] = await Promise.all([
         api('/api/admin/quickbooks/items'),
@@ -293,15 +325,17 @@
   }
 
   async function saveInvoiceSettings() {
-    say('qbInvoiceMsg', 'Saving…');
+    say('qbInvoiceMsg', '');
     try {
-      status = await api('/api/admin/quickbooks/settings', {
-        method: 'PATCH',
-        body: JSON.stringify({
-          invoice_item_id: $('qbInvItem').value,
-          invoice_tax_code_id: $('qbInvTax').value,
-        }),
-      });
+      status = await Snappy.busy($('qbSaveInvoice'), () =>
+        api('/api/admin/quickbooks/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            invoice_item_id: $('qbInvItem').value,
+            invoice_tax_code_id: $('qbInvTax').value,
+          }),
+        })
+      );
       renderInvoiceSettings();
       say('qbInvoiceMsg', 'Saved. Invoices can now be sent from the Invoices tab.', 'ok');
     } catch (e) {
@@ -352,13 +386,20 @@
 
   // `quiet` skips the follow-up refresh so a bulk match doesn't fire a status
   // and preview request per person; the caller refreshes once at the end.
-  async function setMapping(employeeId, qboId, { quiet } = {}) {
-    if (!quiet) say('qbMapMsg', 'Saving…');
+  // `el`, the dropdown that was changed, is held still until the server has
+  // the match: who is matched to whom decides whose pay the hours go to, so
+  // it is never shown as saved before it is.
+  async function setMapping(employeeId, qboId, { quiet, el } = {}) {
+    // A select can't show a spinner, so the line says it — only once the wait
+    // is long enough to notice (.wait).
+    if (!quiet) say('qbMapMsg', 'Saving…', 'wait');
     try {
-      await api('/api/admin/quickbooks/mapping', {
-        method: 'PATCH',
-        body: JSON.stringify({ employee_id: employeeId, qbo_employee_id: qboId }),
-      });
+      await Snappy.busy(el, () =>
+        api('/api/admin/quickbooks/mapping', {
+          method: 'PATCH',
+          body: JSON.stringify({ employee_id: employeeId, qbo_employee_id: qboId }),
+        })
+      );
       const emp = ourEmployees.find((e) => e.id === employeeId);
       if (emp) emp.qbo_employee_id = qboId || '';
       if (!quiet) {
@@ -376,7 +417,8 @@
   // Matching changes who the period can be pushed for, so both the "before you
   // can push" list and the preview need to catch up.
   async function refreshAfterMapping() {
-    status = await api('/api/admin/quickbooks/status');
+    status = await api(STATUS);
+    Snappy.cache.put(STATUS, status);
     renderConnection();
     await loadPeriod(period ? { start: period.start } : undefined);
   }
@@ -426,11 +468,18 @@
     }
     say('qbSyncMsg', '');
     const query = opts && opts.start ? '?start=' + encodeURIComponent(opts.start) : '';
+    // Earlier, Earlier, Later in quick succession: only the last period asked
+    // for is painted, whatever order the answers come back in. Always asked
+    // afresh, never from a kept copy — these are the numbers a push confirms.
+    const n = ++periodAsked;
     try {
-      preview = await api('/api/admin/quickbooks/preview' + query);
+      const p = await api('/api/admin/quickbooks/preview' + query);
+      if (n !== periodAsked) return;
+      preview = p;
       period = preview.period;
       renderPreview();
     } catch (e) {
+      if (n !== periodAsked) return;
       $('qbRange').textContent = '';
       say('qbSyncMsg', e.detail ? `${e.message} ${e.detail}` : e.message, 'err');
     }
@@ -493,66 +542,90 @@
       )
     )
       return;
-    const btn = $('qbSync');
-    btn.disabled = true;
-    say('qbSyncMsg', 'Pushing…');
+    const start = period.start;
+    // Hours into the company's books: nothing is shown as pushed before
+    // QuickBooks says so. Busy from the press, so there's no second push; the
+    // spinner and the line below appear only once the wait is noticeable.
+    say('qbSyncMsg', 'Pushing…', 'wait');
     try {
-      const r = await api('/api/admin/quickbooks/sync', {
-        method: 'POST',
-        body: JSON.stringify({ start: period.start }),
+      await Snappy.busy($('qbSync'), async () => {
+        const r = await api('/api/admin/quickbooks/sync', {
+          method: 'POST',
+          body: JSON.stringify({ start }),
+        });
+        const bits = [];
+        if (r.created) bits.push(`${r.created} added`);
+        if (r.updated) bits.push(`${r.updated} updated`);
+        if (r.deleted) bits.push(`${r.deleted} removed`);
+        if (r.unchanged) bits.push(`${r.unchanged} unchanged`);
+        if (r.adopted) bits.push(`${r.adopted} found already in QuickBooks`);
+        if (r.kept) bits.push(`${r.kept} left as they were`);
+        if (r.failed) bits.push(`${r.failed} failed`);
+        const summary = bits.length ? bits.join(', ') + '.' : 'Nothing to do.';
+        // The period and the history first, then the outcome: reloading the
+        // period clears this line, and the outcome is the part to read.
+        await loadPeriod({ start });
+        await loadRuns({ fresh: true });
+        say(
+          'qbSyncMsg',
+          r.ok
+            ? `${summary} Open QuickBooks and run payroll when you're ready.`
+            : `${summary} ${(r.errors || []).map((e) => e.message).join(' ')}`,
+          r.ok ? 'ok' : 'err'
+        );
       });
-      const bits = [];
-      if (r.created) bits.push(`${r.created} added`);
-      if (r.updated) bits.push(`${r.updated} updated`);
-      if (r.deleted) bits.push(`${r.deleted} removed`);
-      if (r.unchanged) bits.push(`${r.unchanged} unchanged`);
-      if (r.failed) bits.push(`${r.failed} failed`);
-      const summary = bits.length ? bits.join(', ') + '.' : 'Nothing to do.';
-      say(
-        'qbSyncMsg',
-        r.ok
-          ? `${summary} Open QuickBooks and run payroll when you're ready.`
-          : `${summary} ${(r.errors || []).map((e) => e.message).join(' ')}`,
-        r.ok ? 'ok' : 'err'
-      );
-      await loadPeriod({ start: period.start });
-      await loadRuns();
     } catch (e) {
       say('qbSyncMsg', e.detail ? `${e.message} ${e.detail}` : e.message, 'err');
-    } finally {
-      btn.disabled = false;
     }
   }
 
   // ---- history ----
-  async function loadRuns() {
+  // The copy kept from earlier in this visit at once, then the server's answer
+  // if it differs. `fresh` skips the kept copy, for straight after a push.
+  async function loadRuns({ fresh } = {}) {
     if (!status || !status.connected) return;
     try {
-      const d = await api('/api/admin/quickbooks/runs');
-      const runs = d.runs || [];
-      $('qbRunsEmpty').style.display = runs.length ? 'none' : 'block';
-      $('qbRunsBody').innerHTML = runs
-        .map((r) => {
-          const bits = [];
-          if (r.created) bits.push(`${r.created} added`);
-          if (r.updated) bits.push(`${r.updated} updated`);
-          if (r.deleted) bits.push(`${r.deleted} removed`);
-          if (r.unchanged) bits.push(`${r.unchanged} unchanged`);
-          if (r.failed) bits.push(`${r.failed} failed`);
-          const badge = r.ok
-            ? '<span class="badge on">ok</span>'
-            : '<span class="badge status-declined">problem</span>';
-          return `<tr>
-            <td>${prettyDay(r.start)} – ${prettyDay(r.end)}</td>
-            <td class="qb-dim">${prettyWhen(r.finished_at || r.started_at)}</td>
-            <td class="qb-dim">${esc(r.trigger === 'cron' ? 'scheduled' : r.actor || 'admin')}</td>
-            <td>${badge} <span class="qb-dim">${esc(bits.join(', ') || 'nothing to do')}</span></td>
-          </tr>`;
-        })
-        .join('');
+      if (fresh) {
+        const d = await api(RUNS);
+        Snappy.cache.put(RUNS, d);
+        renderRuns(d.runs || []);
+      } else {
+        await Snappy.swr(api, RUNS, (d) => renderRuns(d.runs || []));
+      }
     } catch (e) {
       /* history is nice to have; a failure here shouldn't block the page */
     }
+  }
+
+  function renderRuns(runs) {
+    $('qbRunsEmpty').style.display = runs.length ? 'none' : 'block';
+    $('qbRunsBody').innerHTML = runs
+      .map((r) => {
+        const bits = [];
+        if (r.created) bits.push(`${r.created} added`);
+        if (r.updated) bits.push(`${r.updated} updated`);
+        if (r.deleted) bits.push(`${r.deleted} removed`);
+        if (r.unchanged) bits.push(`${r.unchanged} unchanged`);
+        if (r.adopted) bits.push(`${r.adopted} found already there`);
+        if (r.kept) bits.push(`${r.kept} left as they were`);
+        if (r.failed) bits.push(`${r.failed} failed`);
+        // A run that never got going (the sign-in expired, say) says why; one
+        // that stopped part-way says so.
+        if (r.error) bits.push(r.error);
+        if (r.incomplete) bits.push('stopped part-way — sync again to finish');
+        const badge = r.ok
+          ? '<span class="badge on">ok</span>'
+          : r.incomplete
+            ? '<span class="badge status-pending">unfinished</span>'
+            : '<span class="badge status-declined">problem</span>';
+        return `<tr>
+          <td>${prettyDay(r.start)} – ${prettyDay(r.end)}</td>
+          <td class="qb-dim">${prettyWhen(r.finished_at || r.started_at)}</td>
+          <td class="qb-dim">${esc(r.trigger === 'cron' ? 'scheduled' : r.actor || 'admin')}</td>
+          <td>${badge} <span class="qb-dim">${esc(bits.join(', ') || 'nothing to do')}</span></td>
+        </tr>`;
+      })
+      .join('');
   }
 
   // ---- wiring ----
@@ -562,7 +635,10 @@
 
     $('qbSaveSettings').addEventListener('click', saveSettings);
     $('qbSaveInvoice').addEventListener('click', saveInvoiceSettings);
-    $('qbInvRefresh').addEventListener('click', () => loadInvoiceOptions({ force: true }));
+    // Asks Intuit, which can be slow: busy at once, so it isn't asked twice.
+    $('qbInvRefresh').addEventListener('click', () =>
+      Snappy.busy($('qbInvRefresh'), () => loadInvoiceOptions({ force: true }))
+    );
     $('qbSaveCreds').addEventListener('click', saveCredentials);
     $('qbUseSuggested').addEventListener('click', () => {
       const c = (status && status.credentials) || {};
@@ -576,10 +652,12 @@
       )
         return;
       try {
-        status = await api('/api/admin/quickbooks/credentials', {
-          method: 'PATCH',
-          body: JSON.stringify({ clear_client_secret: true }),
-        });
+        status = await Snappy.busy($('qbClearSecret'), () =>
+          api('/api/admin/quickbooks/credentials', {
+            method: 'PATCH',
+            body: JSON.stringify({ clear_client_secret: true }),
+          })
+        );
         renderCredentials();
         renderConnection();
         say('qbCredsMsg', 'Secret forgotten.', 'ok');
@@ -587,13 +665,23 @@
         say('qbCredsMsg', e.message, 'err');
       }
     });
-    $('qbMapRefresh').addEventListener('click', () => loadMapping({ force: true }));
-    $('qbMapAuto').addEventListener('click', () => autoMatch().catch((e) => say('qbMapMsg', e.message, 'err')));
+    // Both ask Intuit and can take a while: busy at once, so neither runs twice.
+    $('qbMapRefresh').addEventListener('click', () =>
+      Snappy.busy($('qbMapRefresh'), () => loadMapping({ force: true }))
+    );
+    $('qbMapAuto').addEventListener('click', () =>
+      Snappy.busy($('qbMapAuto'), autoMatch).catch((e) => say('qbMapMsg', e.message, 'err'))
+    );
     $('qbMapBody').addEventListener('change', (ev) => {
       const sel = ev.target.closest('select[data-emp]');
-      if (sel) setMapping(Number(sel.dataset.emp), sel.value);
+      if (sel) setMapping(Number(sel.dataset.emp), sel.value, { el: sel });
     });
 
+    // Moving between pay periods only shows one, so a mouse does it on the
+    // way down (data-press, snappy.js). The buttons live in admin.html.
+    ['qbPrev', 'qbNext', 'qbReload'].forEach((id) => {
+      $(id).dataset.press = 'fast';
+    });
     const len = () => (status && status.settings && status.settings.period_days) || 14;
     $('qbPrev').addEventListener('click', () => period && loadPeriod({ start: addDays(period.start, -len()) }));
     $('qbNext').addEventListener('click', () => period && loadPeriod({ start: addDays(period.start, len()) }));
@@ -604,26 +692,44 @@
     $('qbSync').addEventListener('click', () => sync());
   }
 
+  // The connection paints at once from the status kept earlier in this visit,
+  // then from the server's answer if that differs; the rest of the tab
+  // follows the server's answer.
   async function load() {
     wire();
+    let filled = false;
     try {
-      status = await api('/api/admin/quickbooks/status');
+      await Snappy.swr(api, STATUS, (s) => {
+        status = s;
+        renderConnection();
+        // Once the forms have been filled, a refresh doesn't refill one
+        // someone is typing in: their entry is newer than the server's.
+        if (!(filled && typing($('tab-quickbooks')))) {
+          renderCredentials();
+          renderSettings();
+        }
+        filled = true;
+      });
     } catch (e) {
       say('qbConnMsg', e.message, 'err');
       return;
     }
-    renderConnection();
-    renderCredentials();
-    renderSettings();
     if (banner) {
       say('qbConnMsg', banner.text, banner.kind);
       banner = null;
     }
     if (status.connected) {
-      await loadMapping();
-      await loadInvoiceOptions();
-      await loadPeriod();
-      await loadRuns();
+      // The pay period and the history are read here; matching and the
+      // invoice pickers ask Intuit, which can be slow. Neither waits for the
+      // other — but the Intuit reads still go one after another, as before.
+      await Promise.all([
+        (async () => {
+          await loadMapping();
+          await loadInvoiceOptions();
+        })(),
+        loadPeriod(),
+        loadRuns(),
+      ]);
     }
   }
 
@@ -643,5 +749,24 @@
     if (tab && tab.style.display !== 'none') tab.click();
   }
 
-  window.QuickBooks = { load, afterLogin };
+  // Signed in, and allowed this tab: before sign-in the answer would only be
+  // "please sign in", and a feature switched off isn't worth asking about.
+  function canOpen() {
+    const app = $('app');
+    const tab = document.querySelector('.side-nav .tab[data-tab="quickbooks"]');
+    return !!app && app.style.display !== 'none' && !!tab && tab.style.display !== 'none';
+  }
+
+  // Warms the connection status for someone on their way to the tab (the
+  // shell calls this on tab hover, focus or touch, and when idle). Only the
+  // status: it is answered from this server's own records. Nothing that asks
+  // Intuit — items, tax codes, QuickBooks' employees, the connect hand-off —
+  // is ever fetched ahead of time, and neither is the pay-period preview,
+  // which is always read fresh before a push.
+  function prefetch() {
+    if (!canOpen()) return;
+    Snappy.prefetch(api, STATUS);
+  }
+
+  window.QuickBooks = { load, afterLogin, prefetch };
 })();

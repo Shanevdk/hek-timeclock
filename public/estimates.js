@@ -19,7 +19,28 @@
   let requests = [];
   let expanded = null; // id of the request currently opened
   let wired = false;
-  let saveTimer = null;
+  let saveTimer = null; // a text change waiting to be saved
+  let unread = 0; // new requests, as the sidebar badge counts them
+
+  // Read under these exact paths everywhere, so kept copies line up. Kept in
+  // memory only, never on the device: requests carry customers' names, phone
+  // numbers and addresses.
+  const REQUESTS = '/api/admin/estimate/requests';
+  const SETTINGS = '/api/admin/estimate/settings';
+  const BOOK = '/api/admin/ratebook';
+  // Answers about the list can land out of order — a slow read that set off
+  // before a change can arrive after it. Each read is numbered as it starts;
+  // one older than what the screen already shows (a newer read, or a change
+  // made here) is dropped rather than painted over it.
+  let asked = 0;
+  let shown = 0;
+
+  // Whether someone is typing in a field inside `box` right now. A refresh
+  // landing mid-sentence must not put the server's older words back.
+  const typing = (box) => {
+    const a = document.activeElement;
+    return !!box && !!a && box.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+  };
 
   const money = (n) =>
     '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -33,7 +54,9 @@
     sec.innerHTML = `
       <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
         <h2 style="margin:0">Estimate requests</h2>
-        <button class="btn ghost sm" id="esSettingsToggle">Page settings</button>
+        <!-- Only shows or hides the panel, so a mouse does it on the way down
+             (data-press, snappy.js). -->
+        <button class="btn ghost sm" id="esSettingsToggle" data-press="fast">Page settings</button>
       </div>
 
       <div class="card" id="esSettings" style="display:none;margin-bottom:16px">
@@ -101,15 +124,18 @@
       <p class="status-sub" id="esEmpty" style="display:none">No estimate requests yet.</p>
     `;
 
+    // Busy at once, so a second press can't send it twice; a spinner only if
+    // the server takes a moment.
     $('esSaveGoogle').addEventListener('click', async () => {
       const key = $('esGoogleKey').value.trim();
       if (!key) return;
-      await saveSettings({ google_api_key: key });
-      $('esGoogleKey').value = '';
+      // Cleared only once it's saved: a refused key stays in the box to fix.
+      if (await Snappy.busy($('esSaveGoogle'), () => saveSettings({ google_api_key: key })))
+        $('esGoogleKey').value = '';
     });
     $('esClearGoogle').addEventListener('click', async () => {
       if (!confirm('Forget the Google Maps key? The road-level photo will stop appearing.')) return;
-      await saveSettings({ clear_google_api_key: true });
+      await Snappy.busy($('esClearGoogle'), () => saveSettings({ clear_google_api_key: true }));
     });
 
     $('esSettingsToggle').addEventListener('click', () => {
@@ -119,11 +145,30 @@
       $('esSettingsToggle').textContent = open ? 'Page settings' : 'Hide settings';
     });
 
-    $('esEnabled').addEventListener('change', () => saveSettings({ enabled: $('esEnabled').checked }));
+    // Live or off shows at once, link and all; if the server refuses, the
+    // switch goes back and the reason shows under the panel.
+    $('esEnabled').addEventListener('change', () => {
+      const on = $('esEnabled').checked;
+      const setLive = (v) => {
+        $('esEnabled').checked = v;
+        if (settings) settings.enabled = v;
+        renderUrl();
+      };
+      Snappy.optimistic(
+        () => {
+          setLive(on);
+          return () => setLive(!on);
+        },
+        () =>
+          saveSettings({ enabled: on }).then((ok) => {
+            if (!ok) throw new Error('not saved');
+          })
+      ).catch(() => {}); // saveSettings has already said why
+    });
     ['esHeadline', 'esIntro', 'esFootnote', 'esDisclaimer', 'esMinCharge'].forEach((id) => {
       $(id).addEventListener('input', queueSaveText);
     });
-    $('esAddService').addEventListener('click', addService);
+    $('esAddService').addEventListener('click', () => Snappy.busy($('esAddService'), addService));
 
     // Service rows: tick to publish, edit name/price inline, remove.
     $('esServices').addEventListener('change', (e) => {
@@ -156,6 +201,7 @@
   function queueSaveText() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
+      saveTimer = null;
       saveSettings({
         headline: $('esHeadline').value,
         intro: $('esIntro').value,
@@ -166,18 +212,22 @@
     }, 600);
   }
 
+  // Resolves true once saved. A refusal is said under the panel, and
+  // resolves false, so the caller can put back what it showed early.
   async function saveSettings(patch) {
     $('esSettingsMsg').textContent = '';
     try {
-      const d = await api('/api/admin/estimate/settings', {
+      const d = await api(SETTINGS, {
         method: 'PATCH',
         body: JSON.stringify(patch),
       });
       settings = d.settings;
       renderUrl();
       renderGoogle();
+      return true;
     } catch (e) {
       $('esSettingsMsg').textContent = e.message;
+      return false;
     }
   }
 
@@ -223,6 +273,7 @@
       unitSel.innerHTML = (book.units || []).map((u) => `<option>${esc(u)}</option>`).join('');
   }
 
+  // Resolves true once the rate book has taken the change.
   async function editService(action, body) {
     $('esSettingsMsg').textContent = '';
     try {
@@ -230,10 +281,15 @@
         method: 'POST',
         body: JSON.stringify({ action, ...body }),
       });
+      // The answer is the whole book: kept, so Pricing and the invoice
+      // quick-adds open on it rather than on the book from before.
+      Snappy.cache.put(BOOK, book);
       renderServices();
+      return true;
     } catch (e) {
       $('esSettingsMsg').textContent = e.message;
-      await loadBook(); // put the row back the way the server has it
+      await loadBook().catch(() => {}); // put the row back the way the server has it
+      return false;
     }
   }
 
@@ -243,28 +299,35 @@
       $('esSettingsMsg').textContent = 'Give the service a name.';
       return;
     }
-    await editService('add', {
+    const added = await editService('add', {
       label,
       unit: $('esNewUnit').value,
       price: $('esNewPrice').value || 0,
       public: true,
     });
+    // Cleared only once it's in: a refused one stays in the boxes to fix.
+    if (!added) return;
     $('esNewLabel').value = '';
     $('esNewPrice').value = '';
   }
 
+  // The rate book as the server has it now — asked for afresh, since a kept
+  // copy (or a read that set off before the change) would be older.
   async function loadBook() {
-    book = await api('/api/admin/ratebook');
+    book = await api(BOOK);
+    Snappy.cache.put(BOOK, book);
     renderServices();
   }
 
   // A link to where the fence was traced. Google Maps in satellite view at the
   // first corner — enough to recognise the property before driving out.
   function mapLink(m) {
-    const first = (m.runs && m.runs[0] && m.runs[0][0]) || null;
+    const first = m.start || (m.runs && m.runs[0] && m.runs[0][0]) || null;
     if (!first) return '#';
     return `https://www.google.com/maps/@?api=1&map_action=map&center=${first[0]},${first[1]}&zoom=20&basemap=satellite`;
   }
+
+  const runCount = (m) => m.run_count || (m.runs ? m.runs.length : 0);
 
   // ---- requests ----
   function statusBadge(r) {
@@ -273,32 +336,141 @@
     return '<span class="badge status-pending">new</span>';
   }
 
-  function renderRequests() {
-    const nNew = requests.filter((r) => r.status === 'new').length;
-    const value = requests.filter((r) => r.status === 'new').reduce((t, r) => t + (r.total || 0), 0);
+  function renderStats() {
+    const waiting = requests.filter((r) => r.status === 'new');
+    const value = waiting.reduce((t, r) => t + (r.total || 0), 0);
     $('esStats').innerHTML = `
-      <div class="stat"><div class="n">${nNew}</div><div class="l">Waiting on you</div></div>
+      <div class="stat"><div class="n">${waiting.length}</div><div class="l">Waiting on you</div></div>
       <div class="stat"><div class="n">${money(value)}</div><div class="l">Estimated value</div></div>
       <div class="stat"><div class="n">${requests.length}</div><div class="l">Requests all time</div></div>`;
-
     $('esEmpty').style.display = requests.length ? 'none' : 'block';
-    $('esList').innerHTML = requests
-      .map((r) => {
-        const c = r.customer || {};
-        const contact = [c.phone, c.email].filter(Boolean).join(' · ');
-        const open = expanded === r.id;
-        return `<div class="card es-req${r.status === 'new' ? ' is-new' : ''}" data-id="${r.id}">
-          <div class="es-req-head" data-toggle="${r.id}">
-            <div>
-              <div class="es-req-who">${esc(c.name || 'Someone')} ${statusBadge(r)}</div>
-              <div class="es-req-meta">${esc(contact || 'no contact details')} · ${fmtWhen(r.created_at)}</div>
-            </div>
-            <div class="es-req-total">${money(r.total)}</div>
-          </div>
-          ${open ? detail(r) : ''}
-        </div>`;
+  }
+
+  // One request's card. Its head opens and closes the details, which only
+  // shows what is already here, so a mouse does it on the way down
+  // (data-press, snappy.js).
+  function requestCard(r) {
+    const c = r.customer || {};
+    const contact = [c.phone, c.email].filter(Boolean).join(' · ');
+    const open = expanded === r.id;
+    return `<div class="card es-req${r.status === 'new' ? ' is-new' : ''}" data-id="${r.id}">
+      <div class="es-req-head" data-toggle="${r.id}" data-press="fast">
+        <div>
+          <div class="es-req-who">${esc(c.name || 'Someone')} ${statusBadge(r)}</div>
+          <div class="es-req-meta">${esc(contact || 'no contact details')} · ${fmtWhen(r.created_at)}</div>
+        </div>
+        <div class="es-req-total">${money(r.total)}</div>
+      </div>
+      ${open ? detail(r) : ''}
+    </div>`;
+  }
+
+  // `keep`: the same list, refreshed — draw at least as many cards as are
+  // already there, so the page doesn't shrink under someone scrolled down it.
+  function renderRequests(keep) {
+    renderStats();
+    const box = $('esList');
+    const drawn = keep ? box.querySelectorAll('.es-req').length : 0;
+    // A screenful now and the rest as it is scrolled toward.
+    Snappy.chunks(box, requests.map(requestCard), { first: Math.max(60, drawn) });
+  }
+
+  const cardEl = (id) => $('esList').querySelector(`.es-req[data-id="${id}"]`);
+
+  // Redraws one card where it stands; the rest of the list, and how far down
+  // it has been drawn, stay as they are.
+  function redraw(id) {
+    const el = cardEl(id);
+    const r = requests.find((x) => x.id === id);
+    if (el && r) el.outerHTML = requestCard(r);
+  }
+
+  // Opens or closes a card's details in place. Its head stays the same
+  // element, under the pointer that pressed it. Opening drops the details
+  // out from under the head (styles.css, .is-opening); closing is instant.
+  function setOpen(id, on) {
+    const el = cardEl(id);
+    if (!el) return;
+    const body = el.querySelector('.es-req-body');
+    if (body) body.remove();
+    const r = on && requests.find((x) => x.id === id);
+    if (!r) return;
+    el.insertAdjacentHTML('beforeend', detail(r));
+    el.lastElementChild.classList.add('is-opening');
+  }
+
+  const isNew = (r) => (r && r.status === 'new' ? 1 : 0);
+
+  // Changes one request on screen and in the kept copy, badge and totals
+  // included. Returns what changes it back.
+  function change(id, fields) {
+    const before = requests.find((r) => r.id === id);
+    if (!before) return () => {};
+    const after = { ...before, ...fields };
+    const swap = (from, to) => {
+      requests = requests.map((r) => (r.id === id ? to : r));
+      unread = Math.max(0, unread + isNew(to) - isNew(from));
+      shown = ++asked; // newer than any read of the list already on its way
+      const count = unread;
+      Snappy.cache.update(REQUESTS, (d) => ({
+        ...d,
+        requests: (d.requests || []).map((r) => (r.id === id ? to : r)),
+        unread: count,
+      }));
+      setCount(unread);
+      renderStats();
+      redraw(id);
+    };
+    swap(before, after);
+    return () => swap(after, before);
+  }
+
+  // Takes a request off the list, on screen and in the kept copy. Returns
+  // what puts it back.
+  function remove(id) {
+    const was = { requests, unread, expanded };
+    const gone = requests.find((r) => r.id === id);
+    requests = requests.filter((r) => r.id !== id);
+    unread = Math.max(0, unread - isNew(gone));
+    if (expanded === id) expanded = null;
+    shown = ++asked;
+    const count = unread;
+    Snappy.cache.update(REQUESTS, (d) => ({
+      ...d,
+      requests: (d.requests || []).filter((r) => r.id !== id),
+      unread: count,
+    }));
+    const el = cardEl(id);
+    if (el) el.remove();
+    setCount(unread);
+    renderStats();
+    return () => {
+      requests = was.requests;
+      unread = was.unread;
+      expanded = was.expanded;
+      shown = ++asked;
+      Snappy.cache.update(REQUESTS, (d) => ({ ...d, requests: was.requests, unread: was.unread }));
+      setCount(unread);
+      renderRequests(true);
+    };
+  }
+
+  // The list as it stands after a change made here, in the background —
+  // asked for afresh, since a kept copy would be older. A failure leaves the
+  // screen as it is; the next visit asks again.
+  function refreshRequests() {
+    const n = ++asked;
+    api(REQUESTS)
+      .then((d) => {
+        if (n < shown) return;
+        shown = n;
+        Snappy.cache.put(REQUESTS, d);
+        requests = d.requests || [];
+        unread = d.unread || 0;
+        setCount(unread);
+        renderRequests(true);
       })
-      .join('');
+      .catch(() => {});
   }
 
   function detail(r) {
@@ -322,7 +494,7 @@
               ? `<div class="es-kv"><span>Measured</span><span>
                    <strong>${r.measurement.feet.toLocaleString('en-US')} ft</strong>
                    (${Math.round(r.measurement.metres).toLocaleString('en-US')} m)
-                   over ${r.measurement.runs.length} run${r.measurement.runs.length > 1 ? 's' : ''}
+                   over ${runCount(r.measurement)} run${runCount(r.measurement) > 1 ? 's' : ''}
                    <a href="${mapLink(r.measurement)}" target="_blank" rel="noopener">see it</a>
                  </span></div>`
               : ''
@@ -367,27 +539,42 @@
     try {
       if (approve) {
         const id = Number(approve.dataset.approve);
-        approve.disabled = true;
-        const d = await api(`/api/admin/estimate/requests/${id}/approve`, { method: 'POST' });
-        await load();
+        // It makes a quote, so it waits for the server: busy at once (a
+        // second press can't make a second quote), a spinner only if the
+        // wait is noticeable.
+        const d = await Snappy.busy(approve, () => api(`${REQUESTS}/${id}/approve`, { method: 'POST' }));
+        // The Quotes tab's kept list doesn't have the new quote yet.
+        Snappy.cache.drop('/api/admin/quotes');
+        change(id, { status: 'approved', quote_id: d.quote.id });
+        refreshRequests();
         alert(`Created quote ${d.quote.number}. It is in the Quotes tab as a draft.`);
         return;
       }
       if (dismiss) {
-        await api(`/api/admin/estimate/requests/${Number(dismiss.dataset.dismiss)}/dismiss`, { method: 'POST' });
-        await load();
+        const id = Number(dismiss.dataset.dismiss);
+        // A status change: shown at once, put back if the server refuses.
+        await Snappy.optimistic(
+          () => change(id, { status: 'dismissed' }),
+          () => api(`${REQUESTS}/${id}/dismiss`, { method: 'POST' })
+        );
         return;
       }
       if (del) {
         if (!confirm('Delete this request? This cannot be undone.')) return;
-        await api(`/api/admin/estimate/requests/${Number(del.dataset.delete)}`, { method: 'DELETE' });
-        await load();
+        const id = Number(del.dataset.delete);
+        // Gone at once; back where it was if the server refuses.
+        await Snappy.optimistic(
+          () => remove(id),
+          () => api(`${REQUESTS}/${id}`, { method: 'DELETE' })
+        );
         return;
       }
       if (head) {
         const id = Number(head.dataset.toggle);
-        expanded = expanded === id ? null : id;
-        renderRequests();
+        const was = expanded;
+        expanded = was === id ? null : id;
+        if (was != null) setOpen(was, false);
+        if (expanded != null) setOpen(expanded, true);
       }
     } catch (err) {
       alert(err.message);
@@ -395,25 +582,62 @@
   }
 
   // ---- load ----
-  async function load() {
+  // The settings, the rate book and the requests are asked for together.
+  // Each paints the copy kept from earlier in this visit at once, then the
+  // server's answer if it differs.
+  function load() {
     build();
-    const [s, d] = await Promise.all([
-      api('/api/admin/estimate/settings'),
-      api('/api/admin/estimate/requests'),
+    const n = ++asked;
+    let painted = false;
+    const reading = Snappy.swr(api, REQUESTS, (d, fresh) => {
+      painted = true;
+      if (n < shown) return;
+      shown = n;
+      requests = d.requests || [];
+      unread = d.unread || 0;
+      renderRequests(fresh);
+      setCount(unread);
+    });
+    // Nothing kept and nothing drawn yet: say it's loading — but only once
+    // the wait is long enough to notice (styles.css, .wait).
+    if (!painted && !$('esList').children.length)
+      $('esList').innerHTML = '<p class="status-sub wait">Loading requests…</p>';
+    // Whether this visit has filled the panel yet: until it has, there is
+    // nothing of someone's to protect from a refresh.
+    let filled = false;
+    let listed = false;
+    return Promise.all([
+      Snappy.swr(api, SETTINGS, (s) => {
+        fillSettings(s.settings, filled);
+        filled = true;
+      }),
+      Snappy.swr(api, BOOK, (b) => {
+        book = b;
+        // Not while a service is being edited: a refresh mustn't swap its row
+        // out from under the cursor.
+        if (!(listed && typing($('esServices')))) renderServices();
+        listed = true;
+      }),
+      reading,
     ]);
-    settings = s.settings;
-    $('esEnabled').checked = !!settings.enabled;
-    $('esHeadline').value = settings.headline || '';
-    $('esIntro').value = settings.intro || '';
-    $('esFootnote').value = settings.footnote || '';
-    $('esDisclaimer').value = settings.disclaimer || '';
-    $('esMinCharge').value = settings.min_charge || 0;
+  }
+
+  // `again`: the panel was already filled on this visit.
+  function fillSettings(s, again) {
+    settings = s;
+    // A refresh landing while someone types in the panel, or with their
+    // change still waiting to be saved, leaves their words alone: those are
+    // newer than the server's copy.
+    if (!(saveTimer || (again && typing($('esSettings'))))) {
+      $('esEnabled').checked = !!settings.enabled;
+      $('esHeadline').value = settings.headline || '';
+      $('esIntro').value = settings.intro || '';
+      $('esFootnote').value = settings.footnote || '';
+      $('esDisclaimer').value = settings.disclaimer || '';
+      $('esMinCharge').value = settings.min_charge || 0;
+    }
     renderUrl();
     renderGoogle();
-    await loadBook();
-    requests = d.requests || [];
-    renderRequests();
-    setCount(d.unread || 0);
   }
 
   function setCount(n) {
@@ -423,15 +647,33 @@
     badge.style.display = n ? 'inline-block' : 'none';
   }
 
-  // Badge on the sidebar without opening the tab.
+  // Badge on the sidebar without opening the tab — its own light call, not
+  // the whole queue.
   async function refreshCount() {
     try {
-      const d = await api('/api/admin/estimate/requests');
-      setCount(d.unread || 0);
+      const d = await api('/api/admin/estimate/requests/count');
+      unread = d.unread || 0;
+      setCount(unread);
     } catch (e) {
       /* the badge is a nicety; a failure here shouldn't surface */
     }
   }
 
-  window.Estimates = { load, refreshCount };
+  // Signed in, and allowed this tab: before sign-in the answer would only be
+  // "please sign in", and a feature switched off isn't worth asking about.
+  function canOpen() {
+    const app = $('app');
+    const tab = document.querySelector('.side-nav .tab[data-tab="estimate"]');
+    return !!app && app.style.display !== 'none' && !!tab && tab.style.display !== 'none';
+  }
+
+  // Warms what the tab opens on, for someone on their way to it — the shell
+  // calls this on tab hover, focus or touch, and when the page is idle. The
+  // same paths load() reads, kept in memory only like everything here.
+  function prefetch() {
+    if (!canOpen()) return;
+    Snappy.prefetch(api, [REQUESTS, SETTINGS, BOOK]);
+  }
+
+  window.Estimates = { load, refreshCount, prefetch };
 })();

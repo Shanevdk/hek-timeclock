@@ -8,11 +8,14 @@
 
   // ---- API helper ----
   async function api(path, opts = {}) {
+    // `background` marks a prefetch from snappy.js — a guess at what someone
+    // might open next. It means something here, not to fetch().
+    const { background, ...init } = opts;
     let res;
     try {
       res = await fetch(path, {
         headers: { 'Content-Type': 'application/json' },
-        ...opts,
+        ...init,
       });
     } catch (err) {
       // fetch() only rejects when the request never got a reply at all — the
@@ -25,6 +28,11 @@
     // A 401 on a normal request means the session expired — bounce to login.
     // The login request itself is allowed to surface its own error message.
     if (res.status === 401 && path !== '/api/admin/login') {
+      // A guess at the next tab never signs anyone out: their next real
+      // request deals with an expired login the usual way.
+      if (background) throw new Error('Please sign in.');
+      // Everything this device kept for that session goes with it.
+      Snappy.cache.clear();
       showLogin();
       throw new Error('Please sign in.');
     }
@@ -45,8 +53,20 @@
       if (data && data.detail) err.detail = data.detail;
       throw err;
     }
+    // A change went through. Forget every copy read from the same resource, so
+    // no screen paints the state from before it (snappy.js).
+    if ((init.method || 'GET').toUpperCase() !== 'GET') Snappy.cache.dropFor(path);
     if (data === null)
       throw new Error('The server returned an unexpected response. Please refresh the page and sign in again.');
+    return data;
+  }
+
+  // Read `path` again after a change, with a request of its own. Snappy.load()
+  // would join a read already on its way — one sent before the change — and
+  // paint the state the change replaced.
+  async function reread(path, persist) {
+    const data = await api(path);
+    Snappy.cache.put(path, data, persist);
     return data;
   }
 
@@ -89,34 +109,77 @@
   const localInputToIso = (v) => (v ? new Date(v).toISOString() : null);
 
   // ---- Auth ----
+  // What /api/admin/me said about who is signed in. This device keeps that
+  // answer (snappy.js), so the next visit opens straight onto the dashboard
+  // while the server confirms it; meKey() names whose kept copies these are.
+  const ME = '/api/admin/me';
+  const meKey = (d) => 'admin:' + d.role + ':' + (d.email || '');
+  let started = false; // the dashboard has been set up — once per page
+  let shownAs = null; // ...for this account
+  let signIns = 0; // sign-ins on this page, so a slower boot answer can't undo one
+  let tabLoad = null; // the opening tab's load; warming the others waits for it
+  let leaving = false; // on the way to the sign-in page
+
+  // The files that draw the other tabs (quotes.js, schedule.js…) load after
+  // this one. The dashboard can open before they're in; whatever needs one of
+  // them waits for this.
+  const ready = new Promise((resolve) => {
+    if (document.readyState === 'loading')
+      document.addEventListener('DOMContentLoaded', () => resolve(), { once: true });
+    else resolve();
+  });
+
   function showLogin() {
+    leaving = true;
     if (liveTimer) clearInterval(liveTimer);
     // Admins sign in on the main page ("/") now — send visitors without a valid
     // admin session there rather than showing a second login form here.
     window.location.replace('/');
   }
+
+  // Take an /api/admin/me answer as the account the dashboard is for.
+  function adopt(d) {
+    isDev = d.role === 'dev';
+    currentFeatures = d.features || null;
+    shownAs = meKey(d);
+  }
+
+  // Keep a confirmed answer for the next visit, and stamp this device's kept
+  // copies with its account — copies kept for anyone else are deleted here.
+  function remember(d) {
+    Snappy.cache.identify(meKey(d), d.session_expires);
+    Snappy.cache.put(ME, d, true);
+  }
+
   function showApp() {
+    // Set up once per page. Opening on the kept copy and the server's answer
+    // both arrive here; the later one only re-applies what changed (confirmMe).
+    if (started) return;
+    started = true;
     $('loginView').style.display = 'none';
     $('app').style.display = 'block';
     loadPermissions();
-    loadEmployees();
+    loadEmployees().catch(() => {});
     refreshVacationCount();
     if (isDev) applyDevRestrictions();
     else {
       applyEntitlements(currentFeatures);
       // Back to whichever tab was open before the refresh; "On the clock" only
       // when there is nothing to go back to.
-      if (!restoreTab()) showLive();
-      // Returning from QuickBooks' consent screen lands here with the outcome
-      // in the URL — let that module open its own tab on the result.
-      if (window.QuickBooks) window.QuickBooks.afterLogin();
-      // Show how many emails are waiting without making them open the tab.
-      if (window.Inbox && currentFeatures && currentFeatures.inbox !== false)
-        window.Inbox.refreshCount();
-      // Same for quote requests sent in from the public estimate page.
-      if (window.Estimates && currentFeatures && currentFeatures.estimate !== false)
-        window.Estimates.refreshCount();
+      if (!restoreTab()) tabLoad = showLive();
+      ready.then(() => {
+        // Returning from QuickBooks' consent screen lands here with the outcome
+        // in the URL — let that module open its own tab on the result.
+        if (window.QuickBooks) window.QuickBooks.afterLogin();
+        // Show how many emails are waiting without making them open the tab.
+        if (window.Inbox && currentFeatures && currentFeatures.inbox !== false)
+          window.Inbox.refreshCount();
+        // Same for quote requests sent in from the public estimate page.
+        if (window.Estimates && currentFeatures && currentFeatures.estimate !== false)
+          window.Estimates.refreshCount();
+      });
     }
+    warmNextTabs();
   }
 
   // Show/hide a sidebar tab (and drop its "active" if we're hiding it).
@@ -159,18 +222,40 @@
     syncNavGroups();
   }
 
+  // The server's answer has a feature switched on or off since the kept copy
+  // the dashboard opened on. Show or hide each tab to match, both ways, and
+  // move off a tab that has just gone away.
+  function reapplyEntitlements() {
+    if (isDev || !currentFeatures) return; // the dev sees every feature regardless
+    Object.keys(currentFeatures).forEach((key) =>
+      setTabVisible(key, currentFeatures[key] !== false)
+    );
+    const open = document.querySelector('.side-nav .tab.active');
+    if (!open || !navVisible(open)) {
+      const live = document.querySelector('.side-nav .tab[data-tab="live"]');
+      if (live) live.click();
+    }
+    ready.then(() => {
+      if (window.Inbox && currentFeatures.inbox !== false) window.Inbox.refreshCount();
+      if (window.Estimates && currentFeatures.estimate !== false) window.Estimates.refreshCount();
+    });
+  }
+
   // The "dev" account is a limited admin: hide the clock-in features it can't use,
   // and reveal the "Client access" panel where it controls the client's features.
   function applyDevRestrictions() {
     if (liveTimer) clearInterval(liveTimer);
-    ['live', 'sheets'].forEach((t) => setTabVisible(t, false));
+    // The tabs whose data the server keeps from the dev account (clock-ins,
+    // timesheets, the clock-in map, payroll, invoices, the mailbox) — no point
+    // showing a tab that can only answer "not available".
+    ['live', 'sheets', 'map', 'quickbooks', 'invoices', 'inbox'].forEach((t) => setTabVisible(t, false));
     const devTab = $('devAccessTab');
     if (devTab) devTab.style.display = '';
     const healthTab = $('devHealthTab');
     if (healthTab) healthTab.style.display = '';
     syncNavGroups();
     // The dev account's login comes from the environment — hide that editor.
-    ['acLabel', 'acEmail', 'acPass', 'acSave', 'acMsg'].forEach((id) => {
+    ['acLabel', 'acEmail', 'acPass', 'acCurrent', 'acSave', 'acMsg'].forEach((id) => {
       const el = $(id);
       if (el) el.style.display = 'none';
     });
@@ -224,22 +309,40 @@
   $('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   $('email').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
   async function doLogin() {
+    const btn = $('loginBtn');
+    if (btn.disabled) return; // Enter pressed again while the first try is on its way
     $('loginMsg').textContent = '';
     try {
-      const r = await api('/api/admin/login', {
-        method: 'POST',
-        body: JSON.stringify({ email: $('email').value, password: $('pw').value }),
-      });
-      $('pw').value = '';
-      isDev = !!(r && r.role === 'dev');
-      const me = await api('/api/admin/me').catch(() => ({}));
-      currentFeatures = me.features || null;
+      // The button answers the press at once; "Signing in…" and its spinner
+      // only appear if the server is slow to.
+      const me = await Snappy.busy(
+        btn,
+        async () => {
+          const r = await api('/api/admin/login', {
+            method: 'POST',
+            body: JSON.stringify({ email: $('email').value, password: $('pw').value }),
+          });
+          // A shared device: whatever the last person left on it goes first.
+          Snappy.cache.clear();
+          signIns++;
+          $('pw').value = '';
+          isDev = !!(r && r.role === 'dev');
+          return api(ME).catch(() => ({}));
+        },
+        { label: 'Signing in…' }
+      );
+      if (me.admin) {
+        remember(me);
+        adopt(me);
+      } else currentFeatures = me.features || null;
       showApp();
     } catch (e) {
       $('loginMsg').textContent = e.message;
     }
   }
   $('logoutBtn').addEventListener('click', async () => {
+    // Nothing kept on this device outlives the session it was kept for.
+    Snappy.cache.clear();
     await api('/api/admin/logout', { method: 'POST' }).catch(() => {});
     showLogin();
   });
@@ -299,49 +402,134 @@
   });
 
   // ---- Tabs ----
+  // The switch itself — which tab is lit, which section shows, the phone menu
+  // closing — happens first and all at once, before anything is asked of the
+  // server. Then the tab loads, painting a kept copy straight away if there
+  // is one.
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => {
-      rememberTab(t.dataset.tab);
+      const name = t.dataset.tab;
+      rememberTab(name);
       document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
       document.querySelectorAll('.section').forEach((x) => x.classList.remove('active'));
       t.classList.add('active');
-      $('tab-' + t.dataset.tab).classList.add('active');
-      if (t.dataset.tab === 'live') showLive();
-      if (t.dataset.tab === 'employees') loadEmployees();
-      if (t.dataset.tab === 'sheets') loadTimesheet().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'map') showMap();
-      if (t.dataset.tab === 'timeoff') loadVacations().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'quotes' && window.Quotes) window.Quotes.load();
-      if (t.dataset.tab === 'schedule' && window.Schedule)
-        window.Schedule.loadAdmin().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'tasks' && window.Tasks)
-        window.Tasks.loadAdmin().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'messages' && window.Messages)
-        window.Messages.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'access') loadDevFeatures().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'health' && window.DevStats)
-        window.DevStats.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'quickbooks' && window.QuickBooks)
-        window.QuickBooks.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'pricing' && window.Pricing)
-        window.Pricing.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'invoices' && window.Invoices)
-        window.Invoices.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'inbox' && window.Inbox)
-        window.Inbox.load().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'estimate' && window.Estimates)
-        window.Estimates.load().catch((e) => alert(e.message));
+      $('tab-' + name).classList.add('active');
       setMenu(false); // close the popout after choosing a tab
+      tabLoad = loadTab(name);
     });
   });
 
+  // The tabs another file draws, and the name it goes by on window.
+  const TAB_MODULES = {
+    quotes: 'Quotes',
+    schedule: 'Schedule',
+    tasks: 'Tasks',
+    messages: 'Messages',
+    health: 'DevStats',
+    quickbooks: 'QuickBooks',
+    pricing: 'Pricing',
+    invoices: 'Invoices',
+    inbox: 'Inbox',
+    estimate: 'Estimates',
+  };
+
+  // A tab that failed to load says so, the way each tab always has — except
+  // once the session has gone and the page is on its way to sign-in, which
+  // can now happen while a tab opened from a kept copy is still loading.
+  function report(e) {
+    if (!leaving) alert(e.message);
+  }
+
+  // What opening a tab loads. Resolves once its data is in.
+  function loadTab(name) {
+    if (name === 'live') return showLive();
+    if (name === 'employees') return loadEmployees().catch(report);
+    if (name === 'sheets') return loadTimesheet().catch(report);
+    if (name === 'map') return showMap();
+    if (name === 'timeoff') return loadVacations().catch(report);
+    if (name === 'access') return loadDevFeatures().catch(report);
+    const mod = window[TAB_MODULES[name]];
+    if (!mod) {
+      // Opened from a kept copy before that tab's file is in: load it as soon
+      // as it is, if the tab is still the one on screen.
+      if (TAB_MODULES[name] && document.readyState === 'loading')
+        return ready.then(() => (tabOpen(name) ? loadTab(name) : null));
+      return null;
+    }
+    if (name === 'quotes') return mod.load(); // reports its own errors
+    const work = name === 'schedule' || name === 'tasks' ? mod.loadAdmin() : mod.load();
+    return Promise.resolve(work).catch(report);
+  }
+
+  // ---- Getting ahead of the next tab ----
+  // A tab's data is asked for the moment someone shows interest in it — a
+  // mouse resting on it, keyboard focus, a finger landing — so it is usually
+  // here by the time the tab opens. Reads only: nothing warmed here changes,
+  // counts or sends anything, and a warm-up that meets an expired login never
+  // signs anyone out (see `background` in api()).
+  function prefetchTab(name) {
+    if (TAB_MODULES[name]) {
+      const mod = window[TAB_MODULES[name]];
+      if (mod && mod.prefetch) mod.prefetch();
+      return;
+    }
+    if (name === 'live') Snappy.prefetch(api, LIVE_PATH);
+    else if (name === 'employees') Snappy.prefetch(api, EMP_PATH);
+    else if (name === 'sheets') Snappy.prefetch(api, tsPath());
+    else if (name === 'timeoff') Snappy.prefetch(api, voPath());
+    else if (name === 'map') {
+      Snappy.prefetch(api, mapPaths());
+      Snappy.leaflet().catch(() => {});
+    }
+  }
+  Snappy.intent(document.querySelector('.side-nav'), '.tab', (t) => prefetchTab(t.dataset.tab));
+
+  const tabShown = (name) => {
+    const t = document.querySelector('.side-nav .tab[data-tab="' + name + '"]');
+    return !!t && navVisible(t);
+  };
+  const tabOpen = (name) => {
+    const sec = $('tab-' + name);
+    return !!sec && sec.classList.contains('active');
+  };
+
+  // Once the first tab has its data, warm the likeliest next few while the
+  // dashboard sits idle: one at a time, a second apart, so they never crowd
+  // the screen being looked at. Then the map library, when there is a map or
+  // a quote site plan to draw.
+  let warmed = false;
+  function warmNextTabs() {
+    if (warmed) return;
+    warmed = true;
+    const likely = isDev
+      ? ['quotes', 'schedule', 'tasks', 'messages', 'pricing']
+      : ['schedule', 'quotes', 'sheets', 'invoices', 'live', 'timeoff'];
+    const steps = likely
+      .filter((name) => tabShown(name) && !tabOpen(name))
+      .slice(0, 4)
+      .map((name) => () => prefetchTab(name));
+    // The map library ahead of time, unless the device is saving data.
+    if ((tabShown('map') || tabShown('quotes')) && !Snappy.quiet())
+      steps.push(() => Snappy.leaflet().catch(() => {}));
+    const next = () => {
+      const step = steps.shift();
+      if (!step || leaving) return; // done, or the session has gone
+      step();
+      setTimeout(() => Snappy.idle(next), 1000);
+    };
+    Promise.resolve(tabLoad)
+      .catch(() => {})
+      .then(() => Snappy.idle(next));
+  }
+
   // ---- Live view ----
+  const LIVE_PATH = '/api/admin/active';
   function showLive() {
     // Skeleton only on the first paint (not on the 30s refresh, to avoid flicker).
     if (!$('liveBody').children.length) skeletonRows('liveBody', 3, 3);
-    refreshLive();
     if (liveTimer) clearInterval(liveTimer);
     liveTimer = setInterval(refreshLive, 30000);
+    return refreshLive();
   }
   function elapsed(iso) {
     const mins = Math.floor((Date.now() - new Date(iso)) / 60000);
@@ -349,18 +537,23 @@
     const m = mins % 60;
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
+  function renderLive(rows) {
+    $('liveCount').textContent = rows.length;
+    $('liveEmpty').style.display = rows.length ? 'none' : 'block';
+    $('liveBody').innerHTML = rows
+      .map(
+        (r) =>
+          `<tr><td>${esc(r.name)}</td><td>${fmtDateTime(r.clock_in)}</td>
+           <td><span class="badge on">${elapsed(r.clock_in)}</span></td></tr>`
+      )
+      .join('');
+  }
+  // Who is on the clock: the last copy at once, its times counted up to now,
+  // then the server's answer if it differs. Kept in memory only — clock-ins
+  // never go to disk.
   async function refreshLive() {
     try {
-      const rows = await api('/api/admin/active');
-      $('liveCount').textContent = rows.length;
-      $('liveEmpty').style.display = rows.length ? 'none' : 'block';
-      $('liveBody').innerHTML = rows
-        .map(
-          (r) =>
-            `<tr><td>${esc(r.name)}</td><td>${fmtDateTime(r.clock_in)}</td>
-             <td><span class="badge on">${elapsed(r.clock_in)}</span></td></tr>`
-        )
-        .join('');
+      await Snappy.swr(api, LIVE_PATH, renderLive);
     } catch (e) {
       /* handled by api() */
     }
@@ -497,38 +690,43 @@
     e.last_name || (e.name || '').trim().split(/\s+/).slice(1).join(' ') || '';
 
   // Selects used elsewhere (timesheet filter + punch modal) + Reports-To filter.
+  // Each keeps whoever was picked in it: the list can be redrawn under someone
+  // mid-task, when a newer copy of it arrives.
   function syncEmpSelects() {
-    const opts =
-      '<option value="">All employees</option>' +
-      employees.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join('');
-    if ($('tsEmp')) $('tsEmp').innerHTML = opts;
-    if ($('mEmp'))
-      $('mEmp').innerHTML = employees
-        .map((e) => `<option value="${e.id}">${esc(e.name)}</option>`)
-        .join('');
-    if ($('empReports')) {
-      const keep = $('empReports').value;
-      $('empReports').innerHTML =
-        '<option value="">All</option>' +
-        employees.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join('');
-      $('empReports').value = keep;
-    }
+    const names = employees.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join('');
+    const refill = (el, html) => {
+      const keep = el.value;
+      el.innerHTML = html;
+      el.value = keep;
+      if (el.selectedIndex < 0) el.selectedIndex = 0; // they're gone: back to the first choice
+    };
+    if ($('tsEmp')) refill($('tsEmp'), '<option value="">All employees</option>' + names);
+    if ($('mEmp')) refill($('mEmp'), names);
+    if ($('empReports')) refill($('empReports'), '<option value="">All</option>' + names);
   }
 
-  async function loadEmployees() {
-    // Stale-while-revalidate: if we already have the list, paint it instantly and
-    // refresh in the background; otherwise show skeleton rows while it loads.
-    const hadData = employees.length > 0;
-    if (hadData) {
+  // The people list: the last copy at once, then the server's answer if it
+  // differs. Kept in memory only — it holds pay rates and home addresses.
+  // `afterChange` reads it afresh once a save has gone through.
+  const EMP_PATH = '/api/admin/employees';
+  let empSeq = 0;
+  async function loadEmployees(afterChange) {
+    const seq = ++empSeq;
+    let first = !employees.length;
+    const draw = (list) => {
+      if (seq !== empSeq) return; // a newer read has been asked for since
+      employees = Array.isArray(list) ? list : [];
       syncEmpSelects();
+      // A first load starts on page one; a later one keeps their place.
+      if (first) empPage = 1;
+      first = false;
       renderEmployees();
-    } else {
-      skeletonRows('empBody', 4);
-    }
-    employees = await api('/api/admin/employees');
-    syncEmpSelects();
-    if (!hadData) empPage = 1;
-    renderEmployees();
+    };
+    if (afterChange) return draw(await reread(EMP_PATH));
+    // Skeleton rows only while the table is still empty. A kept copy is drawn
+    // over them straight away, so then they are never seen.
+    if (!$('empBody').children.length) skeletonRows('empBody', 4);
+    await Snappy.swr(api, EMP_PATH, draw);
   }
 
   function filteredEmployees() {
@@ -565,7 +763,7 @@
     if ($('empEmpty')) $('empEmpty').style.display = rows.length ? 'none' : 'block';
     $('empBody').innerHTML = pageRows
       .map(
-        (e) => `<tr class="clickable-row" data-id="${e.id}" title="Open ${esc(e.name)}">
+        (e) => `<tr class="clickable-row" data-id="${e.id}" data-press="fast" title="Open ${esc(e.name)}">
           <td>${esc(empFirst(e)) || dash}${
             e.active ? '' : ' <span class="badge">inactive</span>'
           }</td>
@@ -745,7 +943,8 @@
     if (e.target === $('empModalBack')) closeEmpModal();
   });
 
-  // Merge a save payload into a local employee object for optimistic display.
+  // Merge a saved payload into a local employee object, for when the server's
+  // answer doesn't carry the saved record back.
   function applyPayloadToEmp(emp, payload) {
     const next = { ...emp };
     PROFILE_FIELDS.forEach((k) => { if (payload[k] != null) next[k] = payload[k]; });
@@ -772,44 +971,38 @@
     if ($('eaPass').value) payload.password = $('eaPass').value;
 
     const editingId = empModalId;
+    // Pay, permissions and the login all live in here, so the editor waits for
+    // the server to accept them rather than show a change it might refuse. The
+    // button answers the press at once; its spinner only if the wait is long.
+    let saved;
+    try {
+      saved = await Snappy.busy(
+        $('eaSave'),
+        () =>
+          editingId
+            ? api('/api/admin/employees/' + editingId, {
+                method: 'PATCH',
+                body: JSON.stringify(payload),
+              })
+            : api('/api/admin/employees', { method: 'POST', body: JSON.stringify(payload) }),
+        { label: 'Saving…' }
+      );
+    } catch (e) {
+      $('empModalMsg').textContent = e.message;
+      return;
+    }
+    closeEmpModal();
+    dropPeopleLists();
     if (editingId) {
-      // Optimistic: update the row + close immediately, reconcile with the server.
       const idx = employees.findIndex((e) => e.id === editingId);
-      const prev = idx >= 0 ? employees[idx] : null;
       if (idx >= 0) {
-        employees[idx] = applyPayloadToEmp(prev, payload);
+        employees[idx] = saved && saved.id ? saved : applyPayloadToEmp(employees[idx], payload);
         syncEmpSelects();
         renderEmployees();
       }
-      closeEmpModal();
-      try {
-        const updated = await api('/api/admin/employees/' + editingId, {
-          method: 'PATCH',
-          body: JSON.stringify(payload),
-        });
-        if (idx >= 0 && updated && updated.id) {
-          employees[idx] = updated;
-          syncEmpSelects();
-          renderEmployees();
-        }
-      } catch (e) {
-        if (idx >= 0 && prev) {
-          employees[idx] = prev;
-          syncEmpSelects();
-          renderEmployees();
-        }
-        alert(e.message);
-      }
-      return;
     }
-    // New employee needs a server-assigned id, so create it the normal way.
-    try {
-      await api('/api/admin/employees', { method: 'POST', body: JSON.stringify(payload) });
-      closeEmpModal();
-      loadEmployees();
-    } catch (e) {
-      $('empModalMsg').textContent = e.message;
-    }
+    // Then the server's own list — a new person's id is only known there.
+    loadEmployees(true).catch(() => {});
   });
 
   $('eaDelete').addEventListener('click', async () => {
@@ -817,22 +1010,35 @@
     const id = empModalId;
     const emp = employees.find((e) => e.id === id);
     if (!confirm(`Delete ${emp ? emp.name : 'this employee'} and all their time entries?`)) return;
-    // Optimistic: remove from the list right away; restore it if the server rejects.
-    const prev = employees;
+    $('empModalMsg').textContent = '';
+    // Their time entries go with them, and those are payroll history: this
+    // waits for the server to confirm rather than assume it.
+    try {
+      await Snappy.busy(
+        $('eaDelete'),
+        () => api('/api/admin/employees/' + id, { method: 'DELETE' }),
+        { label: 'Deleting…' }
+      );
+    } catch (e) {
+      $('empModalMsg').textContent = e.message;
+      return;
+    }
+    closeEmpModal();
     employees = employees.filter((e) => e.id !== id);
     syncEmpSelects();
     renderEmployees();
-    closeEmpModal();
-    try {
-      await api('/api/admin/employees/' + id, { method: 'DELETE' });
-      tsCache.clear(); // their punches are gone too
-    } catch (e) {
-      employees = prev;
-      syncEmpSelects();
-      renderEmployees();
-      alert(e.message);
-    }
+    dropPeopleLists(); // their punches, requests and crew places went with them
+    loadEmployees(true).catch(() => {});
   });
+
+  // A person's name, punches, requests and crew places show up in other tabs'
+  // lists too, so once someone is changed or deleted, no kept copy of any of
+  // those may paint them as they were. Only the signed-in account is kept.
+  function dropPeopleLists() {
+    const me = Snappy.cache.peek(ME);
+    Snappy.cache.drop('/api/admin/');
+    if (me) Snappy.cache.put(ME, me, true);
+  }
 
   $('eaMerge').addEventListener('click', () => alert('Merging employees is coming soon.'));
 
@@ -844,8 +1050,15 @@
     if ($('tsTo').value) p.set('to', $('tsTo').value);
     return p.toString();
   }
+  function tsPath() {
+    return '/api/admin/timesheet?' + buildQuery();
+  }
 
-  const tsCache = new Map(); // query string -> last timesheet response (SWR)
+  // Each range read is kept in memory (snappy.js) and never on disk: these are
+  // hours, which is pay. tsData is the range on screen — the entry editor
+  // opens from its rows.
+  let tsData = null;
+  let tsSeq = 0;
 
   // Jobs the employee ticked off at clock-out, shown as chips above their note.
   const jobChips = (r) =>
@@ -894,7 +1107,7 @@
     $('tsEmpty').style.display = entries.length ? 'none' : 'block';
     $('tsBody').innerHTML = entries
       .map(
-        (r) => `<tr class="clickable-row" data-punch="${r.id}" title="Click to edit this entry">
+        (r) => `<tr class="clickable-row" data-punch="${r.id}" data-press="fast" title="Click to edit this entry">
           <td>${esc(r.name)}${r.edited ? ' <span class="badge edited">edited</span>' : ''}</td>
           <td>${fmtDateTime(r.clock_in)}</td>
           <td>${r.clock_out ? fmtDateTime(r.clock_out) : '<span class="badge on">on the clock</span>'}</td>
@@ -909,17 +1122,26 @@
       )
       .join('');
   }
-  async function loadTimesheet() {
-    const query = buildQuery();
-    // Show the cached range instantly if we've loaded it before; else skeleton.
-    if (tsCache.has(query)) renderTimesheet(tsCache.get(query));
-    else skeletonRows('tsBody', 5);
-    const data = await api('/api/admin/timesheet?' + query);
-    tsCache.set(query, data);
-    renderTimesheet(data);
+  // A range read before paints at once, then again if the server's answer
+  // differs. `afterChange` reads it afresh once an edit has gone through.
+  async function loadTimesheet(afterChange) {
+    const seq = ++tsSeq;
+    const path = tsPath();
+    const draw = (data) => {
+      if (seq !== tsSeq) return; // another range (or a newer read) since
+      tsData = data;
+      renderTimesheet(data);
+    };
+    if (afterChange) return draw(await reread(path));
+    // A kept copy is drawn over these skeleton rows straight away, so they
+    // only ever show for a range being read for the first time.
+    skeletonRows('tsBody', 5);
+    await Snappy.swr(api, path, draw);
   }
 
-  $('tsLoad').addEventListener('click', () => loadTimesheet().catch((e) => alert(e.message)));
+  $('tsLoad').addEventListener('click', () =>
+    Snappy.busy($('tsLoad'), loadTimesheet).catch((e) => alert(e.message))
+  );
   $('tsExport').addEventListener('click', () => {
     window.location = '/api/admin/export.csv?' + buildQuery();
   });
@@ -932,12 +1154,15 @@
         method: 'PATCH',
         body: JSON.stringify({ round_trip: $('tsRoundTrip').checked }),
       });
-      tsCache.clear();
-      await loadTimesheet();
     } catch (e) {
       $('tsRoundTrip').checked = !$('tsRoundTrip').checked; // put it back
       alert(e.message);
+      return;
     }
+    // The setting did change, so the switch stays as it is even if the
+    // re-read below fails; only the kept ranges are out of date.
+    Snappy.cache.drop('/api/admin/timesheet');
+    loadTimesheet(true).catch((e) => alert(e.message));
   });
 
   $('tsBody').addEventListener('click', (ev) => {
@@ -950,15 +1175,9 @@
   let modalPunchId = null;
   let modalRows = [];
 
-  async function openPunchModal(id) {
-    // Reuse the cached timesheet if we have it, so the editor opens instantly.
-    const query = buildQuery();
-    let data = tsCache.get(query);
-    if (!data) {
-      data = await api('/api/admin/timesheet?' + query);
-      tsCache.set(query, data);
-    }
-    modalRows = data.entries;
+  function openPunchModal(id) {
+    // The row clicked is one of the rows on screen, so the editor opens at once.
+    modalRows = (tsData && tsData.entries) || [];
     const r = modalRows.find((x) => x.id === id);
     if (!r) return;
     modalPunchId = id;
@@ -1013,59 +1232,104 @@
       // straight-line estimate.
       km_manual: $('mKm').value === '' ? '' : Number($('mKm').value),
     };
+    const id = modalPunchId;
+    if (!id) payload.employee_id = Number($('mEmp').value);
+    // Hours are pay: the editor stays open until the server has taken the
+    // change. The button answers the press at once; its spinner only if the
+    // wait is long.
     try {
-      if (modalPunchId) {
-        await api('/api/admin/punches/' + modalPunchId, {
-          method: 'PATCH',
-          body: JSON.stringify(payload),
-        });
-      } else {
-        payload.employee_id = Number($('mEmp').value);
-        await api('/api/admin/punches', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        });
-      }
-      $('modalBack').classList.remove('open');
-      tsCache.clear(); // entry changed — drop the cached ranges
-      loadTimesheet();
+      await Snappy.busy(
+        $('mSave'),
+        () =>
+          id
+            ? api('/api/admin/punches/' + id, { method: 'PATCH', body: JSON.stringify(payload) })
+            : api('/api/admin/punches', { method: 'POST', body: JSON.stringify(payload) }),
+        { label: 'Saving…' }
+      );
     } catch (e) {
       $('modalMsg').textContent = e.message;
+      return;
     }
+    $('modalBack').classList.remove('open');
+    dropPunchLists();
+    loadTimesheet(true).catch(() => {});
   });
 
   $('mDelete').addEventListener('click', async () => {
     if (!modalPunchId || !confirm('Delete this time entry?')) return;
+    const id = modalPunchId;
+    $('modalMsg').textContent = '';
     try {
-      await api('/api/admin/punches/' + modalPunchId, { method: 'DELETE' });
-      $('modalBack').classList.remove('open');
-      tsCache.clear();
-      loadTimesheet();
+      await Snappy.busy(
+        $('mDelete'),
+        () => api('/api/admin/punches/' + id, { method: 'DELETE' }),
+        { label: 'Deleting…' }
+      );
     } catch (e) {
       $('modalMsg').textContent = e.message;
+      return;
     }
+    $('modalBack').classList.remove('open');
+    dropPunchLists();
+    loadTimesheet(true).catch(() => {});
   });
+
+  // A changed entry reaches every list built from punches: the ranges, who is
+  // on the clock, the clock-in map and the payroll preview.
+  function dropPunchLists() {
+    [
+      '/api/admin/timesheet',
+      '/api/admin/active',
+      '/api/admin/locations',
+      '/api/admin/quickbooks/preview',
+    ].forEach((p) => Snappy.cache.drop(p));
+  }
 
   // ---- Map (clock-in locations) ----
   let map = null;
   let mapMarkers = [];
+  let mapBuilding = null; // the map on its way while Leaflet loads
+  let mapSeq = 0;
   function mapQuery() {
     const p = new URLSearchParams();
     if ($('mapFrom').value) p.set('from', $('mapFrom').value);
     if ($('mapTo').value) p.set('to', $('mapTo').value);
     return p.toString();
   }
-  // Create the Leaflet map the first time it's needed (returns null if Leaflet
-  // couldn't load). Must run while the container is visible.
+  // The map's two reads for the range picked: clock-ins, and the shop with the
+  // scheduled jobs.
+  function mapPaths() {
+    const q = mapQuery();
+    return ['/api/admin/locations?' + q, '/api/admin/map?' + q];
+  }
+  // Create the Leaflet map the first time it's needed. Leaflet itself arrives
+  // with the first map opened (snappy.js), not with every visit to the
+  // dashboard. Rejects when it can't load — offline, say — and the next call
+  // tries again. A map made while its tab is hidden is sized when shown.
   function ensureMap() {
-    if (map) return map;
-    if (!window.L) return null;
-    map = L.map('map').setView([43.65, -79.38], 8); // default view: southern Ontario
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '© OpenStreetMap contributors',
-    }).addTo(map);
-    return map;
+    if (map) return Promise.resolve(map);
+    if (!mapBuilding)
+      mapBuilding = Snappy.leaflet()
+        .then((L) => {
+          $('map').innerHTML = ''; // a "couldn't load" note from an earlier try
+          map = L.map('map').setView([43.65, -79.38], 8); // default view: southern Ontario
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors',
+          }).addTo(map);
+          return map;
+        })
+        .finally(() => {
+          mapBuilding = null;
+        });
+    return mapBuilding;
+  }
+  // Said where the map should be, so the empty box explains itself.
+  function mapUnavailable() {
+    if (!map && $('map'))
+      $('map').innerHTML =
+        '<p class="status-sub" style="padding:22px;margin:0">The map couldn’t load — check ' +
+        'the internet connection, then open this tab again.</p>';
   }
   function activateTab(name) {
     document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
@@ -1076,20 +1340,34 @@
     if (sec) sec.classList.add('active');
   }
   async function showMap() {
-    if (!ensureMap()) return;
-    setTimeout(() => map.invalidateSize(), 0); // it was hidden until now
-    await loadMap().catch((e) => alert(e.message));
+    try {
+      await ensureMap();
+    } catch (e) {
+      return mapUnavailable();
+    }
+    // Leaflet can take a moment the first time. Carry on only if the map is
+    // still the tab on screen; opening it again picks up from here.
+    if (!tabOpen('map')) return;
+    // It was hidden until now: size it before anything is drawn, and once
+    // more after this frame in case the layout was still settling.
+    map.invalidateSize();
+    setTimeout(() => map.invalidateSize(), 0);
+    await loadMap().catch(report);
   }
   // Jump the map straight to one clock-in (used by the Timesheets "Location" button).
-  function focusPunch(lat, lng, name, when) {
+  async function focusPunch(lat, lng, name, when) {
     activateTab('map');
-    if (!ensureMap()) return alert('Map could not load (no internet?).');
+    try {
+      await ensureMap();
+    } catch (e) {
+      return mapUnavailable();
+    }
     setTimeout(() => {
       map.invalidateSize();
       mapMarkers.forEach((m) => map.removeLayer(m));
       mapMarkers = [];
       const mk = L.circleMarker([lat, lng], {
-        radius: 9, color: '#a97f43', fillColor: '#c89b5c', fillOpacity: 0.95, weight: 2,
+        radius: 9, color: '#ac7d3f', fillColor: '#c3965a', fillOpacity: 0.95, weight: 2,
       }).addTo(map);
       mk.bindPopup(`<b>${esc(name)}</b><br>${fmtDateTime(when)}`).openPopup();
       mapMarkers.push(mk);
@@ -1133,14 +1411,32 @@
 
   const km = (n) => (n == null ? '—' : n.toFixed(1).replace(/\.0$/, '') + ' km');
 
+  // Punches and jobs are independent; fetch together so one slow query does
+  // not hold up the other. The map is drawn once both are in — from the kept
+  // copies at once, then again only if the server's answer differs. Kept in
+  // memory only: where people clocked in never goes to disk.
   async function loadMap() {
     if (!map) return;
-    // Punches and jobs are independent; fetch together so one slow query does
-    // not hold up the other.
-    const [rows, plan] = await Promise.all([
-      api('/api/admin/locations?' + mapQuery()),
-      api('/api/admin/map?' + mapQuery()),
+    const seq = ++mapSeq;
+    const [locPath, planPath] = mapPaths();
+    const got = {};
+    const draw = () => {
+      // Another range (or a newer read) since: leave the map to that one.
+      if (seq === mapSeq && got.rows && got.plan) drawMap(got.rows, got.plan);
+    };
+    await Promise.all([
+      Snappy.swr(api, locPath, (rows) => {
+        got.rows = rows;
+        draw();
+      }),
+      Snappy.swr(api, planPath, (plan) => {
+        got.plan = plan;
+        draw();
+      }),
     ]);
+  }
+
+  function drawMap(rows, plan) {
     mapMarkers.forEach((m) => map.removeLayer(m));
     mapMarkers = [];
     const jobs = (plan && plan.jobs) || [];
@@ -1169,11 +1465,13 @@
             method: 'PATCH',
             body: JSON.stringify({ lat: p.lat, lng: p.lng }),
           });
-          await loadMap();
+          // The shop's spot, and every distance measured from it, came with
+          // the map plan: no kept plan may put the pin back.
+          Snappy.cache.drop('/api/admin/map');
         } catch (e) {
-          alert(e.message);
-          await loadMap();
+          alert(e.message); // the redraw below puts the pin back where it was
         }
+        await loadMap().catch((e) => alert(e.message));
       });
       mapMarkers.push(mk);
       bounds.push([shop.lat, shop.lng]);
@@ -1197,7 +1495,7 @@
     // Clock-ins stay as plain dots — they are readings, not places.
     rows.forEach((r) => {
       const mk = L.circleMarker([r.lat, r.lng], {
-        radius: 8, color: '#a97f43', fillColor: '#c89b5c', fillOpacity: 0.9, weight: 2,
+        radius: 8, color: '#ac7d3f', fillColor: '#c3965a', fillOpacity: 0.9, weight: 2,
       }).addTo(map);
       mk.bindPopup(`<b>${esc(r.name)}</b><br>${fmtDateTime(r.clock_in)}`);
       mapMarkers.push(mk);
@@ -1244,7 +1542,17 @@
   // The map tab is optional markup — only wire it if it's present on the page,
   // so a build without the map section doesn't break the whole dashboard.
   if ($('mapLoad'))
-    $('mapLoad').addEventListener('click', () => loadMap().catch((e) => alert(e.message)));
+    $('mapLoad').addEventListener('click', () =>
+      Snappy.busy($('mapLoad'), async () => {
+        // Also the way to try again after the map library failed to load.
+        try {
+          await ensureMap();
+        } catch (e) {
+          return mapUnavailable();
+        }
+        await loadMap();
+      }).catch((e) => alert(e.message))
+    );
 
   // ---- Time off (employee vacation requests) ----
   // Format a plain 'YYYY-MM-DD' as a local date (parsed as local, not UTC).
@@ -1264,18 +1572,37 @@
     el.style.display = n > 0 ? '' : 'none';
   }
 
+  // Requests for the filter picked. "Pending" is the same read the badge
+  // makes, so opening the tab after the badge has loaded paints at once.
+  // Kept in memory only.
+  function voPath() {
+    const status = $('voFilter') ? $('voFilter').value : 'pending';
+    return '/api/admin/vacations?status=' + encodeURIComponent(status);
+  }
+  let voSeq = 0;
+
   async function refreshVacationCount() {
     try {
-      const d = await api('/api/admin/vacations?status=pending');
-      setVacationCount(d.pending || 0);
+      await Snappy.swr(api, '/api/admin/vacations?status=pending', (d) =>
+        setVacationCount(d.pending || 0)
+      );
     } catch (e) {
       /* non-fatal: the badge just stays hidden */
     }
   }
 
-  async function loadVacations() {
-    const status = $('voFilter') ? $('voFilter').value : 'pending';
-    const d = await api('/api/admin/vacations?status=' + encodeURIComponent(status));
+  // `afterChange` reads afresh once an approval or decline has gone through.
+  async function loadVacations(afterChange) {
+    const seq = ++voSeq;
+    const path = voPath();
+    const draw = (d) => {
+      if (seq === voSeq) renderVacations(d); // not when another filter was picked since
+    };
+    if (afterChange) return draw(await reread(path));
+    await Snappy.swr(api, path, draw);
+  }
+
+  function renderVacations(d) {
     setVacationCount(d.pending || 0);
     const rows = d.requests || [];
     $('voAdminEmpty').style.display = rows.length ? 'none' : 'block';
@@ -1319,19 +1646,56 @@
         ''
       );
       if (note === null) return; // cancelled
+      const status = approve ? 'approved' : 'declined';
       try {
-        await api('/api/admin/vacations/' + btn.dataset.id, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            status: approve ? 'approved' : 'declined',
-            admin_note: note,
-          }),
-        });
-        await loadVacations();
+        await Snappy.optimistic(
+          () => markVacation(btn.closest('tr'), status),
+          () =>
+            api('/api/admin/vacations/' + btn.dataset.id, {
+              method: 'PATCH',
+              body: JSON.stringify({ status, admin_note: note }),
+            })
+        );
       } catch (e) {
         alert(e.message);
+        return;
       }
+      // Then the server's version, with the note and the true count.
+      loadVacations(true).catch(() => {});
     });
+
+  // An approval or decline shows the moment it's made: the row takes its new
+  // status (or leaves a list filtered to another one) and the badge counts
+  // down. Returns what puts it all back, should the server refuse.
+  function markVacation(row, status) {
+    const body = $('voAdminBody');
+    const filter = $('voFilter') ? $('voFilter').value : 'pending';
+    const badge = $('voNavCount');
+    const was = {
+      html: row.innerHTML,
+      next: row.nextElementSibling,
+      empty: $('voAdminEmpty').style.display,
+      count: badge ? Number(badge.textContent) || 0 : 0,
+    };
+    if (filter && filter !== status) {
+      row.remove();
+      if (!body.children.length) $('voAdminEmpty').style.display = 'block';
+    } else {
+      const cells = row.cells;
+      cells[cells.length - 2].innerHTML = `<span class="badge status-${status}">${status}</span>`;
+      cells[cells.length - 1].innerHTML = '';
+    }
+    setVacationCount(Math.max(0, was.count - 1));
+    // No kept list may paint the request as still pending meanwhile.
+    Snappy.cache.drop('/api/admin/vacations');
+    return () => {
+      if (!row.isConnected)
+        body.insertBefore(row, was.next && was.next.parentNode === body ? was.next : null);
+      row.innerHTML = was.html;
+      $('voAdminEmpty').style.display = was.empty;
+      setVacationCount(was.count);
+    };
+  }
 
   // ---- utils ----
   function esc(s) {
@@ -1344,25 +1708,69 @@
   // which lives in a separate file so this one stays focused on the timeclock.
   window.HEKAdmin = { api, esc, showLogin };
 
-  // ---- boot: default date range = this week, check session ----
+  // ---- boot: default date range = this week, then who is signed in ----
   (function initDates() {
     const now = new Date();
     const monday = new Date(now);
     const day = (now.getDay() + 6) % 7; // 0 = Monday
     monday.setDate(now.getDate() - day);
-    const toStr = (d) => d.toISOString().slice(0, 10);
+    // This device's calendar day. toISOString would give the UTC day, which is
+    // already tomorrow every evening in Ontario.
+    const p2 = (n) => String(n).padStart(2, '0');
+    const toStr = (d) => d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
     if ($('tsFrom')) $('tsFrom').value = toStr(monday);
     if ($('tsTo')) $('tsTo').value = toStr(now);
     if ($('mapFrom')) $('mapFrom').value = toStr(monday);
     if ($('mapTo')) $('mapTo').value = toStr(now);
   })();
 
-  api('/api/admin/me')
+  // Ask the server straight away — on a cold server this is also the request
+  // that wakes it.
+  const meCall = api(ME);
+
+  // When this device kept the answer for an admin login that hasn't run out,
+  // open on it now, before the rest of the page has even loaded: no sign-in
+  // screen in between, the right tab straight away, each tab painting from
+  // its own kept copy. The server's answer then confirms it, adjusts it, or
+  // ends it (confirmMe).
+  const resumed = Snappy.cache.resume();
+  const kept = resumed && resumed.startsWith('admin:') ? Snappy.cache.peek(ME) : undefined;
+  if (kept && kept.admin && meKey(kept) === resumed) {
+    adopt(kept);
+    showApp();
+  }
+
+  // The server's word on who is signed in.
+  function confirmMe(d) {
+    if (!d.admin) {
+      // Signed out, or never signed in: nothing kept may outlive that.
+      Snappy.cache.clear();
+      return showLogin();
+    }
+    if (shownAs && shownAs !== meKey(d)) {
+      // A different account has signed in since that copy was kept — in
+      // another tab, say. Start over rather than leave its screens up.
+      leaving = true;
+      Snappy.cache.clear();
+      return window.location.reload();
+    }
+    remember(d);
+    const before = JSON.stringify(currentFeatures);
+    adopt(d);
+    if (!started) return showApp();
+    // Already open on the kept copy: re-apply only what changed.
+    if (JSON.stringify(currentFeatures) !== before) reapplyEntitlements();
+  }
+
+  const bootSignIns = signIns;
+  meCall
     .then((d) => {
-      if (!d.admin) return showLogin();
-      isDev = d.role === 'dev';
-      currentFeatures = d.features || null;
-      showApp();
+      if (signIns !== bootSignIns) return; // a sign-in since has its own answer
+      confirmMe(d);
     })
-    .catch(showLogin);
+    .catch(() => {
+      // No answer at all — offline, or the server is down. A dashboard already
+      // open on the kept copy stays up; without one there's nothing to show.
+      if (!shownAs && signIns === bootSignIns) showLogin();
+    });
 })();

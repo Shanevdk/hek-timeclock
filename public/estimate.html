@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#0d0d0d" />
+    <meta name="theme-color" content="#0c0a09" />
     <!-- Set the saved theme before first paint so there is no flash. -->
     <script>
       try { document.documentElement.dataset.theme = localStorage.getItem('hek-theme') || 'system'; }
@@ -14,28 +14,52 @@
 
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="/icon-192.png" />
-    <!-- Leaflet, for tracing the fence on the customer's own property -->
+    <!-- Leaflet, for tracing the fence on the customer's own property. Fetched
+         from the start but no longer in the way of the first paint: preloaded
+         here, put to use by estimate.js through Snappy.leaflet(). -->
+    <link rel="preconnect" href="https://unpkg.com" crossorigin />
     <link
-      rel="stylesheet"
+      rel="preload"
+      as="style"
       href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin=""
     />
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    <link
+      rel="preload"
+      as="script"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
-    ></script>
+    />
 
     <!-- three.js for the 3D fence preview. Module-only these days, so it comes
-         in through an import map; fence3d.js hands the viewer to estimate.js. -->
+         in through an import map (the minified build: half the bytes). It is the
+         heaviest thing on the page and only the last step uses it, so it is
+         fetched when estimate.js first asks for it — loadFence3D() — not on
+         arrival. -->
     <script type="importmap">
-      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }
+      { "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.min.js" } }
     </script>
-    <script type="module">
-      import { FencePreview, styleForService, styleList } from '/fence3d.js';
-      window.Fence3D = { FencePreview, styleForService, styleList };
-      window.dispatchEvent(new Event('fence3d-ready'));
+    <script>
+      window.loadFence3D = (function () {
+        var loading = null;
+        return function () {
+          if (!loading)
+            loading = import('/fence3d.js').then(
+              function (m) {
+                window.Fence3D = { FencePreview: m.FencePreview, styleForService: m.styleForService, styleList: m.styleList };
+                window.dispatchEvent(new Event('fence3d-ready'));
+                return window.Fence3D;
+              },
+              function (err) {
+                loading = null; // a dropped connection can be tried again
+                throw err;
+              }
+            );
+          return loading;
+        };
+      })();
     </script>
 
     <link rel="stylesheet" href="/styles.css" />
@@ -43,19 +67,17 @@
   <body class="est-page">
     <div class="wrap est-wrap">
       <div class="brand">
-        <div class="hek">HEK</div>
-        <div class="sub">FENCING</div>
-        <div class="inc">Inc.</div>
+        <svg class="brand-logo" viewBox="79 76 434 298" role="img" aria-label="HEK Fencing Inc."><use href="/logo.svg#logo" /></svg>
       </div>
 
       <!-- Shown while the config loads, and if the page is switched off -->
-      <div class="card" id="estLoading">
+      <div class="card wait" id="estLoading">
         <p class="status-sub" style="margin:0">Loading…</p>
       </div>
 
       <div class="card" id="estOffline" style="display:none">
-        <h2 style="text-align:center;margin-top:0">Estimates are closed right now</h2>
-        <p class="status-sub" style="margin:0">
+        <h2 style="text-align:center;margin-top:0" id="estOfflineTitle">Estimates are closed right now</h2>
+        <p class="status-sub" style="margin:0" id="estOfflineText">
           Our instant estimate tool is unavailable at the moment. Please get in
           touch and we will price your job by hand.
         </p>
@@ -71,7 +93,7 @@
           <div class="est-measure">
             <div class="est-measure-head">
               <h3>Not sure how many feet?</h3>
-              <button class="btn ghost sm" id="mapToggle" type="button">Measure on a map</button>
+              <button class="btn ghost sm" id="mapToggle" type="button" data-press="fast">Measure on a map</button>
             </div>
             <p class="est-measure-hint" id="mapHint" style="display:none">
               Find your property, then click along where the fence goes. Each click adds a
@@ -92,8 +114,8 @@
               <div class="est-map-wrap">
                 <div id="estMap"></div>
                 <div class="est-layers">
-                  <button type="button" class="active" data-layer="sat">Satellite</button>
-                  <button type="button" data-layer="street">Map</button>
+                  <button type="button" class="active" data-layer="sat" data-press="fast">Satellite</button>
+                  <button type="button" data-layer="street" data-press="fast">Map</button>
                 </div>
               </div>
 
@@ -126,7 +148,7 @@
           <div class="est-3d" id="est3d" style="display:none">
             <div class="est-3d-head">
               <h3>Your fence, on your property</h3>
-              <button class="btn ghost sm" id="est3dHide" type="button">Hide</button>
+              <button class="btn ghost sm" id="est3dHide" type="button" data-press="fast">Hide</button>
             </div>
             <div class="est-3d-controls">
               <div class="field"><label for="est3dStyle">Fence style</label>
@@ -145,6 +167,8 @@
               <canvas id="est3dCanvas"></canvas>
               <div class="est-3d-note" id="est3dNote">Building your fence…</div>
             </div>
+            <!-- Why the aerial photo is missing, when the server turned it away -->
+            <p class="est-sv-msg" id="est3dMsg" style="display:none"></p>
             <div class="est-3d-bar">
               <span class="est-3d-hint">Drag to look around · scroll or pinch to zoom</span>
               <button class="btn ghost sm" id="est3dSave" type="button">Save picture</button>
@@ -177,6 +201,8 @@
             <p class="est-min" id="estMinNote" style="display:none">
               A minimum job charge has been applied.
             </p>
+            <!-- Why there is no fresh price, when the server turned the pricing away -->
+            <p class="est-min" id="estPriceNote" style="display:none;color:var(--red)"></p>
           </div>
 
           <p class="est-foot" id="estFootnote"></p>
@@ -198,6 +224,10 @@
         <p class="status-sub">
           Your request is with our office. We will be in touch to confirm the
           details and give you a firm price.
+        </p>
+        <!-- The total as filed, from the server's reply -->
+        <p class="status-sub" id="estDoneTotalLine" style="display:none">
+          Your estimate is <strong id="estDoneTotal"></strong>.
         </p>
         <p class="status-sub" style="margin-bottom:0">
           Your reference is <strong id="estRef"></strong>.
@@ -233,6 +263,7 @@
       </div>
     </div>
 
+    <script src="/snappy.js"></script>
     <script src="/estimate.js"></script>
     <script src="/theme.js"></script>
   </body>

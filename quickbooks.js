@@ -23,8 +23,11 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const { store } = require('./db');
 const secrets = require('./secrets');
+// The same cent-exact line amounts as the invoice on screen and the PDF.
+const docTotals = require('./public/totals');
 
 const SETTINGS_ID = 'quickbooks';
 const SCOPE = 'com.intuit.quickbooks.accounting';
@@ -44,6 +47,12 @@ const TOKEN_SKEW_MS = 5 * 60 * 1000;
 // A sync holds a lock for this long. Two crons (or a cron racing an admin
 // clicking "Sync now") must not both create the same TimeActivity.
 const LOCK_MS = 5 * 60 * 1000;
+// No single call to Intuit may hang a request (or a serverless function) open.
+const FETCH_TIMEOUT_MS = 20000;
+// The OAuth tokens are sealed with their own key (see secrets.js): the refresh
+// token is a standing key to the company's books, so a copy of the database
+// alone must not be enough to use it.
+const TOKEN_PURPOSE = 'quickbooks-token';
 
 // Same timezone rule as server.js: a punch belongs to the local calendar day it
 // started on, which is how the timesheet and CSV export already count it.
@@ -55,6 +64,19 @@ const dayFormatter = new Intl.DateTimeFormat('en-CA', {
   day: '2-digit',
 });
 const localDay = (d) => dayFormatter.format(new Date(d));
+
+// The calendar day a stored date stands for. A date picked in the app (an
+// invoice's due date, a quote's "valid until") is saved as that day's midnight
+// UTC, so its day is the one written in it — moving it through Ontario's
+// timezone would land on the day before. Anything with a real time of day is a
+// moment, and its day is the local one.
+const calendarDay = (d) => {
+  if (d == null) return null;
+  const dt = new Date(d);
+  if (isNaN(dt)) return null;
+  const s = dt.toISOString();
+  return s.endsWith('T00:00:00.000Z') ? s.slice(0, 10) : localDay(dt);
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -169,22 +191,10 @@ async function saveCredentials(patch) {
   const moved = after.clientId !== before.clientId || after.production !== before.production;
   const doc = await loadDoc();
   if (moved && doc && doc.refresh_token) {
-    await store.settings.updateOne(
-      { _id: SETTINGS_ID },
-      {
-        $unset: {
-          access_token: '',
-          access_token_expires_at: '',
-          refresh_token: '',
-          refresh_token_expires_at: '',
-          realm_id: '',
-          company_name: '',
-          connected_at: '',
-          connected_by: '',
-        },
-      }
-    );
-    await store.qboTime.deleteMany({});
+    // What was pushed is kept: connecting again decides whether it still
+    // applies (same company) or must be forgotten (another company, e.g. live
+    // books after the sandbox) — see exchangeCode.
+    await store.settings.updateOne({ _id: SETTINGS_ID }, { $unset: CONNECTION_FIELDS });
   }
   return { ...(await getStatus()), disconnected: moved && !!(doc && doc.refresh_token) };
 }
@@ -228,9 +238,58 @@ const DEFAULTS = {
 
 const SETTING_KEYS = Object.keys(DEFAULTS);
 
+// The settings doc with its tokens opened for use. A doc written before
+// tokens were sealed still holds them in the clear: they are sealed on the
+// spot, and the clear copies removed.
 async function loadDoc() {
-  return (await store.settings.findOne({ _id: SETTINGS_ID })) || null;
+  const doc = await store.settings.findOne({ _id: SETTINGS_ID });
+  if (!doc) return null;
+  if (doc.access_token || doc.refresh_token) {
+    const sealed = sealTokens({ access_token: doc.access_token, refresh_token: doc.refresh_token });
+    try {
+      await store.settings.updateOne(
+        { _id: SETTINGS_ID, refresh_token: doc.refresh_token },
+        { $set: sealed, $unset: { access_token: '', refresh_token: '' } }
+      );
+    } catch (err) {
+      console.error('QuickBooks: could not seal the stored tokens:', err.message);
+    }
+    return { ...doc, ...sealed };
+  }
+  const refresh = doc.refresh_token_enc ? secrets.decrypt(TOKEN_PURPOSE, doc.refresh_token_enc) : null;
+  return {
+    ...doc,
+    access_token: doc.access_token_enc ? secrets.decrypt(TOKEN_PURPOSE, doc.access_token_enc) : null,
+    refresh_token: refresh,
+    // Stored but unreadable (the server's secret changed): connect again.
+    tokens_unreadable: !!(doc.refresh_token_enc && !refresh),
+  };
 }
+
+// Token fields as stored: the two tokens sealed, everything else as given.
+function sealTokens(fields) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (k === 'access_token' || k === 'refresh_token') {
+      if (v) out[k + '_enc'] = secrets.encrypt(TOKEN_PURPOSE, v);
+    } else out[k] = v;
+  }
+  return out;
+}
+
+// Everything that ties us to a connected company, for clearing on disconnect.
+const CONNECTION_FIELDS = {
+  access_token: '',
+  access_token_enc: '',
+  access_token_expires_at: '',
+  refresh_token: '',
+  refresh_token_enc: '',
+  refresh_token_expires_at: '',
+  realm_id: '',
+  company_name: '',
+  connected_at: '',
+  connected_by: '',
+};
 
 function settingsOf(doc) {
   const out = { ...DEFAULTS };
@@ -389,6 +448,7 @@ async function tokenRequest(body) {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: new URLSearchParams(body).toString(),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   const text = await res.text();
   let data = null;
@@ -422,23 +482,50 @@ function tokenFields(data) {
   return fields;
 }
 
+// Everything we hold that names records in a company: which hours were pushed
+// (and their QuickBooks ids), each invoice's QuickBooks id and payments, each
+// employee's match. Ids only mean something inside the company that issued
+// them — a sandbox invoice 146 is somebody else's invoice 146 in the live
+// books — so when the connection moves to another company all of it is set
+// aside (kept for reference, never used) before a single call goes there.
+async function forgetCompany() {
+  await store.qboTime.deleteMany({});
+  await store.invoices.updateMany({ qbo: { $type: 'object' } }, [
+    { $set: { qbo_previous_company: '$qbo' } },
+    { $unset: 'qbo' },
+  ]);
+  await store.employees.updateMany({ qbo_employee_id: { $exists: true } }, [
+    { $set: { qbo_employee_previous: '$qbo_employee_id' } },
+    { $unset: ['qbo_employee_id', 'qbo_realm_id'] },
+  ]);
+}
+
 // Finish the OAuth handshake and remember the company we're connected to.
 async function exchangeCode({ code, realmId, redirectUri, actor }) {
+  const before = await loadDoc();
   const data = await tokenRequest({
     grant_type: 'authorization_code',
     code,
     redirect_uri: redirectUri,
   });
+  // Another company than the last one connected: forget the old one's ids.
+  // The same company again (a reconnect) keeps everything.
+  const previous = before && (before.last_realm_id || before.realm_id);
+  if (previous && String(previous) !== String(realmId)) await forgetCompany();
   await store.settings.updateOne(
     { _id: SETTINGS_ID },
     {
       $set: {
-        ...tokenFields(data),
+        ...sealTokens(tokenFields(data)),
         realm_id: String(realmId),
+        // Kept through a disconnect, so a later connection can tell whether it
+        // reached the same company.
+        last_realm_id: String(realmId),
         connected_at: new Date(),
         connected_by: actor || null,
         last_error: null,
       },
+      $unset: { access_token: '', refresh_token: '' },
     },
     { upsert: true }
   );
@@ -454,7 +541,15 @@ async function exchangeCode({ code, realmId, redirectUri, actor }) {
   return getStatus();
 }
 
-async function refreshTokens(doc) {
+// One refresh at a time in this copy of the app: two calls that both find the
+// token expired (the items and tax-code pickers load together) share it.
+let refreshing = null;
+function refreshTokens(doc) {
+  if (!refreshing) refreshing = doRefresh(doc).finally(() => (refreshing = null));
+  return refreshing;
+}
+
+async function doRefresh(doc) {
   if (!doc || !doc.refresh_token)
     throw new QuickBooksError('QuickBooks is not connected.', { status: 409 });
   if (doc.refresh_token_expires_at && new Date(doc.refresh_token_expires_at) <= new Date())
@@ -467,13 +562,25 @@ async function refreshTokens(doc) {
     refresh_token: doc.refresh_token,
   });
   const fields = tokenFields(data);
-  await store.settings.updateOne({ _id: SETTINGS_ID }, { $set: fields });
+  // Written only over the token this refresh started from. Intuit rotates the
+  // refresh token, so if another copy of the app refreshed first, its newer
+  // token is the one to keep — take that instead of overwriting it.
+  const r = await store.settings.updateOne(
+    { _id: SETTINGS_ID, refresh_token_enc: doc.refresh_token_enc },
+    { $set: sealTokens(fields) }
+  );
+  if (!r.matchedCount) return loadDoc();
   return { ...doc, ...fields };
 }
 
 // A valid access token plus the realm to call against, refreshing if needed.
 async function auth() {
   let doc = await loadDoc();
+  if (doc && doc.tokens_unreadable)
+    throw new QuickBooksError(
+      "The saved QuickBooks connection can't be read any more (the server's secret changed). Connect again.",
+      { status: 409 }
+    );
   if (!doc || !doc.refresh_token || !doc.realm_id)
     throw new QuickBooksError('QuickBooks is not connected.', { status: 409 });
   const expires = doc.access_token_expires_at ? new Date(doc.access_token_expires_at).getTime() : 0;
@@ -498,6 +605,7 @@ async function disconnect() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ token: doc.refresh_token }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
     } catch (err) {
       console.error('QuickBooks: revoke failed, clearing local tokens anyway:', err.message);
@@ -505,40 +613,38 @@ async function disconnect() {
   }
   await store.settings.updateOne(
     { _id: SETTINGS_ID },
-    {
-      $unset: {
-        access_token: '',
-        access_token_expires_at: '',
-        refresh_token: '',
-        refresh_token_expires_at: '',
-        realm_id: '',
-        company_name: '',
-        connected_at: '',
-        connected_by: '',
-        sync_lock: '',
-      },
-    },
+    { $unset: { ...CONNECTION_FIELDS, sync_lock: '', sync_lock_owner: '' } },
     { upsert: true }
   );
-  // Pushed-record bookkeeping points at a company we can no longer reach.
-  await store.qboTime.deleteMany({});
+  // What was pushed is kept on purpose. Reconnecting the same company picks up
+  // where this left off — wiping it would make the next sync of a period
+  // already in QuickBooks push every hour a second time. Connecting a
+  // different company clears it then (see exchangeCode).
 }
 
 // ---------------------------------------------------------------------------
 // API calls
 // ---------------------------------------------------------------------------
 
-async function apiCall(path, { method = 'GET', body = null, retry = true } = {}) {
+// requestId: a write sent again with the same id is answered with the result
+// of the first one instead of being done twice — how a retry after a timeout
+// (the write landed, the answer didn't) avoids a duplicate.
+async function apiCall(path, { method = 'GET', body = null, retry = true, requestId = null } = {}) {
   const { token } = await auth();
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/json',
   };
   if (body) headers['Content-Type'] = 'application/json';
-  const res = await fetch((await creds()).apiBase + path, {
+  const url =
+    (await creds()).apiBase +
+    path +
+    (requestId ? (path.includes('?') ? '&' : '?') + 'requestid=' + encodeURIComponent(requestId) : '');
+  const res = await fetch(url, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   // A 401 here means the access token died early (revoked, or refreshed by a
@@ -546,7 +652,7 @@ async function apiCall(path, { method = 'GET', body = null, retry = true } = {})
   if (res.status === 401 && retry) {
     const doc = await loadDoc();
     await refreshTokens(doc);
-    return apiCall(path, { method, body, retry: false });
+    return apiCall(path, { method, body, retry: false, requestId });
   }
 
   const text = await res.text();
@@ -557,10 +663,12 @@ async function apiCall(path, { method = 'GET', body = null, retry = true } = {})
     data = null;
   }
   if (!res.ok) {
-    throw new QuickBooksError(`QuickBooks rejected the request (${res.status}).`, {
+    const err = new QuickBooksError(`QuickBooks rejected the request (${res.status}).`, {
       status: res.status === 429 ? 429 : 502,
       detail: faultMessage(data) || text.slice(0, 400),
     });
+    err.code = faultCode(data);
+    throw err;
   }
   return data;
 }
@@ -570,6 +678,19 @@ const apiGet = (path) => apiCall(withMinorVersion(path));
 function withMinorVersion(path) {
   return path + (path.includes('?') ? '&' : '?') + 'minorversion=' + MINOR_VERSION;
 }
+
+// Intuit's fault code for an error (e.g. "610" object not found, "5010" stale
+// object — someone changed it since we read it).
+function faultCode(data) {
+  const fault = data && (data.Fault || data.fault);
+  const errors = (fault && fault.Error) || [];
+  return errors.length ? String(errors[0].code || '') : '';
+}
+
+// True when a failed call means "that record isn't there" (deleted in
+// QuickBooks, or an id from another company).
+const isNotFound = (err) =>
+  !!err && (err.code === '610' || /object not found/i.test(String(err.detail || '')));
 
 // Pull the human-readable part out of Intuit's nested fault envelope.
 function faultMessage(data) {
@@ -621,38 +742,66 @@ async function listQboTaxCodes() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Escape a value for QuickBooks' query language (single quotes are the risk).
-const qEscape = (s) => String(s || '').replace(/'/g, "\\'");
+// Escape a value for QuickBooks' query language: backslashes first (a name
+// ending in one would otherwise eat the closing quote), then single quotes.
+const qEscape = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
 // Find the customer by the name on the invoice, creating them if QuickBooks
 // has never seen them. Matching on display name is what a person would do, and
 // it keeps a repeat customer from being duplicated on every invoice.
-async function findOrCreateCustomer(customer) {
+async function findOrCreateCustomer(customer, { knownId = null } = {}) {
   const name = String((customer && customer.name) || '').trim();
   if (!name) throw new QuickBooksError('The invoice needs a customer name before it can be sent.');
+  const view = (c, created) => ({
+    id: String(c.Id),
+    name: c.DisplayName,
+    email: (c.PrimaryEmailAddr && c.PrimaryEmailAddr.Address) || null,
+    created,
+  });
 
   const { realmId } = await auth();
+  // The customer this invoice was pushed for before, when it's still there:
+  // two different "John Smith"s each keep their own.
+  if (knownId) {
+    try {
+      const c = (await apiGet(`/v3/company/${realmId}/customer/${encodeURIComponent(knownId)}`)).Customer;
+      if (c && c.Active !== false) return view(c, false);
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+  }
+  // Inactive customers too: one made inactive in QuickBooks still holds the
+  // name, and creating another would fail on it.
   const found = await runQuery(
-    `select Id, DisplayName, PrimaryEmailAddr from Customer where DisplayName = '${qEscape(name)}'`
+    `select Id, DisplayName, PrimaryEmailAddr, Active, SyncToken from Customer where DisplayName = '${qEscape(name)}' and Active in (true, false)`
   );
   const existing = (found && found.QueryResponse && found.QueryResponse.Customer) || [];
   if (existing.length) {
-    return {
-      id: String(existing[0].Id),
-      name: existing[0].DisplayName,
-      email: (existing[0].PrimaryEmailAddr && existing[0].PrimaryEmailAddr.Address) || null,
-      created: false,
-    };
+    const c = existing[0];
+    if (c.Active === false)
+      await apiCall(withMinorVersion(`/v3/company/${realmId}/customer`), {
+        method: 'POST',
+        body: { Id: String(c.Id), SyncToken: String(c.SyncToken), sparse: true, Active: true },
+      });
+    return view(c, false);
   }
 
   const body = { DisplayName: name };
   if (customer.email) body.PrimaryEmailAddr = { Address: customer.email };
   if (customer.phone) body.PrimaryPhone = { FreeFormNumber: customer.phone };
   if (customer.address) body.BillAddr = { Line1: customer.address };
-  const made = await apiCall(withMinorVersion(`/v3/company/${realmId}/customer`), {
-    method: 'POST',
-    body,
-  });
+  let made;
+  try {
+    made = await apiCall(withMinorVersion(`/v3/company/${realmId}/customer`), { method: 'POST', body });
+  } catch (err) {
+    // A vendor or an employee already has that exact name — QuickBooks keeps
+    // names unique across all three. Tell the two apart instead of failing.
+    if (err.code !== '6240') throw err;
+    made = await apiCall(withMinorVersion(`/v3/company/${realmId}/customer`), {
+      method: 'POST',
+      body: { ...body, DisplayName: `${name} (customer)`.slice(0, 100) },
+    });
+  }
   const c = made && made.Customer;
   if (!c) throw new QuickBooksError('QuickBooks did not return the new customer.');
   return {
@@ -669,7 +818,9 @@ function invoiceBody(inv, { customerId, itemId, taxCodeId }) {
     .map((it) => {
       const qty = Number(it.qty) || 0;
       const rate = Number(it.unit_price) || 0;
-      const amount = Math.round(qty * rate * 100) / 100;
+      // Rounded exactly as the invoice on screen rounds it (totals.js), so
+      // the two agree to the cent — 12.5 × $18.99 is $237.38 in both.
+      const amount = docTotals.lineAmount(it);
       const detail = {
         ItemRef: { value: itemId },
         Qty: qty,
@@ -694,46 +845,75 @@ function invoiceBody(inv, { customerId, itemId, taxCodeId }) {
     // Our own number, so the two systems can be lined up by eye.
     DocNumber: String(inv.number || '').slice(0, 21),
   };
-  if (inv.issue_date) body.TxnDate = localDay(inv.issue_date);
-  if (inv.due_date) body.DueDate = localDay(inv.due_date);
+  if (inv.issue_date) body.TxnDate = calendarDay(inv.issue_date);
+  if (inv.due_date) body.DueDate = calendarDay(inv.due_date);
   if (inv.notes) body.CustomerMemo = { value: String(inv.notes).slice(0, 1000) };
   if (inv.customer && inv.customer.email) body.BillEmail = { Address: inv.customer.email };
   if (taxCodeId) body.GlobalTaxCalculation = 'TaxExcluded';
   return body;
 }
 
-// Create (or update) the invoice in QuickBooks. Returns what happened, plus a
-// warning when QuickBooks' own total does not agree with ours.
-async function pushInvoice(inv) {
+// A fingerprint of what an invoice says, as sent to QuickBooks. Kept with the
+// push, so "Email it" can tell whether QuickBooks still has today's version.
+const contentHash = (body) => crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+// The QuickBooks record an invoice was pushed to, when it was pushed to the
+// company connected now. (Older pushes didn't note the company; for those the
+// invoice number is checked when the record is read — see pushInvoice.)
+const sameCompany = (qboState, realmId) =>
+  qboState && qboState.id && (!qboState.realm_id || String(qboState.realm_id) === String(realmId)) ? qboState : null;
+
+// The form an invoice takes in QuickBooks — what a push would send.
+async function invoiceForQbo(inv, { customerId } = {}) {
   const settings = await getSettings();
   if (!settings.invoice_item_id)
     throw new QuickBooksError(
       'Choose which QuickBooks product/service invoice lines should bill against first.'
     );
-  const { realmId } = await auth();
-  const customer = await findOrCreateCustomer(inv.customer);
-  const body = invoiceBody(inv, {
-    customerId: customer.id,
+  return invoiceBody(inv, {
+    customerId,
     itemId: settings.invoice_item_id,
     taxCodeId: settings.invoice_tax_code_id,
   });
+}
 
-  const existingId = inv.qbo && inv.qbo.id;
+// Create (or update) the invoice in QuickBooks. Returns what happened, plus a
+// warning when QuickBooks' own total does not agree with ours.
+async function pushInvoice(inv) {
+  const { realmId } = await auth();
+  const prior = sameCompany(inv.qbo, realmId);
+  const customer = await findOrCreateCustomer(inv.customer, { knownId: prior && prior.customer_id });
+  const body = await invoiceForQbo(inv, { customerId: customer.id });
+  const hash = contentHash(body);
+
+  // Updating needs the current SyncToken. And the record must really be this
+  // invoice — the id could be one kept from another company (the sandbox),
+  // naming an unrelated invoice here. Not ours, or gone: make a new one.
+  let existing = null;
+  if (prior) {
+    try {
+      existing = (await apiGet(`/v3/company/${realmId}/invoice/${encodeURIComponent(prior.id)}`)).Invoice || null;
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+    if (existing && String(existing.DocNumber || '') !== body.DocNumber) existing = null;
+  }
+
   let saved;
-  if (existingId) {
-    // Updating needs the current SyncToken, or QuickBooks refuses the write.
-    const current = await apiGet(`/v3/company/${realmId}/invoice/${existingId}`);
-    const token = current && current.Invoice && current.Invoice.SyncToken;
-    if (token == null)
-      throw new QuickBooksError('That invoice no longer exists in QuickBooks.');
+  if (existing) {
+    // sparse: change what we send and leave the rest — terms, class, a memo
+    // added in QuickBooks stay as they are. (The lines are always replaced.)
     saved = await apiCall(withMinorVersion(`/v3/company/${realmId}/invoice`), {
       method: 'POST',
-      body: { ...body, Id: String(existingId), SyncToken: String(token), sparse: false },
+      body: { ...body, Id: String(existing.Id), SyncToken: String(existing.SyncToken), sparse: true },
     });
   } else {
+    // Same invoice, same content, same request id: a retry after a timeout gets
+    // back the invoice the first attempt made instead of a second one.
     saved = await apiCall(withMinorVersion(`/v3/company/${realmId}/invoice`), {
       method: 'POST',
       body,
+      requestId: `inv-${inv.id != null ? inv.id : inv._id}-${hash.slice(0, 24)}`,
     });
   }
 
@@ -751,10 +931,93 @@ async function pushInvoice(inv) {
     doc_number: qi.DocNumber || null,
     total: theirTotal,
     balance: Number(qi.Balance) || 0,
-    updated: !!existingId,
+    updated: !!existing,
     customer: { id: customer.id, name: customer.name, created: customer.created },
     mismatch,
+    realm_id: String(realmId),
+    hash,
   };
+}
+
+// Whether QuickBooks still has the version of this invoice we have now: same
+// company, and nothing changed here since the last push.
+async function pushedIsCurrent(inv) {
+  const { realmId } = await auth();
+  const prior = sameCompany(inv.qbo, realmId);
+  if (!prior || !prior.hash || !prior.customer_id) return false;
+  const body = await invoiceForQbo(inv, { customerId: prior.customer_id });
+  return contentHash(body) === prior.hash;
+}
+
+// Record this invoice's payments in QuickBooks, linked to its invoice there,
+// so QuickBooks' balance — and the pay link in its email — match ours. Only
+// payments not sent before; each carries its own request id, so a retry never
+// records one twice. Returns { paymentId: QuickBooks payment id } for the new.
+async function pushPayments(inv, { invoiceId, customerId, known = {} }) {
+  const { realmId } = await auth();
+  const out = {};
+  for (const p of inv.payments || []) {
+    if (!p.id || known[p.id]) continue;
+    const amount = Math.round((Number(p.amount) || 0) * 100) / 100;
+    if (!(amount > 0)) continue;
+    const made = await apiCall(withMinorVersion(`/v3/company/${realmId}/payment`), {
+      method: 'POST',
+      body: {
+        CustomerRef: { value: String(customerId) },
+        TotalAmt: amount,
+        TxnDate: calendarDay(p.date) || localDay(new Date()),
+        PrivateNote: [p.method, p.note, 'via HEK Timeclock'].filter(Boolean).join(' — ').slice(0, 4000),
+        Line: [{ Amount: amount, LinkedTxn: [{ TxnId: String(invoiceId), TxnType: 'Invoice' }] }],
+      },
+      requestId: `pay-${p.id}`.slice(0, 50),
+    });
+    if (made && made.Payment) out[p.id] = String(made.Payment.Id);
+  }
+  return out;
+}
+
+// Take back a payment recorded in QuickBooks (when it is removed here). Gone
+// already is fine.
+async function deletePayment(qboPaymentId) {
+  const { realmId } = await auth();
+  let current;
+  try {
+    current = (await apiGet(`/v3/company/${realmId}/payment/${encodeURIComponent(qboPaymentId)}`)).Payment;
+  } catch (err) {
+    if (isNotFound(err)) return;
+    throw err;
+  }
+  if (!current) return;
+  await apiCall(withMinorVersion(`/v3/company/${realmId}/payment?operation=delete`), {
+    method: 'POST',
+    body: { Id: String(current.Id), SyncToken: String(current.SyncToken) },
+  });
+}
+
+// Void the invoice in QuickBooks too, so it stops being owed there (and its
+// reminders stop). Not there any more is fine.
+async function voidInvoice(qboId) {
+  const { realmId } = await auth();
+  let current;
+  try {
+    current = (await apiGet(`/v3/company/${realmId}/invoice/${encodeURIComponent(qboId)}`)).Invoice;
+  } catch (err) {
+    if (isNotFound(err)) return { voided: false, missing: true };
+    throw err;
+  }
+  if (!current) return { voided: false, missing: true };
+  await apiCall(withMinorVersion(`/v3/company/${realmId}/invoice?operation=void`), {
+    method: 'POST',
+    body: { Id: String(current.Id), SyncToken: String(current.SyncToken) },
+  });
+  return { voided: true };
+}
+
+// What QuickBooks says is still owed on an invoice.
+async function invoiceBalance(qboId) {
+  const { realmId } = await auth();
+  const qi = (await apiGet(`/v3/company/${realmId}/invoice/${encodeURIComponent(qboId)}`)).Invoice;
+  return qi ? Math.round((Number(qi.Balance) || 0) * 100) / 100 : null;
 }
 
 // Ask QuickBooks to email the invoice. This is the actual send — the message,
@@ -860,6 +1123,8 @@ function applyOvertime(days, period, settings) {
 async function buildPeriod(period, settings) {
   const employees = await store.employees.find({}, { sort: { name: 1 } }).toArray();
   const byId = new Map(employees.map((e) => [e._id, e]));
+  const doc = await loadDoc();
+  const realm = doc && (doc.realm_id || doc.last_realm_id);
 
   // Query a day wider on each side, then filter by local day — a punch started
   // late on the last evening of the period is still that day's work even
@@ -927,7 +1192,8 @@ async function buildPeriod(period, settings) {
     const split = applyOvertime(ordered, period, settings);
     const total = round2(split.reduce((s, d) => s + d.hours, 0));
 
-    if (!emp.qbo_employee_id) {
+    const qboId = matchIn(emp, realm);
+    if (!qboId) {
       warnings.push({
         kind: 'unmapped',
         employee_id: emp._id,
@@ -945,7 +1211,7 @@ async function buildPeriod(period, settings) {
     rows.push({
       employee_id: emp._id,
       name: emp.name,
-      qbo_employee_id: emp.qbo_employee_id || null,
+      qbo_employee_id: qboId,
       pay_type: emp.pay_type || '',
       hourly_rate: hourlyRateOf(emp),
       days: split,
@@ -967,6 +1233,15 @@ async function buildPeriod(period, settings) {
       hours: round2(rows.reduce((s, r) => s + r.total, 0)),
     },
   };
+}
+
+// The QuickBooks employee someone is matched to in the company connected now —
+// null when unmatched, or matched in another company (a sandbox) whose ids
+// mean nothing here.
+function matchIn(emp, realm) {
+  if (!emp || !emp.qbo_employee_id) return null;
+  if (emp.qbo_realm_id && realm && String(emp.qbo_realm_id) !== String(realm)) return null;
+  return String(emp.qbo_employee_id);
 }
 
 // pay_rate is dollars per hour for hourly staff (and per year for salary, which
@@ -1028,27 +1303,37 @@ function timeActivityBody(row, dayRow, line) {
     Minutes,
     Description: describe(dayRow, line),
   };
-  if (row.hourly_rate) body.HourlyRate = row.hourly_rate;
+  // No rate: HourlyRate is what a customer would be billed for the time, not
+  // what the employee is paid — payroll takes the pay rate from the employee
+  // in QuickBooks.
   if (line.itemId) body.PayrollItemRef = { value: String(line.itemId) };
   return body;
 }
 
 // Send up to BATCH_MAX operations in one request. Returns the response keyed by
 // the bId we assigned, so each result can be matched back to its own record.
+// The request id comes from the operations themselves: the same batch sent
+// again (a retry after the reply was lost) is answered from the first try.
 async function sendBatch(ops) {
   const { realmId } = await auth();
+  const requestId =
+    'tb-' +
+    crypto.createHash('sha256').update(String(realmId) + JSON.stringify(ops)).digest('hex').slice(0, 40);
   const data = await apiCall(withMinorVersion(`/v3/company/${realmId}/batch`), {
     method: 'POST',
     body: { BatchItemRequest: ops },
+    requestId,
   });
   const out = new Map();
   for (const item of (data && data.BatchItemResponse) || []) out.set(item.bId, item);
   return out;
 }
 
-// Take out the sync lock. Returns false when another sync already holds it.
-// A lock older than LOCK_MS is treated as abandoned — a serverless function
-// killed mid-sync would otherwise wedge payroll shut until someone noticed.
+// One sync at a time. The lock carries an owner so only the sync that took it
+// renews or releases it, and it is renewed between batches, so a long sync is
+// never mistaken for an abandoned one. A lock older than LOCK_MS is treated as
+// abandoned — a serverless function killed mid-sync would otherwise wedge
+// payroll shut until someone noticed. Returns the owner token, or null.
 async function acquireLock() {
   const cutoff = new Date(Date.now() - LOCK_MS);
   // The conditional update below can only match a doc that exists.
@@ -1057,26 +1342,160 @@ async function acquireLock() {
     { $setOnInsert: { created_at: new Date() } },
     { upsert: true }
   );
+  const owner = crypto.randomUUID();
   const r = await store.settings.updateOne(
     { _id: SETTINGS_ID, $or: [{ sync_lock: null }, { sync_lock: { $lte: cutoff } }] },
-    { $set: { sync_lock: new Date() } }
+    { $set: { sync_lock: new Date(), sync_lock_owner: owner } }
   );
-  return r.matchedCount === 1;
+  return r.matchedCount === 1 ? owner : null;
+}
+const renewLock = (owner) =>
+  store.settings.updateOne({ _id: SETTINGS_ID, sync_lock_owner: owner }, { $set: { sync_lock: new Date() } });
+const releaseLock = (owner) =>
+  store.settings.updateOne(
+    { _id: SETTINGS_ID, sync_lock_owner: owner },
+    { $unset: { sync_lock: '', sync_lock_owner: '' } }
+  );
+
+// What we pushed is filed by employee, day and kind of hours — not by pay
+// period, so changing the pay schedule can't make the same day look unpushed.
+const timeKey = (employeeId, day, kind) => `${employeeId}|${day}|${kind}`;
+
+// Note what QuickBooks holds for one of our lines.
+async function recordTime(o, ta, realmId) {
+  await store.qboTime.updateOne(
+    { _id: o.doc ? o.doc._id : o.key },
+    {
+      $set: {
+        employee_id: o.row.employee_id,
+        day: o.dayRow.day,
+        kind: o.line.kind,
+        hours: o.line.hours,
+        item_id: String(o.line.itemId || ''),
+        description: o.body.Description,
+        hourly_rate: null,
+        qbo_employee_id: String(o.row.qbo_employee_id),
+        qbo_id: String(ta.Id || (o.doc && o.doc.qbo_id) || ''),
+        sync_token: String(ta.SyncToken != null ? ta.SyncToken : '0'),
+        realm_id: String(realmId),
+        pushed_at: new Date(),
+      },
+    },
+    { upsert: true }
+  );
 }
 
-const releaseLock = () => store.settings.updateOne({ _id: SETTINGS_ID }, { $unset: { sync_lock: '' } });
+// Entries a run cut off part-way had already made in QuickBooks before it could
+// note them: found by what they say (employee, date, hours, payroll item and
+// our own description, which ends "via HEK Timeclock") and adopted, so the
+// next run updates them instead of creating each one twice. Returns how many.
+async function adoptExisting(period, ops, realmId) {
+  const sig = (emp, date, hours, minutes, item, desc) =>
+    [emp, date, Number(hours) || 0, Number(minutes) || 0, item || '', desc || ''].join('|');
+  const there = new Map();
+  for (let start = 1; ; start += 1000) {
+    const data = await runQuery(
+      `select * from TimeActivity where TxnDate >= '${period.start}' and TxnDate <= '${period.end}' startposition ${start} maxresults 1000`
+    );
+    const rows = (data && data.QueryResponse && data.QueryResponse.TimeActivity) || [];
+    for (const t of rows) {
+      if (!String(t.Description || '').includes('via HEK Timeclock')) continue;
+      const k = sig(
+        t.EmployeeRef && t.EmployeeRef.value,
+        t.TxnDate,
+        t.Hours,
+        t.Minutes,
+        t.PayrollItemRef && t.PayrollItemRef.value,
+        t.Description
+      );
+      if (!there.has(k)) there.set(k, t);
+    }
+    if (rows.length < 1000) break;
+  }
+  if (!there.size) return 0;
+  // An entry already on file is ours already; it can't be adopted again.
+  const held = new Set(
+    (await store.qboTime.find({ qbo_id: { $in: [...there.values()].map((t) => String(t.Id)) } }).toArray()).map(
+      (d) => d.qbo_id
+    )
+  );
+  let n = 0;
+  for (const o of ops) {
+    if (o.op !== 'create') continue;
+    const b = o.body;
+    const k = sig(b.EmployeeRef.value, b.TxnDate, b.Hours, b.Minutes, b.PayrollItemRef && b.PayrollItemRef.value, b.Description);
+    const t = there.get(k);
+    if (!t || held.has(String(t.Id))) continue;
+    there.delete(k);
+    held.add(String(t.Id));
+    await recordTime(o, t, realmId);
+    o.adopted = true;
+    n++;
+  }
+  return n;
+}
+
+// Everyone the sync currently pays attention to: hourly (not salaried), and
+// matched to an employee the connected company actually has.
+async function qualifyingEmployees(known, realm) {
+  const out = new Set();
+  for (const e of await store.employees.find({}).toArray()) {
+    const id = matchIn(e, realm);
+    if ((e.pay_type || '') !== 'Salary' && id && known.has(id)) out.add(e._id);
+  }
+  return out;
+}
+
+// One operation, on its own — for the ones a batch couldn't do as it stood.
+async function singleTimeOp(op, body) {
+  const { realmId } = await auth();
+  const path = op === 'delete' ? '/timeactivity?operation=delete' : '/timeactivity';
+  const data = await apiCall(withMinorVersion(`/v3/company/${realmId}${path}`), { method: 'POST', body });
+  return (data && data.TimeActivity) || {};
+}
+
+// A batch item QuickBooks refused because of something done in QuickBooks
+// since: an entry edited there (stale SyncToken) is re-read and written again;
+// one deleted there is made again, or — if we were deleting it — is done.
+// Returns the TimeActivity on success, null when there's nothing to record
+// (a delete), or throws with the reason.
+async function recoverTimeOp(o, code) {
+  const { realmId } = await auth();
+  if (code === '610') {
+    if (o.op === 'delete') return null;
+    const fresh = { ...o.body };
+    delete fresh.Id;
+    delete fresh.SyncToken;
+    delete fresh.sparse;
+    return singleTimeOp('create', fresh);
+  }
+  // 5010: read the entry's current version and write ours over it.
+  const current = (await apiGet(`/v3/company/${realmId}/timeactivity/${encodeURIComponent(o.doc.qbo_id)}`))
+    .TimeActivity;
+  if (!current) throw new QuickBooksError('That entry is no longer in QuickBooks.');
+  return singleTimeOp(o.op, { ...o.body, Id: String(current.Id), SyncToken: String(current.SyncToken) });
+}
+
+// Warnings that mean "something here can still change and should go over
+// later" — the scheduled run tries again while any are left.
+const BLOCKING_WARNINGS = new Set(['open_punch', 'unmapped', 'unknown_qbo_employee']);
 
 // Push a period's hours into QuickBooks.
 //
 // Re-running is safe and is the normal way to correct a timesheet: every
 // pushed record is remembered locally with its QuickBooks id and SyncToken, so
 // a second run updates what changed, deletes what no longer has hours, and
-// leaves the rest alone rather than creating duplicates.
-async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
+// leaves the rest alone rather than creating duplicates. A run stops between
+// batches when its time budget is nearly spent (a serverless function has a
+// hard limit); the next run picks up from there.
+async function syncPeriod(period, { actor = null, trigger = 'manual', budgetMs = 45000 } = {}) {
+  const started = Date.now();
   const settings = await getSettings();
+  const { realmId } = await auth();
   const report = await buildPeriod(period, settings);
 
-  if (!(await acquireLock()))
+  const owner = await acquireLock();
+  if (!owner)
     throw new QuickBooksError('Another sync is already running. Try again in a minute.', {
       status: 409,
     });
@@ -1091,6 +1510,8 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
     updated: 0,
     deleted: 0,
     unchanged: 0,
+    adopted: 0,
+    kept: 0,
     failed: 0,
     hours: report.totals.hours,
     regular: report.totals.regular,
@@ -1098,30 +1519,44 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
     employees: 0,
     warnings: report.warnings,
     errors: [],
+    realm_id: String(realmId),
   };
 
   try {
+    // Who QuickBooks actually has. A match to an id it doesn't know (removed
+    // there, or from another company) would put hours on nobody — or on the
+    // wrong person — so those are held back until matched again.
+    const known = new Set((await listQboEmployees()).map((e) => e.id));
+    for (const row of report.employees) {
+      if (row.qbo_employee_id && !known.has(String(row.qbo_employee_id))) {
+        result.warnings.push({
+          kind: 'unknown_qbo_employee',
+          employee_id: row.employee_id,
+          message: `${row.name} is matched to a QuickBooks employee this company doesn't have. Match them again on the QuickBooks tab.`,
+        });
+        row.qbo_employee_id = null;
+      }
+    }
     const pushable = report.employees.filter((r) => r.qbo_employee_id);
     result.employees = pushable.length;
 
-    // Everything we previously pushed for this period. Anything still here at
-    // the end no longer has hours behind it and must be removed from
-    // QuickBooks — otherwise a deleted punch would stay paid.
+    // Everything pushed before for these days, found by day — whichever pay
+    // schedule it was pushed under.
     const stale = new Map();
-    for (const doc of await store.qboTime.find({ period_start: period.start }).toArray())
-      stale.set(doc._id, doc);
+    for (const doc of await store.qboTime.find({ day: { $gte: period.start, $lte: period.end } }).toArray())
+      stale.set(timeKey(doc.employee_id, doc.day, doc.kind), doc);
 
-    const ops = []; // { op, key, doc, body, kind }
+    const ops = []; // { op, key, doc, body, row, dayRow, line }
     for (const row of pushable) {
       for (const dayRow of row.days) {
         for (const line of linesFor(dayRow, settings)) {
-          const key = `${period.start}|${row.employee_id}|${dayRow.day}|${line.kind}`;
-          const existing = stale.get(key);
+          const key = timeKey(row.employee_id, dayRow.day, line.kind);
+          const existing = stale.get(key) || null;
           stale.delete(key);
           const body = timeActivityBody(row, dayRow, line);
 
           if (!existing || !existing.qbo_id) {
-            ops.push({ op: 'create', key, body, row, dayRow, line });
+            ops.push({ op: 'create', key, doc: existing, body, row, dayRow, line });
             continue;
           }
           // Nothing changed since the last push — skip the round trip.
@@ -1129,8 +1564,7 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
             existing.hours === line.hours &&
             existing.qbo_employee_id === String(row.qbo_employee_id) &&
             existing.description === body.Description &&
-            existing.item_id === String(line.itemId || '') &&
-            existing.hourly_rate === (row.hourly_rate || null)
+            existing.item_id === String(line.itemId || '')
           ) {
             result.unchanged++;
             continue;
@@ -1148,22 +1582,49 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
       }
     }
 
-    // Whatever is left in `stale` was pushed before and shouldn't exist now.
+    // Pushed before, with no hours behind them now. Removed from QuickBooks
+    // only for someone the sync still covers — their punch was deleted or
+    // moved. Anyone else (moved onto salary, unmatched, deleted here) keeps
+    // what was pushed: those hours may already have been paid, and only a
+    // person can say what should happen to them.
+    const covered = await qualifyingEmployees(known, realmId);
+    const keptFor = new Set();
     for (const [key, doc] of stale) {
       if (!doc.qbo_id) {
-        await store.qboTime.deleteOne({ _id: key });
+        await store.qboTime.deleteOne({ _id: doc._id });
         continue;
       }
-      ops.push({
-        op: 'delete',
-        key,
-        doc,
-        body: { Id: doc.qbo_id, SyncToken: doc.sync_token },
+      if (!covered.has(doc.employee_id)) {
+        result.kept++;
+        keptFor.add(doc.employee_id);
+        continue;
+      }
+      ops.push({ op: 'delete', key, doc, body: { Id: doc.qbo_id, SyncToken: doc.sync_token } });
+    }
+    for (const id of keptFor) {
+      const emp = await store.employees.findOne({ _id: id });
+      result.warnings.push({
+        kind: 'kept',
+        employee_id: id,
+        message: `${emp ? emp.name : `Employee #${id}`}'s hours already in QuickBooks for this period were left as they are — the sync no longer covers them. Change them in QuickBooks if they need to.`,
       });
     }
 
-    for (let i = 0; i < ops.length; i += BATCH_MAX) {
-      const chunk = ops.slice(i, i + BATCH_MAX);
+    // Creates QuickBooks already has, from a run cut off before it could note
+    // them, are adopted instead of made twice.
+    if (ops.some((o) => o.op === 'create')) result.adopted = await adoptExisting(period, ops, realmId);
+    const todo = ops.filter((o) => !o.adopted);
+
+    for (let i = 0; i < todo.length; i += BATCH_MAX) {
+      if (Date.now() - started > budgetMs) {
+        result.incomplete = true;
+        result.errors.push({
+          message: `Stopped with ${todo.length - i} entr${todo.length - i === 1 ? 'y' : 'ies'} still to go, to stay inside the time limit. Sync again to finish — nothing goes over twice.`,
+        });
+        break;
+      }
+      await renewLock(owner);
+      const chunk = todo.slice(i, i + BATCH_MAX);
       const responses = await sendBatch(
         chunk.map((o, n) => ({ bId: String(n), operation: o.op, TimeActivity: o.body }))
       );
@@ -1171,57 +1632,57 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
       for (let n = 0; n < chunk.length; n++) {
         const o = chunk[n];
         const res = responses.get(String(n));
-        const fault = res && res.Fault ? faultMessage(res) : null;
-        if (!res || fault) {
-          result.failed++;
-          result.errors.push({
-            employee: o.row ? o.row.name : null,
-            day: o.dayRow ? o.dayRow.day : null,
-            message: fault || 'QuickBooks returned no result for this entry.',
-          });
-          continue;
+        let ta = res && !res.Fault ? res.TimeActivity || {} : null;
+        if (!ta) {
+          const code = res && res.Fault ? faultCode(res) : '';
+          if ((code === '5010' || code === '610') && o.op !== 'create') {
+            try {
+              ta = await recoverTimeOp(o, code);
+              if (ta === null) {
+                await store.qboTime.deleteOne({ _id: o.doc._id });
+                result.deleted++;
+                continue;
+              }
+            } catch (err) {
+              ta = null;
+              res.recoverError = err.detail || err.message;
+            }
+          }
+          if (!ta) {
+            result.failed++;
+            result.errors.push({
+              employee: o.row ? o.row.name : null,
+              day: o.dayRow ? o.dayRow.day : (o.doc && o.doc.day) || null,
+              message:
+                (res && res.recoverError) ||
+                (res && res.Fault ? faultMessage(res) : null) ||
+                'QuickBooks returned no result for this entry.',
+            });
+            continue;
+          }
         }
-        const ta = res.TimeActivity || {};
         if (o.op === 'delete') {
-          await store.qboTime.deleteOne({ _id: o.key });
+          await store.qboTime.deleteOne({ _id: o.doc._id });
           result.deleted++;
           continue;
         }
-        await store.qboTime.updateOne(
-          { _id: o.key },
-          {
-            $set: {
-              period_start: period.start,
-              employee_id: o.row.employee_id,
-              day: o.dayRow.day,
-              kind: o.line.kind,
-              hours: o.line.hours,
-              item_id: String(o.line.itemId || ''),
-              description: o.body.Description,
-              hourly_rate: o.row.hourly_rate || null,
-              qbo_employee_id: String(o.row.qbo_employee_id),
-              qbo_id: String(ta.Id || (o.doc && o.doc.qbo_id) || ''),
-              sync_token: String(ta.SyncToken != null ? ta.SyncToken : '0'),
-              pushed_at: new Date(),
-            },
-          },
-          { upsert: true }
-        );
+        await recordTime(o, ta, realmId);
         if (o.op === 'create') result.created++;
         else result.updated++;
       }
     }
   } finally {
-    await releaseLock();
+    await releaseLock(owner);
   }
 
   result.finished_at = new Date();
-  result.ok = result.failed === 0;
+  result.blocking = result.warnings.filter((w) => BLOCKING_WARNINGS.has(w.kind)).length;
+  result.ok = result.failed === 0 && !result.incomplete;
   const _id = await store.nextId('qbo_runs');
   await store.qboRuns.insertOne({ _id, ...result });
   await store.settings.updateOne(
     { _id: SETTINGS_ID },
-    { $set: { last_run: { ...result, _id } } },
+    { $set: { last_run: { ...result, _id }, ...(result.ok ? { last_error: null } : {}) } },
     { upsert: true }
   );
   return { ...result, _id };
@@ -1234,7 +1695,7 @@ async function syncPeriod(period, { actor = null, trigger = 'manual' } = {}) {
 async function getStatus() {
   const doc = await loadDoc();
   const settings = settingsOf(doc);
-  const connected = !!(doc && doc.refresh_token && doc.realm_id);
+  const connected = !!(doc && doc.refresh_token && doc.realm_id && !doc.tokens_unreadable);
   const c = await creds();
   const status = {
     configured: !!(c.clientId && c.clientSecret),
@@ -1266,7 +1727,10 @@ async function getStatus() {
     status.needs.push('The saved Client Secret can no longer be read — enter it again.');
   else if (!c.clientId) status.needs.push('Add the Intuit app Client ID.');
   else if (!c.clientSecret) status.needs.push('Add the Intuit app Client Secret.');
-  if (status.configured && !connected) status.needs.push('Connect the QuickBooks company.');
+  if (doc && doc.tokens_unreadable)
+    status.needs.push("The saved connection can't be read any more (the server's secret changed) — connect again.");
+  else if (status.configured && !connected) status.needs.push('Connect the QuickBooks company.');
+  if (doc && doc.last_error) status.needs.push(`The last push to QuickBooks failed: ${doc.last_error}`);
   if (!settings.period_anchor) status.needs.push('Set the pay period start date.');
 
   if (settings.period_anchor) {
@@ -1287,7 +1751,11 @@ async function getStatus() {
 // The daily cron. It looks for a pay period that has just closed and pushes it
 // once — running again the same day finds the work already done and does
 // nothing, so a retry is free.
-async function runScheduledSync() {
+async function runScheduledSync({ budgetMs } = {}) {
+  // The client's own switch for the feature: with QuickBooks turned off,
+  // nothing goes to the books on a timer either. (Read fresh, not cached.)
+  const ent = await store.settings.findOne({ _id: 'entitlements' });
+  if (ent && ent.features && ent.features.quickbooks === false) return { skipped: 'feature_off' };
   const settings = await getSettings();
   const doc = await loadDoc();
   if (!doc || !doc.refresh_token) return { skipped: 'not_connected' };
@@ -1301,14 +1769,41 @@ async function runScheduledSync() {
   const age = daysBetween(period.end, today);
   if (age > settings.auto_window_days) return { skipped: 'nothing_due', period };
 
-  const already = await store.qboRuns.findOne(
-    { start: period.start, ok: true },
-    { sort: { _id: -1 } }
-  );
-  if (already) return { skipped: 'already_synced', period, run_id: already._id };
+  // Done means a clean run made after the period had closed, with nothing left
+  // out for a reason that can still change (someone still clocked in, someone
+  // not matched yet). A push made while the period was still running, or one
+  // that had to leave hours out, doesn't count: the run goes again — it never
+  // pushes the same hours twice.
+  const runs = await store.qboRuns.find({ start: period.start, ok: true }).sort({ _id: -1 }).limit(20).toArray();
+  const done = runs.find((r) => r.started_at && localDay(r.started_at) > period.end && r.blocking === 0);
+  if (done) return { skipped: 'already_synced', period, run_id: done._id };
 
-  const result = await syncPeriod(period, { trigger: 'cron' });
-  return { ran: true, period, result };
+  try {
+    const result = await syncPeriod(period, { trigger: 'cron', budgetMs });
+    return { ran: true, period, result };
+  } catch (err) {
+    // Written down, so the dashboard shows the scheduled push failing instead
+    // of an old run that looks fine.
+    const _id = await store.nextId('qbo_runs');
+    const run = {
+      _id,
+      start: period.start,
+      end: period.end,
+      trigger: 'cron',
+      started_at: new Date(),
+      finished_at: new Date(),
+      ok: false,
+      error: err.message,
+      detail: err.detail || null,
+    };
+    await store.qboRuns.insertOne(run);
+    await store.settings.updateOne(
+      { _id: SETTINGS_ID },
+      { $set: { last_run: run, last_error: [err.message, err.detail].filter(Boolean).join(' — ') } },
+      { upsert: true }
+    );
+    return { ran: false, period, error: err.message };
+  }
 }
 
 module.exports = {
@@ -1329,9 +1824,16 @@ module.exports = {
   listQboTaxCodes,
   findOrCreateCustomer,
   pushInvoice,
+  pushedIsCurrent,
+  pushPayments,
+  deletePayment,
+  voidInvoice,
+  invoiceBalance,
+  sameCompany,
   sendInvoice,
   invoiceLink,
   buildPeriod,
+  matchIn,
   // Exported so the overtime split — the one calculation here that decides
   // what somebody is paid — can be checked directly.
   applyOvertime,
@@ -1341,6 +1843,7 @@ module.exports = {
   shiftPeriod,
   lastCompletePeriod,
   localDay,
+  calendarDay,
   dayToMs,
   addDays,
 };

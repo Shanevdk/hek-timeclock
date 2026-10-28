@@ -33,6 +33,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const { sessionSecret } = require('./secrets');
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -67,12 +68,64 @@ function buildKey(prefix, id, filename) {
   return `${prefix}/${id}${ext}`;
 }
 
-// Content-Disposition with a filename that is safe in both the quoted form and
-// the RFC 5987 form, so non-ASCII names survive on phones.
+// Content-Disposition with the real name in the RFC 5987 form (filename*,
+// which every current browser reads) and a plain-ASCII stand-in in the quoted
+// form. The quoted form must be ASCII: Node refuses a header holding anything
+// past U+00FF — a curly apostrophe, an emoji, the narrow space in a Mac
+// screenshot's name — and the request dies with a 500 instead of the file.
 function disposition(filename, download) {
-  const name = String(filename || 'file').replace(/["\\\r\n]/g, '');
+  const name = String(filename || 'file').replace(/[\u0000-\u001f\u007f"\\]/g, '').trim() || 'file';
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_');
+  // encodeURIComponent leaves ' ( ) * ! alone, but RFC 5987 wants them encoded.
+  const encoded = encodeURIComponent(name).replace(/['()*!]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
   const kind = download ? 'attachment' : 'inline';
-  return `${kind}; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  return `${kind}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+// Types a browser can show without running anything: pictures, PDFs, audio,
+// video and plain text. Anything else — HTML, SVG, XML, scripts — would open as
+// a page on our own address, with the viewer's login, so it is only ever
+// handed over as a download.
+const INLINE_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+  'image/bmp',
+  'image/heic',
+  'image/heif',
+  'application/pdf',
+  'text/plain',
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/wav',
+  'audio/webm',
+  'audio/ogg',
+]);
+const baseType = (ct) => String(ct || '').split(';')[0].trim().toLowerCase();
+const inlineSafe = (ct) => INLINE_TYPES.has(baseType(ct));
+
+// How a stored file goes back out: its own type and inline only when that is
+// safe; otherwise a download of opaque bytes.
+function serving(contentType, download) {
+  if (inlineSafe(contentType)) return { contentType: baseType(contentType), download: !!download };
+  return { contentType: 'application/octet-stream', download: true };
+}
+
+// Headers for a file served from our own origin (the local driver and old
+// in-database files). nosniff stops a browser second-guessing the type, and a
+// sandbox keeps anything that does render from acting as the signed-in user.
+// (Not on PDFs: Chrome's viewer won't open a sandboxed one, and a PDF can't
+// reach the page's login anyway.)
+function guardHeaders(res, contentType) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (baseType(contentType) !== 'application/pdf')
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'");
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +222,7 @@ function s3Driver(cfg) {
     },
 
     async presignGet({ key, filename, contentType, download, ttl }) {
+      const out = serving(contentType, download);
       return getSignedUrl(
         client,
         new GetObjectCommand({
@@ -176,8 +230,8 @@ function s3Driver(cfg) {
           Key: key,
           // Set on the way out rather than at upload time, so the same object can
           // be viewed inline or forced to download from the same stored bytes.
-          ResponseContentDisposition: disposition(filename, download),
-          ResponseContentType: contentType || undefined,
+          ResponseContentDisposition: disposition(filename, out.download),
+          ResponseContentType: out.contentType,
         }),
         { expiresIn: ttl || GET_TTL }
       );
@@ -209,7 +263,16 @@ function localDriver(cfg) {
   fs.mkdirSync(staging, { recursive: true });
 
   const objectPath = (key) => path.join(objects, key.replace(/[\\/]+/g, '__'));
-  const partPath = (uploadId, n) => path.join(staging, uploadId, `part-${n}`);
+  // Both halves come out of a signed token the server minted, but they still
+  // become a path on disk, so they are held to the shapes the server mints: a
+  // UUID and a part number. Nothing else can name a file.
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const partPath = (uploadId, n) => {
+    const part = Number(n);
+    if (!UUID.test(String(uploadId)) || !Number.isInteger(part) || part < 1 || part > 10000)
+      throw Object.assign(new Error('Bad upload reference.'), { status: 400 });
+    return path.join(staging, String(uploadId), `part-${part}`);
+  };
 
   // Tokens stand in for a signature: they name exactly one operation and expire.
   function sign(payload) {
@@ -274,12 +337,13 @@ function localDriver(cfg) {
       } finally {
         await new Promise((res) => sink.end(res));
       }
-      await fsp.rm(path.join(staging, uploadId), { recursive: true, force: true });
+      await fsp.rm(path.dirname(partPath(uploadId, 1)), { recursive: true, force: true });
       return { etag: null };
     },
 
     async abortUpload({ uploadId }) {
-      await fsp.rm(path.join(staging, uploadId), { recursive: true, force: true });
+      // Through partPath's check, so only a real upload folder can be removed.
+      await fsp.rm(path.dirname(partPath(uploadId, 1)), { recursive: true, force: true });
     },
 
     async head({ key }) {
@@ -293,10 +357,11 @@ function localDriver(cfg) {
 
     async presignGet({ key, filename, contentType, download, ttl }) {
       const exp = Math.floor(Date.now() / 1000) + (ttl || GET_TTL);
+      const out = serving(contentType, download);
       return (
         '/api/storage/local/object?token=' +
         encodeURIComponent(
-          sign({ op: 'get', key, filename, ct: contentType || '', download: !!download, exp })
+          sign({ op: 'get', key, filename, ct: out.contentType, download: out.download, exp })
         )
       );
     },
@@ -325,17 +390,30 @@ function readConfig() {
 
 const cfg = readConfig();
 const s3Configured = !!(cfg.bucket && cfg.accessKeyId && cfg.secretAccessKey);
-// A serverless filesystem is read-only apart from /tmp, which is wiped between
-// invocations — so the local driver is never a silent production fallback.
+// The local driver is for a developer's machine, never a silent production
+// fallback. A serverless filesystem is read-only apart from /tmp, which is
+// wiped between invocations; a hosted server's disk (Render, Railway, Fly) is
+// writable but wiped on every deploy and restart, so files would appear to
+// save and then vanish. Either way, deployed without a bucket means uploads are
+// refused with a clear message — unless STORAGE_DRIVER=local says the host has
+// a persistent disk.
 const serverless = !!(process.env.NETLIFY || process.env.VERCEL || process.env.AWS_REGION);
+const hosted = !!(
+  process.env.RENDER ||
+  process.env.RAILWAY_ENVIRONMENT ||
+  process.env.FLY_APP_NAME ||
+  process.env.NODE_ENV === 'production'
+);
 const forced = (process.env.STORAGE_DRIVER || '').toLowerCase();
 
 let driver;
 let reason;
-if (forced === 'local' || (!s3Configured && !serverless && forced !== 's3')) {
+if (forced === 'local' || (!s3Configured && !serverless && !hosted && forced !== 's3')) {
   driver = localDriver({
     dir: process.env.STORAGE_DIR || path.join(__dirname, '.storage'),
-    secret: process.env.SESSION_SECRET || 'hek-timeclock-dev-secret-please-change',
+    // Its own key, derived from the session secret, so a storage token can
+    // never be mistaken for anything else the app signs.
+    secret: crypto.createHash('sha256').update('hek-storage-tokens|' + sessionSecret()).digest(),
   });
   reason = s3Configured
     ? 'STORAGE_DRIVER=local'
@@ -345,12 +423,13 @@ if (forced === 'local' || (!s3Configured && !serverless && forced !== 's3')) {
   reason = `bucket ${cfg.bucket}`;
 } else {
   // Deployed with no bucket: fail loudly at the point of use rather than
-  // pretend to store a file that would vanish with the invocation.
+  // pretend to store a file that would vanish with the next deploy.
   const missing = new Error(
     'File storage is not configured. Set S3_BUCKET, S3_ACCESS_KEY_ID, ' +
       'S3_SECRET_ACCESS_KEY (and S3_ENDPOINT for Cloudflare R2).'
   );
   missing.status = 503;
+  missing.expose = true; // a setup message for the office, not a crash
   driver = {
     mode: 'unconfigured',
     createUpload: async () => { throw missing; },
@@ -366,6 +445,8 @@ if (forced === 'local' || (!s3Configured && !serverless && forced !== 's3')) {
 console.log(`[storage] driver: ${driver.mode} (${reason})`);
 
 module.exports = {
+  serving,
+  guardHeaders,
   storage: driver,
   MAX_UPLOAD_BYTES,
   GET_TTL,

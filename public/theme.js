@@ -5,7 +5,7 @@
   const KEY = 'hek-theme';
   const root = document.documentElement;
   const meta = document.querySelector('meta[name="theme-color"]');
-  const BG = { light: '#f4f2ee', dark: '#0d0d0d' };
+  const BG = { light: '#f4f2ee', dark: '#0c0a09' };
   const media = window.matchMedia('(prefers-color-scheme: dark)');
 
   const stored = () => {

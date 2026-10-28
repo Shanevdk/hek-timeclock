@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f2ee" />
+    <!-- The link is the only key to this page, so it must never be indexed or
+         leak through a referrer. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Your quote — HEK Fencing</title>
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="/icon-192.png" />
+    <!-- Leaflet draws the fence plan further down the page. Preloaded so it is
+         ready by the time it's needed, but no longer holding up the quote
+         itself: quote-portal.js picks it up through Snappy.leaflet(). -->
+    <link rel="preconnect" href="https://unpkg.com" crossorigin />
+    <link
+      rel="preload"
+      as="style"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link
+      rel="preload"
+      as="script"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="qp-page">
+    <header class="qp-top">
+      <div class="qp-brand"><img src="/logo.svg" alt="HEK Fencing Inc." /></div>
+      <div class="qp-top-meta" id="qpTopMeta"></div>
+    </header>
+
+    <main class="qp-wrap">
+      <div class="qp-card qp-loading wait" id="qpLoading">Loading your quote…</div>
+
+      <div class="qp-card qp-missing" id="qpMissing" hidden>
+        <h1>We couldn't open this quote</h1>
+        <p id="qpMissingMsg">The link may be incomplete. Please check it, or get in touch and we'll send it again.</p>
+        <div class="qp-contact" id="qpContact1"></div>
+      </div>
+
+      <div id="qpMain" hidden>
+        <div class="qp-banner" id="qpBanner" hidden></div>
+
+        <section class="qp-card qp-hero">
+          <div class="qp-hero-l">
+            <div class="qp-lbl">Prepared for</div>
+            <h1 id="qpName"></h1>
+            <p class="qp-dim" id="qpAddr"></p>
+            <div class="qp-lbl qp-mt">Project</div>
+            <p class="qp-project" id="qpProject"></p>
+            <p class="qp-dim" id="qpSite"></p>
+          </div>
+          <div class="qp-hero-r">
+            <div class="qp-lbl">Total (CAD)</div>
+            <div class="qp-total" id="qpTotal"></div>
+            <p class="qp-dim" id="qpTaxNote"></p>
+            <p class="qp-deposit" id="qpDeposit" hidden></p>
+            <dl class="qp-meta" id="qpMeta"></dl>
+            <div class="qp-hero-actions">
+              <a class="qp-btn qp-primary" id="qpGoSign" href="#qpSign" data-press="fast">Approve &amp; sign</a>
+              <button class="qp-btn" id="qpPdf" type="button">Download PDF</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="qp-card" id="qpLayoutCard" hidden>
+          <h2>Where your fence goes</h2>
+          <div class="qp-map" id="qpMap"></div>
+          <div class="qp-legend" id="qpLegend"></div>
+        </section>
+
+        <section class="qp-card">
+          <h2>What's included</h2>
+          <div class="qp-items" id="qpItems"></div>
+          <div class="qp-totals" id="qpTotals"></div>
+        </section>
+
+        <section class="qp-card" id="qpNotesCard" hidden>
+          <h2>Notes &amp; terms</h2>
+          <p class="qp-notes" id="qpNotes"></p>
+        </section>
+
+        <section class="qp-card qp-sign" id="qpSign">
+          <div id="qpSignForm">
+            <h2>Approve &amp; sign</h2>
+            <p class="qp-dim">Signing here accepts the work and price in this quote. We'll be in touch to book your installation.</p>
+            <label for="qpSignName">Your full name</label>
+            <input id="qpSignName" autocomplete="name" placeholder="First and last name" />
+            <div class="qp-pad-head">
+              <label for="qpPad">Sign in the box</label>
+              <button class="qp-link" id="qpPadClear" type="button">Clear</button>
+            </div>
+            <canvas class="qp-pad" id="qpPad" aria-label="Signature pad — draw your signature with a finger or mouse"></canvas>
+            <label class="qp-agree"><input type="checkbox" id="qpAgree" /> I accept this quote, including the work, price and terms above.</label>
+            <div class="qp-msg" id="qpSignMsg" role="alert"></div>
+            <button class="qp-btn qp-primary qp-wide" id="qpAccept" type="button">Approve &amp; sign</button>
+            <button class="qp-link qp-decline-toggle" id="qpDeclineToggle" type="button" data-press="fast">Not going ahead? Let us know</button>
+            <div class="qp-decline" id="qpDecline" hidden>
+              <label for="qpReason">Anything we should know? (optional)</label>
+              <textarea id="qpReason" rows="3" placeholder="e.g. went with a different design, timing, budget…"></textarea>
+              <button class="qp-btn qp-wide" id="qpDeclineBtn" type="button">Decline this quote</button>
+            </div>
+          </div>
+          <div id="qpSigned" hidden></div>
+        </section>
+
+        <footer class="qp-foot" id="qpFoot"></footer>
+      </div>
+    </main>
+
+    <script src="/snappy.js"></script>
+    <script src="/totals.js"></script>
+    <script src="/paper.js"></script>
+    <script src="/takeoff.js"></script>
+    <script src="/fencemap.js"></script>
+    <script src="/quote-portal.js"></script>
+  </body>
+</html>

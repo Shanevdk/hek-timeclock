@@ -272,4 +272,22 @@ async function dbSize() {
   }
 }
 
-module.exports = { record, recordError, report, dayKey, routeOf };
+// Writes still in flight. They are started after the response goes out, and a
+// serverless host may freeze the instance the moment its handler returns — so
+// the platform wrappers wait on settle() before handing the response back.
+const pending = new Set();
+function track(p) {
+  pending.add(p);
+  p.catch(() => {}).finally(() => pending.delete(p));
+  return p;
+}
+const settle = () => Promise.allSettled([...pending]);
+
+module.exports = {
+  record: (info) => track(record(info)),
+  recordError: (info) => track(recordError(info)),
+  settle,
+  report,
+  dayKey,
+  routeOf,
+};

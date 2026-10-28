@@ -15,7 +15,40 @@
 
 const crypto = require('crypto');
 
-const PLACEHOLDER = 'hek-timeclock-dev-secret-please-change';
+// Values that have been published — the old built-in fallback and the
+// .env.example placeholder. A secret anyone can read in the repository is no
+// secret, so neither is ever accepted. Listed by SHA-256 so this file doesn't
+// publish them all over again.
+const PUBLISHED = new Set([
+  '7637534278bf8b6da8780ce6437b7ca06235ef6212162828579b55c20ce70d23',
+  '507f4a36ac60403813911d179e82c5a8c07c6e1475182d56af418ab495029e8b',
+]);
+const published = (s) => PUBLISHED.has(crypto.createHash('sha256').update(s).digest('hex'));
+const MIN_SECRET_LENGTH = 32;
+const weak = (s) => !s || s.length < MIN_SECRET_LENGTH || published(s);
+
+// The key that signs every login cookie. There is no fallback: with a known
+// key, anyone could sign a cookie that says "admin". Called once at startup,
+// so a missing or published value stops the app with a clear message instead
+// of running wide open.
+function sessionSecret() {
+  const secret = process.env.SESSION_SECRET || '';
+  if (weak(secret)) {
+    const err = new Error(
+      'SESSION_SECRET must be set to a long random value (at least 32 characters) and must not be ' +
+        'the placeholder from .env.example. Generate one with:\n' +
+        '  node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"'
+    );
+    // A setup mistake, not a crash: safe to show to whoever is deploying.
+    err.code = 'CONFIG';
+    throw err;
+  }
+  return secret;
+}
+
+// scrypt is deliberately slow (tens of milliseconds, all of it blocking the
+// server), and a key only changes when its secret does — so derive each once.
+const derived = new Map();
 
 function keyFor(purpose) {
   const secret =
@@ -23,14 +56,22 @@ function keyFor(purpose) {
     process.env.MAIL_ENCRYPTION_KEY ||
     process.env.SESSION_SECRET ||
     '';
-  if (!secret || secret === PLACEHOLDER) {
+  // Published values only, not the length rule: a deployment that already
+  // stores credentials under a shorter dedicated key must keep decrypting them.
+  if (!secret || published(secret)) {
     const err = new Error(
       'Set SESSION_SECRET (or CREDENTIAL_ENCRYPTION_KEY) to a long random value before saving a credential.'
     );
     err.status = 400;
     throw err;
   }
-  return crypto.scryptSync(secret, `hek-${purpose}-v1`, 32);
+  const id = crypto.createHash('sha256').update(`${purpose}\0${secret}`).digest('base64');
+  let key = derived.get(id);
+  if (!key) {
+    key = crypto.scryptSync(secret, `hek-${purpose}-v1`, 32);
+    derived.set(id, key);
+  }
+  return key;
 }
 
 // Returns "iv:tag:ciphertext", all base64.
@@ -65,4 +106,4 @@ function canEncrypt() {
   }
 }
 
-module.exports = { encrypt, decrypt, canEncrypt };
+module.exports = { encrypt, decrypt, canEncrypt, sessionSecret };

@@ -3,7 +3,11 @@
 // published "dist" folder; only /api/* is routed here (see netlify.toml).
 
 const serverless = require('serverless-http');
+// Tells the app it is behind Netlify, whose x-nf-client-connection-ip header is
+// the only trustworthy source of the caller's address here (see clientIp).
+process.env.HEK_PLATFORM = 'netlify';
 const { app, connect } = require('../../server');
+const metrics = require('../../metrics');
 
 // A function's reply travels to Netlify as a string. Left to itself,
 // serverless-http only base64-encodes gzip'd bodies and turns everything else
@@ -24,5 +28,9 @@ exports.handler = async (event, context) => {
   // Don't wait for the (reused) Mongo connection pool to drain before returning.
   context.callbackWaitsForEmptyEventLoop = false;
   await connect(); // memoized — connects on cold start, reused when warm
-  return handler(event, context);
+  const result = await handler(event, context);
+  // The request counts and error records start after the response is written;
+  // finish them before Netlify freezes this instance.
+  await metrics.settle();
+  return result;
 };

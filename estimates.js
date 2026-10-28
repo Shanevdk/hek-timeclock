@@ -292,12 +292,27 @@ const requestView = (r) => ({
   created_at: r.created_at,
 });
 
+// The queue as the dashboard lists it. Each traced fence is reduced to its
+// length, its run count and where it starts: the full trace (up to 20 runs of
+// 200 points) is only needed when a request is approved, which reads it from
+// the database, and leaving it in made the list grow past what a serverless
+// response can carry.
+const listView = (r) => {
+  const v = requestView(r);
+  const m = r.measurement;
+  if (m && Array.isArray(m.runs)) {
+    const first = m.runs[0] && m.runs[0][0];
+    v.measurement = { feet: m.feet, metres: m.metres, run_count: m.runs.length, start: first || null };
+  }
+  return v;
+};
+
 async function listRequests() {
   const rows = await store.estimateRequests
     .find({}, { sort: { created_at: -1 } })
     .limit(500)
     .toArray();
-  return rows.map(requestView);
+  return rows.map(listView);
 }
 
 async function countNew() {

@@ -17,6 +17,7 @@
     "@aws-sdk/client-s3": "^3.1131.0",
     "@aws-sdk/s3-request-presigner": "^3.1131.0",
     "@vercel/speed-insights": "^2.0.0",
+    "compression": "^1.8.2",
     "cookie-session": "^2.1.0",
     "express": "^4.21.2",
     "imapflow": "^1.6.5",

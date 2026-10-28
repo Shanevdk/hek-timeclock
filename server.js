@@ -27,24 +27,44 @@ const {
   MAX_UPLOAD_BYTES,
   buildKey,
   disposition: storageDisposition,
+  serving: storageServing,
+  guardHeaders: storageGuard,
 } = require('./storage');
 const { connect, store } = require('./db');
+const secrets = require('./secrets');
 const qbo = require('./quickbooks');
 const rateBook = require('./ratebook');
 const inbox = require('./inbox');
 const estimates = require('./estimates');
 const metrics = require('./metrics');
+// The fence estimator behind the quote editor: the takeoff engine (shared with
+// the browser), the materials catalog it prices from, and the quote review.
+const takeoff = require('./public/takeoff');
+const docTotals = require('./public/totals');
+const catalog = require('./catalog');
+const quoteReview = require('./quotereview');
+// The pages' scripts and stylesheet at content-hashed addresses (see below).
+const assets = require('./assets');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@hekfencing.com').toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 // A built-in "dev" account: a limited admin that can use everything in the
-// dashboard EXCEPT the clock-in features. Seeded into the database on first run.
+// dashboard EXCEPT the clock-in features. It exists only when DEV_PASSWORD is
+// set to 12 or more characters — there is no default password, and the short
+// one that was once published in this repository can never qualify. The stored
+// login follows the env vars: change DEV_PASSWORD and the next start re-hashes it.
 const DEV_EMAIL = (process.env.DEV_EMAIL || 'dev@hek-fencing.com').toLowerCase();
-const DEV_PASSWORD = process.env.DEV_PASSWORD || 'golfcart';
-const SESSION_SECRET =
-  process.env.SESSION_SECRET || 'hek-timeclock-dev-secret-please-change';
+const DEV_PASSWORD = process.env.DEV_PASSWORD || '';
+const DEV_ENABLED = DEV_PASSWORD.length >= 12;
+if (DEV_PASSWORD && !DEV_ENABLED)
+  console.warn('\n[WARN] DEV_PASSWORD is shorter than 12 characters — the dev account is off.\n');
+// Signs every login cookie. Required, with no fallback — see secrets.js.
+const SESSION_SECRET = secrets.sessionSecret();
+// How long a login lasts. Enforced on the server, not just by the cookie's
+// expiry, so a saved copy of an old cookie stops working too.
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 // The admin dashboard is its own page served at this path. Admins reach it by
 // signing in on the main page ("/"), which redirects here — they never type it.
 // Override with the ADMIN_PATH env var.
@@ -63,12 +83,84 @@ function localDay(d) {
   }).format(new Date(d));
 }
 
-if (ADMIN_PASSWORD === 'changeme') {
+// How far TIMEZONE is ahead of UTC at instant t, in milliseconds.
+const zoneParts = new Intl.DateTimeFormat('en-US', {
+  timeZone: TIMEZONE,
+  hourCycle: 'h23',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+function zoneOffsetAt(t) {
+  const p = Object.fromEntries(zoneParts.formatToParts(new Date(t)).map((x) => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(t / 1000) * 1000;
+}
+
+// The instant a wall-clock time in TIMEZONE names: "2026-10-23T17:00" is 5 pm
+// in Ontario, whatever zone this server runs in (UTC on every host we use).
+// A date alone means its midnight. Invalid input gives an Invalid Date.
+function wallTimeToDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(String(s || '').trim());
+  if (!m) return new Date(NaN);
+  const asUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  // Date.UTC rolls "Feb 30" or "25:00" over into a real date; refuse those.
+  const back = new Date(asUtc);
+  if (
+    back.getUTCMonth() !== +m[2] - 1 ||
+    back.getUTCDate() !== +m[3] ||
+    back.getUTCHours() !== +(m[4] || 0) ||
+    back.getUTCMinutes() !== +(m[5] || 0)
+  )
+    return new Date(NaN);
+  // Guess with the offset at that moment, then once more with the offset at
+  // the guess, which settles a time near a daylight-saving change.
+  let t = asUtc - zoneOffsetAt(asUtc);
+  t = asUtc - zoneOffsetAt(t);
+  return new Date(t);
+}
+
+// The instants a range of local calendar days covers, from/to inclusive, as a
+// Mongo condition — or null when neither end is a real date. A day starts at
+// midnight in TIMEZONE, not at midnight on the server's clock (UTC on every
+// host we use, which put an 8 pm clock-in on the next day).
+function dayRange(from, to) {
+  const q = {};
+  const start = from ? wallTimeToDate(String(from)) : null;
+  const nextDay = (d) => {
+    const t = Date.parse(String(d) + 'T12:00:00Z');
+    return isNaN(t) ? '' : new Date(t + 86400000).toISOString().slice(0, 10);
+  };
+  const end = to ? wallTimeToDate(nextDay(to)) : null;
+  if (start && !isNaN(start)) q.$gte = start;
+  if (end && !isNaN(end)) q.$lt = end;
+  return Object.keys(q).length ? q : null;
+}
+
+// A time sent by a browser. An ISO string with a zone (what the pages send) is
+// exact; one without a zone was typed on a clock in TIMEZONE, so read it there
+// instead of in the server's own zone.
+function clientTime(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$/.test(s)) return wallTimeToDate(s);
+  return new Date(s);
+}
+
+if (ADMIN_PASSWORD.length < 8 || ADMIN_PASSWORD === 'changeme') {
   console.warn(
-    '\n[WARN] ADMIN_PASSWORD is not set — using default "changeme". ' +
-      'Set the ADMIN_PASSWORD env var before going live.\n'
+    '\n[WARN] ADMIN_PASSWORD is not set (or is under 8 characters). A new install will not ' +
+      'create the built-in admin login until it is set. (An install that already has one keeps it.)\n'
   );
 }
+
+// Compressed responses: the scripts, the stylesheet and the JSON lists are all
+// text that shrinks to about a fifth. Only when this file is the server itself
+// (Render, a laptop). On Netlify and Vercel the pages and scripts come from
+// their own CDN, which compresses them, and the function wrappers expect a
+// plain body back.
+if (require.main === module) app.use(require('compression')());
 
 // When running as a Netlify function, requests arrive under a
 // "/.netlify/functions/<name>" prefix. Strip it so the Express routes below see
@@ -83,16 +175,123 @@ app.use((req, res, next) => {
 // with its options, a ratebook import). File attachments no longer travel this
 // way at all — they go straight to object storage from the browser (storage.js),
 // so no request body needs to be anywhere near this size.
-app.use(express.json({ limit: '6mb' }));
+// Not on the local driver's part uploads: those are raw file bytes, and a part
+// of a .json file arrives labelled application/json — parsing it here would eat
+// (or refuse) the very bytes the route has to store.
+const jsonBody = express.json({ limit: '6mb' });
+app.use((req, res, next) => (/^\/api\/storage\/local\/part$/i.test(req.path) ? next() : jsonBody(req, res, next)));
 app.use(
   cookieSession({
     name: 'hek_sess',
     secret: SESSION_SECRET,
-    maxAge: 12 * 60 * 60 * 1000, // 12h
+    maxAge: SESSION_TTL_MS,
     httpOnly: true,
     sameSite: 'lax',
   })
 );
+// Every host this runs on (Vercel, Netlify, Render) sits behind one proxy that
+// ends HTTPS and says so in X-Forwarded-Proto. Trusting that one hop tells the
+// app which requests really came over HTTPS, and on those the login cookie is
+// marked Secure, so a browser never sends it over plain http to a custom
+// domain. A plain-http request (a laptop) keeps an ordinary cookie.
+app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  if (req.secure) req.sessionOptions.secure = true;
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Is this login still good? Checked on every API request, before anything
+// trusts req.session.
+//
+// A signed cookie only proves the server issued it, not that the person is
+// still allowed in — the cookie carries no server-side state to revoke. So each
+// request also confirms that:
+//   - it is younger than SESSION_TTL_MS (the cookie's own expiry is only an
+//     instruction to the browser, and a saved copy ignores it);
+//   - the account still exists and is active — and an employee signed into
+//     the dashboard still holds the "admin" permission;
+//   - the login's email and password are the ones it was issued for, so
+//     changing a password signs every other copy of that login out.
+// A session that fails is dropped, and the request carries on signed out.
+// ---------------------------------------------------------------------------
+
+// A fingerprint of a login's current email + password, kept in the session.
+// Keyed, so a cookie (which its holder can read) reveals nothing about the hash.
+const credTag = (doc) =>
+  crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(`${(doc && doc.email) || ''}|${(doc && doc.password_hash) || ''}`)
+    .digest('base64url')
+    .slice(0, 22);
+
+// The built-in admin and dev logins, cached briefly so a busy dashboard isn't
+// a database read per request. A credentials change clears its own entry.
+const accountCache = new Map();
+async function builtInAccount(id, { fresh } = {}) {
+  const hit = accountCache.get(id);
+  if (!fresh && hit && Date.now() - hit.at < 15000) return hit.doc;
+  const doc = id === 'dev' ? await getDevRecord() : await getAdminRecord();
+  accountCache.set(id, { doc, at: Date.now() });
+  return doc;
+}
+
+async function loginStillValid(req) {
+  const s = req.session;
+  const age = Date.now() - Number(s.iat);
+  if (!Number.isFinite(age) || age < -60000 || age > SESSION_TTL_MS) return false;
+  if (s.employeeId) {
+    const emp = await store.employees.findOne({ _id: s.employeeId, active: true });
+    if (!emp || s.cred !== credTag(emp)) return false;
+    // An employee in the dashboard is there on the "admin" permission alone,
+    // and is never the dev.
+    if (s.admin && (s.role !== 'admin' || !(emp.permissions || []).includes('admin'))) return false;
+    req.authEmployee = emp;
+    return true;
+  }
+  if (!s.admin || (s.role !== 'admin' && s.role !== 'dev')) return false;
+  const account = await builtInAccount(s.role);
+  if (account && s.cred === credTag(account)) return true;
+  // The cached copy may be the one that's stale: just after a login change
+  // made through another running copy of the app, the new cookie matches the
+  // database, not this cache. Look once more before signing anyone out.
+  const latest = await builtInAccount(s.role, { fresh: true });
+  return !!latest && s.cred === credTag(latest);
+}
+
+// Mounted on "/api" rather than tested with a string comparison: Express
+// matches routes in any letter case, and so does app.use, so "/API/admin/…"
+// is checked exactly like "/api/admin/…". (A case-sensitive startsWith here
+// once let a revoked login through on a capitalised path.) The guards below
+// refuse any session this check didn't pass.
+app.use('/api', async (req, res, next) => {
+  const s = req.session;
+  if (!s || (!s.admin && !s.employeeId)) return next();
+  try {
+    if (await loginStillValid(req)) req.sessionChecked = true;
+    else req.session = null;
+    next();
+  } catch (err) {
+    // Fail closed: a login that can't be checked is not trusted.
+    console.error('session check failed:', err.message);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// A fresh session for a successful sign-in, built from scratch rather than
+// edited in place, so nothing from an earlier login in the same browser (an
+// employee id, a role) carries into the new one.
+//   role: 'admin' | 'dev' | 'employee'; login: the employee or settings doc.
+function startSession(req, role, login, { employee } = {}) {
+  req.session = {
+    admin: role === 'admin' || role === 'dev',
+    role: role === 'employee' ? null : role,
+    employeeId: employee ? login._id : null,
+    email: (login && login.email) || null,
+    iat: Date.now(),
+    cred: credTag(login),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Local-disk storage endpoints.
@@ -106,19 +305,31 @@ if (storage.mode === 'local') {
   const fsp = require('fs/promises');
   const nodePath = require('path');
 
-  // One part of a multipart upload. express.json ignores this request (wrong
-  // content type), so the raw body is still here to be read.
+  // One part of a multipart upload. express.json is skipped for this path (see
+  // where it is mounted), so the raw body is still here to be read.
   app.put(
     '/api/storage/local/part',
+    // The token is checked before a byte of the body is read, so nobody without
+    // a valid upload link can make the server buffer 64 MB.
+    (req, res, next) => {
+      const t = storage.verify(req.query.token);
+      if (!t || t.op !== 'put')
+        return res.status(403).json({ error: 'This upload link has expired.' });
+      req.uploadToken = t;
+      next();
+    },
     // type:() => true, not '*/*': a Blob slice carries no MIME type, so the
     // browser sends the part with NO Content-Type header at all — and a matcher
     // based on the header skips exactly those requests, leaving req.body empty.
     express.raw({ type: () => true, limit: '64mb' }),
     (req, res) => {
-      const t = storage.verify(req.query.token);
-      if (!t || t.op !== 'put')
-        return res.status(403).json({ error: 'This upload link has expired.' });
-      const dest = storage.partPath(t.uploadId, t.part);
+      const t = req.uploadToken;
+      let dest;
+      try {
+        dest = storage.partPath(t.uploadId, t.part);
+      } catch (err) {
+        return res.status(400).json({ error: 'This upload link is not valid.' });
+      }
       fsp
         .mkdir(nodePath.dirname(dest), { recursive: true })
         .then(() => fsp.writeFile(dest, req.body))
@@ -143,13 +354,21 @@ if (storage.mode === 'local') {
   app.get('/api/storage/local/object', (req, res) => {
     const t = storage.verify(req.query.token);
     if (!t || t.op !== 'get') return res.status(403).type('text').send('This link has expired.');
-    res.setHeader('Content-Type', t.ct || 'application/octet-stream');
-    res.setHeader('Content-Disposition', storageDisposition(t.filename, t.download));
+    // This driver serves from our own address, so a file that could run script
+    // (HTML, SVG…) only ever goes out as a download, and nothing is sniffed.
+    const out = storageServing(t.ct, t.download);
+    res.setHeader('Content-Type', out.contentType);
+    res.setHeader('Content-Disposition', storageDisposition(t.filename, out.download));
+    storageGuard(res, out.contentType);
     res.sendFile(storage.objectPath(t.key), (err) => {
       if (err && !res.headersSent) res.status(404).type('text').send('That file is gone.');
     });
   });
 }
+
+// The first API call each page makes as it opens — the portal and the login
+// page, the dashboard, the public estimate page, a customer's quote link.
+const PAGE_OPENING_CALLS = /^\/api\/(me|admin\/me|estimate\/config|public\/quote\/[^/]+)\/?$/i;
 
 // Count every request for the dev dashboard. This runs on 'finish', i.e. after
 // the response has been sent, so measuring never slows anybody down, and a
@@ -178,7 +397,10 @@ app.use((req, res, next) => {
         ip: clientIp(req),
         agent: req.headers['user-agent'],
         timezone: TIMEZONE,
-        isPage: !path.startsWith('/api/'),
+        // A page view is counted from the one call each page makes as it opens,
+        // not from the page itself: on Netlify and Vercel the pages are static
+        // files that never reach this app, so they would never be counted.
+        isPage: req.method === 'GET' && PAGE_OPENING_CALLS.test(path),
         who,
       })
       .catch(() => {});
@@ -189,6 +411,12 @@ app.use((req, res, next) => {
 // The "dev" account is a limited admin: it can use the dashboard's non-clock-in
 // features (quotes, pricing, scheduling, employees) but not the timeclock data,
 // nor the admin's own login settings. Enforced here in one place.
+//
+// Mounted with app.use, so Express itself decides what each entry covers —
+// with the same rules it uses to route the request (any letter case, an
+// optional trailing slash, everything below the path). A hand-written string
+// comparison here once disagreed with the router: "/api/Admin/credentials"
+// slipped past the check and still reached the route.
 const DEV_BLOCKED = [
   '/api/admin/active',
   '/api/admin/timesheet',
@@ -196,26 +424,25 @@ const DEV_BLOCKED = [
   '/api/admin/credentials',
   '/api/cron/quickbooks-sync',
   '/api/cron/inbox-scan',
-];
-// Path prefixes the dev account may not touch. These are the client's own
-// business: payroll reads pay rates and writes to their books, invoices are
-// money owed them, and the inbox agent reads their email. The dev may switch
-// any of these features on or off, but never operate them.
-const DEV_BLOCKED_PREFIXES = [
+  // The client's own business: payroll reads pay rates and writes to their
+  // books, invoices are money owed them, and the inbox agent reads their email.
+  // The dev may switch any of these features on or off, but never operate them.
   '/api/admin/punches',
   '/api/admin/quickbooks',
   '/api/quickbooks',
   '/api/admin/invoices',
   '/api/admin/inbox',
+  // Every clock-in's position — the same timeclock data as the timesheet.
+  '/api/admin/locations',
+  // Billing, even though the route sits under quotes: it creates an invoice.
+  '/api/admin/quotes/:id/invoice',
 ];
-app.use((req, res, next) => {
-  if (req.session && req.session.role === 'dev') {
-    if (DEV_BLOCKED.includes(req.path) || DEV_BLOCKED_PREFIXES.some((p) => req.path.startsWith(p))) {
-      return res.status(403).json({ error: 'Not available for the dev account.' });
-    }
-  }
+app.use(DEV_BLOCKED, (req, res, next) => {
+  if (req.session && req.session.role === 'dev')
+    return res.status(403).json({ error: 'Not available for the dev account.' });
   next();
 });
+const isDev = (req) => !!(req.session && req.session.admin && req.session.role === 'dev');
 
 // ---------------------------------------------------------------------------
 // Feature entitlements — the dev account decides which paid features the client
@@ -247,7 +474,9 @@ const ADMIN_FEATURES = [
 ];
 // Which request paths belong to each feature (used to block them when disabled).
 const FEATURE_MATCH = {
-  quotes: (p) => p.startsWith('/api/admin/quotes'),
+  // The customer's approval page rides on the same switch: with quotes off, a
+  // link already sent stops working too.
+  quotes: (p) => p.startsWith('/api/admin/quotes') || p.startsWith('/api/public/quote'),
   schedule: (p) =>
     p.startsWith('/api/admin/schedules') ||
     p === '/api/admin/geocode' ||
@@ -260,18 +489,26 @@ const FEATURE_MATCH = {
     p === '/api/admin/shop',
   tasks: (p) => p.startsWith('/api/admin/tasks') || p.startsWith('/api/my/tasks'),
   messages: (p) => p.startsWith('/api/admin/bulletins') || p.startsWith('/api/my/bulletins'),
+  // Includes pushing and emailing an invoice through QuickBooks: that is the
+  // books too, so it needs this switch as well as the invoices one.
   quickbooks: (p) =>
     p.startsWith('/api/admin/quickbooks') ||
     p.startsWith('/api/quickbooks') ||
-    p === '/api/cron/quickbooks-sync',
-  invoices: (p) => p.startsWith('/api/admin/invoices'),
+    p === '/api/cron/quickbooks-sync' ||
+    /^\/api\/admin\/invoices\/[^/]+\/quickbooks(\/|$)/.test(p),
+  // Includes turning a quote into an invoice, which creates one.
+  invoices: (p) => p.startsWith('/api/admin/invoices') || /^\/api\/admin\/quotes\/[^/]+\/invoice$/.test(p),
   inbox: (p) => p.startsWith('/api/admin/inbox') || p === '/api/cron/inbox-scan',
   // Both sides of the estimate page: the admin's queue and the public endpoints
   // the page itself calls, so switching the feature off closes it to the world.
   estimate: (p) => p.startsWith('/api/admin/estimate') || p.startsWith('/api/estimate'),
 };
 
-let _entitlements = null; // cached; reloaded on write and on cold start
+// Cached briefly. On serverless hosting several copies of the app run at once,
+// and only the one that handled a switch would ever see it if the cache lived
+// as long as the process; 15 seconds is the most any copy can lag behind.
+const ENTITLEMENTS_TTL_MS = 15000;
+let _entitlements = null; // { value, at }
 function normalizeEntitlements(f) {
   f = f || {};
   const out = {};
@@ -279,34 +516,39 @@ function normalizeEntitlements(f) {
   return out;
 }
 async function getEntitlements() {
-  if (_entitlements) return _entitlements;
+  if (_entitlements && Date.now() - _entitlements.at < ENTITLEMENTS_TTL_MS) return _entitlements.value;
   const doc = await store.settings.findOne({ _id: 'entitlements' });
-  _entitlements = normalizeEntitlements(doc && doc.features);
-  return _entitlements;
+  _entitlements = { value: normalizeEntitlements(doc && doc.features), at: Date.now() };
+  return _entitlements.value;
 }
+// Writes only the switches that changed, so a copy holding an out-of-date view
+// can't put back what another copy just turned off.
 async function setEntitlements(patch) {
-  const next = { ...(await getEntitlements()) };
-  for (const feat of ADMIN_FEATURES) if (patch[feat.key] != null) next[feat.key] = !!patch[feat.key];
-  await store.settings.updateOne({ _id: 'entitlements' }, { $set: { features: next } }, { upsert: true });
-  _entitlements = next;
-  return next;
+  const set = {};
+  for (const feat of ADMIN_FEATURES)
+    if (patch[feat.key] != null) set['features.' + feat.key] = !!patch[feat.key];
+  if (Object.keys(set).length)
+    await store.settings.updateOne({ _id: 'entitlements' }, { $set: set }, { upsert: true });
+  _entitlements = null;
+  return getEntitlements();
 }
 
 // Block a disabled feature's endpoints for everyone except the dev.
+//
+// Matched on the path as the router sees it: Express routes ignore letter case
+// and a trailing slash, so the comparison here must too, or "/API/Estimate/…"
+// would reach a feature that is switched off.
 app.use(async (req, res, next) => {
   try {
-    if (req.session && req.session.role === 'dev') return next();
-    if (!req.path.startsWith('/api/')) return next();
-    let feat = null;
-    for (const f of ADMIN_FEATURES) {
-      if (FEATURE_MATCH[f.key] && FEATURE_MATCH[f.key](req.path)) {
-        feat = f.key;
-        break;
-      }
-    }
-    if (feat) {
+    if (req.sessionChecked && req.session && req.session.role === 'dev') return next();
+    const p = req.path.toLowerCase().replace(/\/+$/, '');
+    if (!p.startsWith('/api/')) return next();
+    // Every feature a path belongs to must be on — pushing an invoice to
+    // QuickBooks needs both Invoices and QuickBooks.
+    const feats = ADMIN_FEATURES.filter((f) => FEATURE_MATCH[f.key] && FEATURE_MATCH[f.key](p));
+    if (feats.length) {
       const ent = await getEntitlements();
-      if (!ent[feat])
+      if (feats.some((f) => !ent[f.key]))
         return res.status(403).json({ error: 'This feature is turned off. Contact your provider.' });
     }
   } catch (e) {
@@ -321,15 +563,22 @@ app.use(async (req, res, next) => {
 
 const iso = (v) => (v == null ? null : new Date(v).toISOString());
 
+// A session that passed this request's check (see loginStillValid). Every
+// guard asks this rather than trusting the cookie's own flags, so a request
+// that somehow skipped the check is refused instead of let through.
+const checkedSession = (req) => (req.session && req.sessionChecked ? req.session : null);
+
 function requireAdmin(req, res, next) {
-  if (req.session && req.session.admin) return next();
+  const s = checkedSession(req);
+  if (s && s.admin) return next();
   return res.status(401).json({ error: 'Not authorized' });
 }
 
 // Only the dev account may manage which features the client can use.
 function requireDev(req, res, next) {
-  if (req.session && req.session.admin && req.session.role === 'dev') return next();
-  if (req.session && req.session.admin) return res.status(403).json({ error: 'Not authorized' });
+  const s = checkedSession(req);
+  if (s && s.admin && s.role === 'dev') return next();
+  if (s && s.admin) return res.status(403).json({ error: 'Not authorized' });
   return res.status(401).json({ error: 'Not authorized' });
 }
 
@@ -392,10 +641,48 @@ function verifyPassword(password, salt, hash) {
 // admin can change them from the dashboard and the env vars are no longer used.
 // ---------------------------------------------------------------------------
 
+// The default admin password is in the source, so a brand-new install is never
+// seeded with it: until ADMIN_PASSWORD is set there is simply no built-in admin
+// login. (An install that already has its admin doc is unaffected.)
+const ADMIN_SEEDABLE = ADMIN_PASSWORD.length >= 8 && ADMIN_PASSWORD !== 'changeme';
+
+// An install whose admin login was created before ADMIN_PASSWORD was required
+// may still hold the published default. Checked once per start (it costs a
+// password hash): with a safe ADMIN_PASSWORD set, that replaces it; without
+// one the default keeps working nowhere — sign-in refuses it (see the login
+// routes) and the log says what to do.
+let defaultAdminCheck = null;
+function replaceDefaultAdminPassword() {
+  if (!defaultAdminCheck)
+    defaultAdminCheck = (async () => {
+      const doc = await store.settings.findOne({ _id: 'admin' });
+      if (!doc || !verifyPassword('changeme', doc.password_salt, doc.password_hash)) return;
+      if (ADMIN_SEEDABLE) {
+        await store.settings.updateOne(
+          { _id: 'admin' },
+          { $set: { ...hashPassword(ADMIN_PASSWORD), updated_at: new Date() } }
+        );
+        accountCache.delete('admin');
+        console.warn('[security] The admin password was the published default; it now comes from ADMIN_PASSWORD.');
+      } else {
+        console.warn(
+          '[security] The admin password is still the published default and is refused at sign-in. ' +
+            'Set ADMIN_PASSWORD (8+ characters, not "changeme") and restart.'
+        );
+      }
+    })().catch((err) => {
+      defaultAdminCheck = null; // try again next time
+      throw err;
+    });
+  return defaultAdminCheck;
+}
+
 // Load the admin credential doc, creating it from the env vars on first run.
+// Null when it doesn't exist yet and there is no safe password to seed it with.
 async function getAdminRecord() {
   let doc = await store.settings.findOne({ _id: 'admin' });
   if (!doc) {
+    if (!ADMIN_SEEDABLE) return null;
     // Upsert with $setOnInsert so two concurrent first-boots can't double-insert.
     await store.settings.updateOne(
       { _id: 'admin' },
@@ -407,31 +694,36 @@ async function getAdminRecord() {
   return doc;
 }
 
-// True when email + password match the stored admin credentials.
-async function checkAdmin(email, password) {
-  const admin = await getAdminRecord();
-  const emailOk = (email || '').trim().toLowerCase() === (admin.email || '').toLowerCase();
-  return emailOk && verifyPassword(password, admin.password_salt, admin.password_hash);
-}
-
-// The "dev" account lives in the same settings collection (doc _id:'dev'),
-// seeded from DEV_EMAIL / DEV_PASSWORD on first run.
+// The "dev" account lives in the same settings collection (doc _id:'dev'). It
+// follows the env vars: once per start, the stored login is made to match
+// DEV_EMAIL / DEV_PASSWORD, so rotating the password is just changing the
+// variable. With DEV_PASSWORD unset there is no dev login at all — a record
+// left over from an earlier install can't be signed into.
+let devSync = null;
 async function getDevRecord() {
-  let doc = await store.settings.findOne({ _id: 'dev' });
-  if (!doc) {
-    await store.settings.updateOne(
-      { _id: 'dev' },
-      { $setOnInsert: { email: DEV_EMAIL, ...hashPassword(DEV_PASSWORD), created_at: new Date() } },
-      { upsert: true }
-    );
-    doc = await store.settings.findOne({ _id: 'dev' });
-  }
-  return doc;
-}
-async function checkDev(email, password) {
-  const dev = await getDevRecord();
-  const emailOk = (email || '').trim().toLowerCase() === (dev.email || '').toLowerCase();
-  return emailOk && verifyPassword(password, dev.password_salt, dev.password_hash);
+  if (!DEV_ENABLED) return null;
+  if (!devSync)
+    devSync = (async () => {
+      const doc = await store.settings.findOne({ _id: 'dev' });
+      const current =
+        doc &&
+        (doc.email || '').toLowerCase() === DEV_EMAIL &&
+        verifyPassword(DEV_PASSWORD, doc.password_salt, doc.password_hash);
+      if (!current)
+        await store.settings.updateOne(
+          { _id: 'dev' },
+          {
+            $set: { email: DEV_EMAIL, ...hashPassword(DEV_PASSWORD), updated_at: new Date() },
+            $setOnInsert: { created_at: new Date() },
+          },
+          { upsert: true }
+        );
+    })().catch((err) => {
+      devSync = null; // try again on the next call
+      throw err;
+    });
+  await devSync;
+  return store.settings.findOne({ _id: 'dev' });
 }
 
 // Salaried staff are paid the same however long the day runs, so they have no
@@ -461,12 +753,18 @@ function selfView(emp, ent) {
   };
 }
 
+// The signed-in employee's record. The session check above has usually just
+// loaded it for this request; reusing it saves a second read.
+const sessionEmployee = (req) =>
+  req.authEmployee && req.authEmployee._id === req.session.employeeId
+    ? Promise.resolve(req.authEmployee)
+    : store.employees.findOne({ _id: req.session.employeeId, active: true });
+
 // Require a signed-in employee; attaches the fresh employee doc as req.employee.
 function requireEmployee(req, res, next) {
-  if (!req.session || !req.session.employeeId)
-    return res.status(401).json({ error: 'Please sign in.' });
-  store.employees
-    .findOne({ _id: req.session.employeeId, active: true })
+  const s = checkedSession(req);
+  if (!s || !s.employeeId) return res.status(401).json({ error: 'Please sign in.' });
+  sessionEmployee(req)
     .then((emp) => {
       if (!emp) {
         req.session = null;
@@ -484,11 +782,10 @@ function requireEmployee(req, res, next) {
 // Allow admins, or employees who have been granted a specific permission.
 function requirePermission(perm) {
   return (req, res, next) => {
-    if (req.session && req.session.admin) return next();
-    if (!req.session || !req.session.employeeId)
-      return res.status(401).json({ error: 'Please sign in.' });
-    store.employees
-      .findOne({ _id: req.session.employeeId, active: true })
+    const s = checkedSession(req);
+    if (s && s.admin) return next();
+    if (!s || !s.employeeId) return res.status(401).json({ error: 'Please sign in.' });
+    sessionEmployee(req)
       .then((emp) => {
         if (!emp || !(emp.permissions || []).includes(perm)) {
           req.session = emp ? req.session : null;
@@ -520,23 +817,40 @@ function requireMyFeature(perm) {
     });
 }
 
+// What an error means for the reply. A deliberate refusal — bad input, a body
+// too large to read, a service that isn't set up — keeps its own status and
+// says what it is; anything else is a fault: logged, kept for the dev
+// dashboard, and answered with a plain "Server error."
+function errorReply(err) {
+  const status = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+  const shown = status < 500 || (err && err.expose === true);
+  return { status, fault: !shown, message: shown ? err.message : 'Server error.' };
+}
+
+// Only what a fault needs: never the whole error object, which for a body that
+// failed to parse carries the raw request — a sign-in form's password with it.
+function recordFault(req, err, status) {
+  console.error(`[${req.method} ${req.path}]`, (err && err.stack) || err);
+  // Keep it for the dev dashboard as well as the log — a log line on a
+  // serverless host is gone the moment you look away.
+  metrics
+    .recordError({
+      path: req.path,
+      method: req.method,
+      status,
+      message: err && err.message,
+      stack: err && err.stack,
+      who: req.session && req.session.admin ? 'admin' : req.session && req.session.employeeId ? 'employee' : 'anonymous',
+      timezone: TIMEZONE,
+    })
+    .catch(() => {});
+}
+
 const wrap = (fn) => (req, res) =>
   Promise.resolve(fn(req, res)).catch((err) => {
-    console.error(err);
-    // Keep it for the dev dashboard as well as the log — a log line on a
-    // serverless host is gone the moment you look away.
-    metrics
-      .recordError({
-        path: req.path,
-        method: req.method,
-        status: 500,
-        message: err && err.message,
-        stack: err && err.stack,
-        who: req.session && req.session.admin ? 'admin' : req.session && req.session.employeeId ? 'employee' : 'anonymous',
-        timezone: TIMEZONE,
-      })
-      .catch(() => {});
-    if (!res.headersSent) res.status(500).json({ error: 'Server error.' });
+    const reply = errorReply(err);
+    if (reply.fault) recordFault(req, err, reply.status);
+    if (!res.headersSent) res.status(reply.status).json({ error: reply.message });
   });
 
 // ---------------------------------------------------------------------------
@@ -785,34 +1099,53 @@ async function withNames(punches) {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiting — after RL_LIMIT failed attempts from one IP within RL_WINDOW,
-// further attempts are blocked until the window passes. Stored in MongoDB so it
-// works across serverless invocations. Only *failed* attempts count, so a whole
-// crew signing in from one office IP with correct passwords is never locked out.
+// Rate limiting, kept in MongoDB so it holds across serverless instances.
+//
+//   limiter(scope)       counts FAILED attempts per address — a quote link that
+//                        doesn't exist. Too many and that address has to wait.
+//   loginLimiter(scope)  counts EVERY sign-in attempt as it arrives, before the
+//                        password is checked, per address and per account (the
+//                        email typed). Counting first means a burst of parallel
+//                        guesses is counted too, and the per-account count is
+//                        the same whatever address the guesses claim to come
+//                        from. A successful sign-in takes its own attempt back
+//                        off the address and clears that account — nobody
+//                        else's — so signing into your own account can't reset
+//                        the count against someone else's.
+//   budget(scope, …)     counts every request per address, for public
+//                        endpoints that cost money or a third party's goodwill.
 // ---------------------------------------------------------------------------
 
 const RL_LIMIT = 10;
 const RL_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+// One address trying many accounts. Successful sign-ins don't count, so a whole
+// crew signing in from the shop's connection never gets near it.
+const LOGIN_ADDRESS_LIMIT = 30;
+// Many addresses trying one account.
+const LOGIN_ACCOUNT_LIMIT = 10;
+const LOGIN_ACCOUNT_WINDOW_MS = 15 * 60 * 1000;
 
+// The caller's address, read from the header the hosting platform itself sets.
+// Any other header is whatever the client chose to send, so trusting one would
+// let every attempt claim a fresh address. Netlify: its own connection header
+// (the function wrapper marks the platform). Vercel: X-Forwarded-For, which
+// Vercel overwrites. Elsewhere, CLIENT_IP_HEADER may name the header your
+// proxy guarantees; failing that the first X-Forwarded-For hop is used, which
+// a client can choose — the per-account sign-in limit doesn't depend on it.
 function clientIp(req) {
-  return (
-    req.headers['x-nf-client-connection-ip'] ||
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.ip ||
-    'unknown'
-  );
+  const h = req.headers;
+  const first = (v) => String(v || '').split(',')[0].trim();
+  if (process.env.HEK_PLATFORM === 'netlify') return first(h['x-nf-client-connection-ip']) || 'unknown';
+  if (process.env.VERCEL) return first(h['x-real-ip']) || first(h['x-forwarded-for']) || 'unknown';
+  const named = String(process.env.CLIENT_IP_HEADER || '').trim().toLowerCase();
+  if (named && h[named]) return first(h[named]);
+  return first(h['x-forwarded-for']) || (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
-async function isBlocked(key) {
-  const doc = await store.rateLimits.findOne({ _id: key });
-  if (!doc || !doc.windowStart) return 0;
-  const elapsed = Date.now() - new Date(doc.windowStart).getTime();
-  if (elapsed > RL_WINDOW_MS) return 0;
-  return doc.count >= RL_LIMIT ? RL_WINDOW_MS - elapsed : 0;
-}
-
-async function recordFail(key) {
-  await store.rateLimits.updateOne(
+// Add one to key's count, starting a fresh window when the last has run out.
+// Returns the counter after the update.
+async function bump(key, windowMs) {
+  const r = await store.rateLimits.findOneAndUpdate(
     { _id: key },
     [
       {
@@ -822,7 +1155,7 @@ async function recordFail(key) {
               {
                 $gt: [
                   { $subtract: ['$$NOW', { $ifNull: ['$windowStart', new Date(0)] }] },
-                  RL_WINDOW_MS,
+                  windowMs,
                 ],
               },
               '$$NOW',
@@ -843,32 +1176,147 @@ async function recordFail(key) {
         },
       },
     ],
-    { upsert: true }
+    { upsert: true, returnDocument: 'after' }
   );
+  return r && r.value !== undefined && r.ok !== undefined ? r.value : r; // driver v6 returns the doc
 }
 
-const clearFails = (key) => store.rateLimits.deleteOne({ _id: key });
+// How long until counter `doc` is back under `limit`, or 0 if it is under now.
+function waitFor(doc, limit, windowMs) {
+  if (!doc || !(doc.count > limit)) return 0;
+  return Math.max(1000, windowMs - (Date.now() - new Date(doc.windowStart).getTime()));
+}
 
-// Middleware factory: blocks a request if the IP is over the limit for `scope`.
+const tooMany = (res, waitMs, what = 'attempts') => {
+  const mins = Math.ceil(waitMs / 60000);
+  return res
+    .status(429)
+    .json({ error: `Too many ${what}. Please wait ${mins} minute${mins > 1 ? 's' : ''} and try again.` });
+};
+
+async function isBlocked(key) {
+  const doc = await store.rateLimits.findOne({ _id: key });
+  if (!doc || !doc.windowStart) return 0;
+  const elapsed = Date.now() - new Date(doc.windowStart).getTime();
+  if (elapsed > RL_WINDOW_MS) return 0;
+  return doc.count >= RL_LIMIT ? RL_WINDOW_MS - elapsed : 0;
+}
+
+const recordFail = (key) => bump(key, RL_WINDOW_MS);
+
+// Middleware factory: blocks a request if its address has failed too often
+// within the window for `scope`. The route calls recordFail on a failure.
 const limiter = (scope) => async (req, res, next) => {
   const key = `${scope}:${clientIp(req)}`;
   req._rlKey = key;
   try {
     const waitMs = await isBlocked(key);
-    if (waitMs > 0) {
-      const mins = Math.ceil(waitMs / 60000);
-      return res
-        .status(429)
-        .json({ error: `Too many attempts. Please wait ${mins} minute${mins > 1 ? 's' : ''}.` });
-    }
+    if (waitMs > 0) return tooMany(res, waitMs);
   } catch (err) {
     console.error('rate-limit check failed (allowing request):', err.message);
   }
   next();
 };
 
-const adminLimiter = limiter('admin');
-const loginLimiter = limiter('login');
+// Sign-in forms. See the note at the top of this section.
+const loginLimiter = (scope) => async (req, res, next) => {
+  const raw = req.body && req.body.email;
+  const email = typeof raw === 'string' ? raw.trim().toLowerCase().slice(0, 254) : '';
+  req._login = {
+    addressKey: `${scope}:${clientIp(req)}`,
+    accountKey: email ? `${scope}-account:${email}` : null,
+  };
+  try {
+    const [byAddress, byAccount] = await Promise.all([
+      bump(req._login.addressKey, RL_WINDOW_MS),
+      req._login.accountKey ? bump(req._login.accountKey, LOGIN_ACCOUNT_WINDOW_MS) : null,
+    ]);
+    const waitMs = Math.max(
+      waitFor(byAddress, LOGIN_ADDRESS_LIMIT, RL_WINDOW_MS),
+      waitFor(byAccount, LOGIN_ACCOUNT_LIMIT, LOGIN_ACCOUNT_WINDOW_MS)
+    );
+    if (waitMs > 0) return tooMany(res, waitMs);
+  } catch (err) {
+    console.error('rate-limit check failed (allowing request):', err.message);
+  }
+  next();
+};
+
+// After a successful sign-in: this attempt stops counting against the address
+// and the account starts clean. Other accounts' counts are left alone.
+async function loginSucceeded(req) {
+  const k = req._login;
+  if (!k) return;
+  try {
+    await Promise.all([
+      store.rateLimits.updateOne({ _id: k.addressKey, count: { $gt: 0 } }, { $inc: { count: -1 } }),
+      k.accountKey ? store.rateLimits.deleteOne({ _id: k.accountKey }) : null,
+    ]);
+  } catch (err) {
+    console.error('rate-limit reset failed:', err.message);
+  }
+}
+
+// Middleware factory for public endpoints: at most `limit` requests per
+// address in `windowMs`, counting every request, successful or not.
+const budget = (scope, limit, windowMs) => async (req, res, next) => {
+  try {
+    const doc = await bump(`${scope}:${clientIp(req)}`, windowMs);
+    const waitMs = waitFor(doc, limit, windowMs);
+    if (waitMs > 0) return tooMany(res, waitMs, 'requests');
+  } catch (err) {
+    console.error('rate-limit check failed (allowing request):', err.message);
+  }
+  next();
+};
+
+// A ceiling for everyone together, per local day — the last line against a
+// flood that changes address. True once `limit` is passed.
+async function overDailyCap(scope, limit) {
+  const r = await store.rateLimits.findOneAndUpdate(
+    { _id: `${scope}:day:${localDay(new Date())}` },
+    { $inc: { count: 1 }, $setOnInsert: { expireAt: new Date(Date.now() + 2 * 86400000) } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const doc = r && r.value !== undefined && r.ok !== undefined ? r.value : r;
+  return !!doc && doc.count > limit;
+}
+
+// Who an email belongs to, before any password is checked: the built-in admin,
+// the dev account, or an employee.
+async function loginTarget(email) {
+  if (!email) return null;
+  await replaceDefaultAdminPassword().catch((err) => console.error('default password check failed:', err.message));
+  const admin = await getAdminRecord();
+  if (admin && email === String(admin.email || '').toLowerCase()) return { kind: 'admin', doc: admin };
+  const dev = await getDevRecord();
+  if (dev && email === String(dev.email || '').toLowerCase()) return { kind: 'dev', doc: dev };
+  const emp = await store.employees.findOne({ email });
+  return emp ? { kind: 'employee', doc: emp } : null;
+}
+
+// Exactly one password check per attempt, whoever the email belongs to — and
+// against a throwaway hash when it belongs to nobody — so a wrong email takes
+// as long to refuse as a wrong password and the timing doesn't tell anyone
+// which emails have accounts.
+let dummyLogin = null;
+function passwordMatches(target, password) {
+  if (!dummyLogin) dummyLogin = hashPassword(crypto.randomBytes(16).toString('hex'));
+  const d = target ? target.doc : dummyLogin;
+  const ok = verifyPassword(password, d.password_salt || dummyLogin.password_salt, d.password_hash || dummyLogin.password_hash);
+  return !!target && ok;
+}
+
+// The email and password from a sign-in form, or null when either is missing
+// or not text.
+function credentialsFrom(body) {
+  const email = body && typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = body && typeof body.password === 'string' ? body.password : '';
+  return email && password ? { email, password } : null;
+}
+
+const adminLimiter = loginLimiter('admin');
+const userLimiter = loginLimiter('login');
 
 // ---------------------------------------------------------------------------
 // Employee / unified auth (used by the login page at "/")
@@ -878,49 +1326,38 @@ const loginLimiter = limiter('login');
 // client redirects to the dashboard); everyone else signs in as an employee.
 app.post(
   '/api/login',
-  loginLimiter,
+  userLimiter,
   wrap(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
-    const password = req.body?.password || '';
-    if (!email || !password)
-      return res.status(400).json({ error: 'Enter your email and password.' });
-
-    // Admin?
-    if (await checkAdmin(email, password)) {
-      await clearFails(req._rlKey);
-      req.session.admin = true;
-      req.session.role = 'admin';
-      req.session.employeeId = null;
-      return res.json({ role: 'admin', redirect: ADMIN_PATH });
-    }
-
-    // Dev — a limited admin (everything in the dashboard except clock-in).
-    if (await checkDev(email, password)) {
-      await clearFails(req._rlKey);
-      req.session.admin = true;
-      req.session.role = 'dev';
-      req.session.employeeId = null;
-      return res.json({ role: 'admin', redirect: ADMIN_PATH });
-    }
-
-    // Employee?
-    const emp = await store.employees.findOne({ email });
-    if (!emp || !emp.active || !verifyPassword(password, emp.password_salt, emp.password_hash)) {
-      await recordFail(req._rlKey);
+    const creds = credentialsFrom(req.body);
+    if (!creds) return res.status(400).json({ error: 'Enter your email and password.' });
+    const target = await loginTarget(creds.email);
+    if (
+      !passwordMatches(target, creds.password) ||
+      (target.kind === 'employee' && !target.doc.active) ||
+      (target.kind === 'admin' && creds.password === 'changeme')
+    )
       return res.status(401).json({ error: 'Wrong email or password.' });
-    }
-    await clearFails(req._rlKey);
-    // An employee granted the "admin" role signs into the full dashboard.
-    if ((emp.permissions || []).includes('admin')) {
-      req.session.admin = true;
-      req.session.role = 'admin';
-      req.session.employeeId = emp._id;
+    await loginSucceeded(req);
+
+    const { kind, doc } = target;
+    // The admin, and the dev — a limited admin (everything in the dashboard
+    // except clock-in) — go to the dashboard.
+    if (kind !== 'employee') {
+      startSession(req, kind, doc);
       return res.json({ role: 'admin', redirect: ADMIN_PATH });
     }
-    req.session.admin = false;
-    req.session.role = null;
-    req.session.employeeId = emp._id;
-    res.json({ role: 'employee', ...selfView(emp, await getEntitlements()) });
+    // An employee granted the "admin" role signs into the full dashboard.
+    if ((doc.permissions || []).includes('admin')) {
+      startSession(req, 'admin', doc, { employee: true });
+      return res.json({ role: 'admin', redirect: ADMIN_PATH });
+    }
+    startSession(req, 'employee', doc, { employee: true });
+    res.json({
+      role: 'employee',
+      ...selfView(doc, await getEntitlements()),
+      // When this login ends — the portal may keep copies on the device until then.
+      session_expires: sessionEnds(req),
+    });
   })
 );
 
@@ -930,6 +1367,14 @@ app.post('/api/logout', (req, res) => {
 });
 
 
+// When this login runs out. The pages keep copies of what they last showed so
+// the next visit opens on it (snappy.js), and throw them away at this time —
+// a copy must never outlive the login that was allowed to see it.
+function sessionEnds(req) {
+  const iat = Number(req.session && req.session.iat);
+  return Number.isFinite(iat) ? new Date(iat + SESSION_TTL_MS).toISOString() : null;
+}
+
 // Who am I? Used by the portal (and by the shared login page) to restore state.
 app.get(
   '/api/me',
@@ -938,7 +1383,11 @@ app.get(
     if (req.session && req.session.employeeId) {
       const emp = await store.employees.findOne({ _id: req.session.employeeId, active: true });
       if (emp)
-        return res.json({ role: 'employee', ...selfView(emp, await getEntitlements()) });
+        return res.json({
+          role: 'employee',
+          ...selfView(emp, await getEntitlements()),
+          session_expires: sessionEnds(req),
+        });
     }
     res.json({ role: null });
   })
@@ -1020,22 +1469,28 @@ app.post(
     const now = new Date();
     const remarks = String(req.body?.remarks || '').trim().slice(0, 1000) || null;
     const { lat, lng } = cleanLatLng(req.body?.lat, req.body?.lng);
-    await store.punches.insertOne({
-      _id: await store.nextId('punches'),
-      employee_id: req.employee._id,
-      clock_in: now,
-      clock_out: null,
-      work_done: null,
-      jobs: [],
-      missed_reason: null,
-      note: remarks,
-      shop_hours: 0,
-      lunch_hours: 0,
-      km_manual: null,
-      edited: false,
-      clock_in_lat: lat,
-      clock_in_lng: lng,
-    });
+    try {
+      await store.punches.insertOne({
+        _id: await store.nextId('punches'),
+        employee_id: req.employee._id,
+        clock_in: now,
+        clock_out: null,
+        work_done: null,
+        jobs: [],
+        missed_reason: null,
+        note: remarks,
+        shop_hours: 0,
+        lunch_hours: 0,
+        km_manual: null,
+        edited: false,
+        clock_in_lat: lat,
+        clock_in_lng: lng,
+      });
+    } catch (err) {
+      // The one-open-punch index: another tap (or phone) clocked in first.
+      if (err.code === 11000) return res.status(409).json({ error: 'You are already clocked in.' });
+      throw err;
+    }
     res.json({ clockedIn: true, since: iso(now) });
   })
 );
@@ -1069,7 +1524,7 @@ app.post(
     let out = now;
     let backdated = false;
     if (req.body?.clockOut) {
-      out = new Date(req.body.clockOut);
+      out = clientTime(req.body.clockOut);
       if (isNaN(out)) return res.status(400).json({ error: 'Invalid finish time.' });
       if (out.getTime() > now.getTime() + 60000)
         return res.status(400).json({ error: "Finish time can't be in the future." });
@@ -1089,8 +1544,10 @@ app.post(
     )
       return res.status(400).json({ error: "Your lunch break is longer than the time you were on the clock." });
 
-    await store.punches.updateOne(
-      { _id: open._id },
+    // Only while it is still open: a second tap, or another phone, that got
+    // here at the same time must not overwrite the first clock-out.
+    const closed = await store.punches.updateOne(
+      { _id: open._id, clock_out: null },
       {
         $set: {
           clock_out: out,
@@ -1104,9 +1561,13 @@ app.post(
         },
       }
     );
+    if (!closed.matchedCount) return res.status(409).json({ error: 'You are already clocked out.' });
     res.json({ clockedIn: false, since: iso(open.clock_in), until: iso(out) });
   })
 );
+
+// The longest shift an employee can record when fixing a missed clock-out.
+const MAX_SHIFT_MS = 24 * 60 * 60 * 1000;
 
 // Resolve a missed clock-out from a previous day: the employee supplies the time
 // they actually finished, what they did, and why they forgot to clock out.
@@ -1128,12 +1589,20 @@ app.post(
     if (!work) return res.status(400).json({ error: 'Enter what you worked on that day.' });
     if (!why) return res.status(400).json({ error: 'Enter why you did not clock out.' });
 
-    const co = new Date(clockOut);
+    // The portal sends an exact instant; an older page sent the bare time off
+    // the phone's clock, which is read in TIMEZONE rather than as UTC.
+    const co = clientTime(clockOut);
     if (isNaN(co)) return res.status(400).json({ error: 'Invalid finish time.' });
     if (co.getTime() > Date.now() + 60000)
       return res.status(400).json({ error: "Finish time can't be in the future." });
     if (co < new Date(p.clock_in))
       return res.status(400).json({ error: 'Finish time must be after your clock-in.' });
+    // Nobody works a shift longer than a day; a finish later than that is a
+    // wrong date, and it would go to payroll as days of hours.
+    if (co - new Date(p.clock_in) > MAX_SHIFT_MS)
+      return res.status(400).json({
+        error: "That's more than 24 hours after you clocked in. Check the date, or ask the office to fix this entry.",
+      });
 
     const jobs = await pickJobs(req.employee._id, localDay(p.clock_in), req.body?.jobIds);
     const shopHours = quarterHours(req.body?.shopHours, MAX_SHOP_HOURS);
@@ -1147,8 +1616,8 @@ app.post(
     )
       return res.status(400).json({ error: "Your lunch break is longer than the time you were on the clock." });
 
-    await store.punches.updateOne(
-      { _id: p._id },
+    const resolved = await store.punches.updateOne(
+      { _id: p._id, clock_out: null },
       {
         $set: {
           clock_out: co,
@@ -1163,6 +1632,7 @@ app.post(
         },
       }
     );
+    if (!resolved.matchedCount) return res.status(409).json({ error: 'That clock-out was already fixed.' });
     res.json({ ok: true });
   })
 );
@@ -1171,7 +1641,12 @@ app.get(
   '/api/my/schedules',
   requireEmployee,
   wrap(async (req, res) => {
-    const docs = await store.schedules.find({ employee_ids: req.employee._id }).toArray();
+    // What's coming up, anything undated, and the last two months — not every
+    // job they have ever been on, oldest first, above today's.
+    const since = localDay(new Date(Date.now() - 60 * 86400000));
+    const docs = await store.schedules
+      .find({ employee_ids: req.employee._id, ...recentJobs(since) })
+      .toArray();
     res.json({ jobs: docs.map(publicScheduleView).sort(scheduleSort) });
   })
 );
@@ -1220,11 +1695,8 @@ app.get(
   wrap(async (req, res) => {
     const q = { employee_id: req.employee._id, clock_in_lat: { $ne: null } };
     const { from, to } = req.query;
-    if (from || to) {
-      q.clock_in = {};
-      if (from) q.clock_in.$gte = new Date(from + 'T00:00:00');
-      if (to) q.clock_in.$lte = new Date(to + 'T23:59:59.999');
-    }
+    const range = dayRange(from, to);
+    if (range) q.clock_in = range;
     const rows = await store.punches.find(q, { sort: { clock_in: -1 } }).toArray();
     res.json(
       rows.map((p) => ({
@@ -1308,39 +1780,20 @@ app.post(
   '/api/admin/login',
   adminLimiter,
   wrap(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
-    const { password } = req.body || {};
-    if (await checkAdmin(email, password)) {
-      await clearFails(req._rlKey);
-      req.session.admin = true;
-      req.session.role = 'admin';
-      req.session.email = email;
-      return res.json({ ok: true, email, role: 'admin' });
-    }
-    if (await checkDev(email, password)) {
-      await clearFails(req._rlKey);
-      req.session.admin = true;
-      req.session.role = 'dev';
-      req.session.email = email;
-      return res.json({ ok: true, email, role: 'dev' });
-    }
+    const creds = credentialsFrom(req.body);
+    if (!creds) return res.status(400).json({ error: 'Enter your email and password.' });
+    const target = await loginTarget(creds.email);
     // An employee granted the "admin" role may also sign in on the admin form.
-    const emp = await store.employees.findOne({ email });
-    if (
-      emp &&
-      emp.active &&
-      verifyPassword(password, emp.password_salt, emp.password_hash) &&
-      (emp.permissions || []).includes('admin')
-    ) {
-      await clearFails(req._rlKey);
-      req.session.admin = true;
-      req.session.role = 'admin';
-      req.session.employeeId = emp._id;
-      req.session.email = email;
-      return res.json({ ok: true, email, role: 'admin' });
-    }
-    await recordFail(req._rlKey);
-    res.status(401).json({ error: 'Wrong email or password.' });
+    const allowed =
+      target &&
+      (target.kind !== 'employee' ||
+        (target.doc.active && (target.doc.permissions || []).includes('admin')));
+    if (!passwordMatches(target, creds.password) || !allowed || (target.kind === 'admin' && creds.password === 'changeme'))
+      return res.status(401).json({ error: 'Wrong email or password.' });
+    await loginSucceeded(req);
+    if (target.kind === 'employee') startSession(req, 'admin', target.doc, { employee: true });
+    else startSession(req, target.kind, target.doc);
+    res.json({ ok: true, email: creds.email, role: target.kind === 'dev' ? 'dev' : 'admin' });
   })
 );
 
@@ -1363,7 +1816,8 @@ app.get(
           const emp = await store.employees.findOne({ _id: req.session.employeeId });
           email = emp ? emp.email || emp.name : null;
         } else {
-          email = (role === 'dev' ? await getDevRecord() : await getAdminRecord()).email;
+          const account = await builtInAccount(role);
+          email = account ? account.email : null;
         }
       } catch (e) {
         /* fall back to no email if the settings doc can't be read */
@@ -1374,7 +1828,7 @@ app.get(
         /* fall back to no feature info */
       }
     }
-    res.json({ admin, role, email, features });
+    res.json({ admin, role, email, features, session_expires: admin ? sessionEnds(req) : null });
   })
 );
 
@@ -1435,6 +1889,12 @@ app.patch(
   '/api/admin/credentials',
   requireAdmin,
   wrap(async (req, res) => {
+    // The dev's login comes from DEV_EMAIL / DEV_PASSWORD. Refused here as well
+    // as by DEV_BLOCKED, because the fall-through below edits the built-in
+    // admin's login — the one thing a dev session must never reach.
+    if (isDev(req))
+      return res.status(403).json({ error: 'The dev login is set with DEV_EMAIL and DEV_PASSWORD.' });
+
     let email = null;
     if (req.body?.email != null) {
       email = String(req.body.email).trim().toLowerCase();
@@ -1443,11 +1903,23 @@ app.patch(
     let password = null;
     if (req.body?.password) {
       password = String(req.body.password);
-      if (password.length < 6)
-        return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+      if (password.length < 8)
+        return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+      // The published default is refused at sign-in, so it can't be chosen.
+      if (password === 'changeme') return res.status(400).json({ error: 'Choose a different password.' });
     }
     if (!email && !password)
       return res.status(400).json({ error: 'Enter a new email or password.' });
+
+    // Whoever this is must know the current password. A session alone isn't
+    // enough to rewrite the login — someone at an unattended screen, or holding
+    // a stolen cookie, could otherwise lock the real owner out.
+    const current = String(req.body?.current_password || '');
+    const mine = req.session.employeeId
+      ? await store.employees.findOne({ _id: req.session.employeeId, active: true })
+      : await getAdminRecord();
+    if (!mine || !verifyPassword(current, mine.password_salt, mine.password_hash))
+      return res.status(403).json({ error: 'Your current password is not right.' });
 
     const set = { updated_at: new Date() };
     if (password) Object.assign(set, hashPassword(password));
@@ -1457,31 +1929,30 @@ app.patch(
     // admin account (which is how the whole company gets in).
     if (req.session.employeeId) {
       const id = req.session.employeeId;
-      if (email) {
-        if (await store.employees.findOne({ email, _id: { $ne: id } }))
-          return res.status(409).json({ error: 'That email is already in use.' });
+      if (email && email !== String(mine.email || '').toLowerCase()) {
         // Taking the built-in admin's address would shadow that login.
-        const taken = await Promise.all([getAdminRecord(), getDevRecord()]);
-        if (taken.some((d) => d && (d.email || '').toLowerCase() === email))
+        if ((await store.employees.findOne({ email, _id: { $ne: id } })) || (await builtInEmail(email)))
           return res.status(409).json({ error: 'That email is already in use.' });
         set.email = email;
       }
       await store.employees.updateOne({ _id: id }, { $set: set });
       const emp = await store.employees.findOne({ _id: id });
+      // This browser stays signed in; every other copy of the old login is out.
+      startSession(req, 'admin', emp, { employee: true });
       return res.json({ ok: true, email: emp.email || emp.name });
     }
 
-    // The built-in admin account, stored in the settings collection. (The dev
-    // account never gets here — DEV_BLOCKED refuses this path outright.)
-    await getAdminRecord(); // ensure the doc exists before updating
-    if (email) {
+    // The built-in admin account, stored in the settings collection. The form
+    // always sends the email, so only a different one is checked for a clash.
+    if (email && email !== String(mine.email || '').toLowerCase()) {
       if (await store.employees.findOne({ email }))
         return res.status(409).json({ error: 'That email is already in use.' });
       set.email = email;
     }
     await store.settings.updateOne({ _id: 'admin' }, { $set: set });
+    accountCache.delete('admin');
     const updated = await getAdminRecord();
-    if (set.email) req.session.email = updated.email;
+    startSession(req, 'admin', updated);
     res.json({ ok: true, email: updated.email });
   })
 );
@@ -1567,28 +2038,59 @@ app.get(
   wrap(async (req, res) => {
     const ent = await getEntitlements();
     const permissions = GRANTABLE_PERMISSIONS.filter(
-      (p) => !FEATURE_KEYS.has(p.key) || ent[p.key] !== false
+      (p) => (!FEATURE_KEYS.has(p.key) || ent[p.key] !== false) && !(p.key === 'admin' && isDev(req))
     );
     res.json({ permissions });
   })
 );
 
+// What the dev may not do to an employee. The dev is kept away from payroll,
+// invoices, the books and the inbox (DEV_BLOCKED) — but an employee holding
+// "admin" signs in with none of those limits. So the dev can't hand that
+// permission out, take it away, or take over the login of anyone who holds it;
+// and since deleting an employee deletes their time entries, it can't delete
+// anyone with payroll history either. Returns the reason, or null.
+function devEmployeeRefusal(req, emp, body) {
+  if (!isDev(req)) return null;
+  const isAdminEmp = !!emp && (emp.permissions || []).includes('admin');
+  const wantsAdmin = Array.isArray(body && body.permissions) && body.permissions.includes('admin');
+  if (wantsAdmin && !isAdminEmp) return 'Only the admin can give someone admin access.';
+  if (!isAdminEmp) return null;
+  const b = body || {};
+  if (b.password) return "Only the admin can change an admin's password.";
+  if (b.email != null && String(b.email).trim().toLowerCase() !== (emp.email || '').toLowerCase())
+    return "Only the admin can change an admin's email.";
+  if (b.active != null && !!b.active !== !!emp.active) return 'Only the admin can switch an admin on or off.';
+  return null;
+}
+
+// True when an email is the built-in admin's or the dev's login. An employee
+// given that address would never be able to sign in (the built-in login is
+// checked first), and the admin could no longer save their own login.
+async function builtInEmail(email) {
+  if (!email) return false;
+  const accounts = await Promise.all([getAdminRecord(), getDevRecord()]);
+  return accounts.some((d) => d && String(d.email || '').toLowerCase() === email);
+}
+
 app.post(
   '/api/admin/employees',
   requireAdmin,
   wrap(async (req, res) => {
-    const first = (req.body?.first_name || '').trim();
-    const last = (req.body?.last_name || '').trim();
-    let name = (req.body?.name || '').trim();
+    const first = String(req.body?.first_name || '').trim();
+    const last = String(req.body?.last_name || '').trim();
+    let name = String(req.body?.name || '').trim();
     if (!name) name = [first, last].filter(Boolean).join(' ').trim();
-    const email = (req.body?.email || '').trim().toLowerCase();
-    const password = req.body?.password || '';
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
     const permissions = cleanPermissions(req.body?.permissions);
+    const refusal = devEmployeeRefusal(req, null, { permissions });
+    if (refusal) return res.status(403).json({ error: refusal });
     if (!name) return res.status(400).json({ error: 'Name is required.' });
     if (email && !validEmail(email))
       return res.status(400).json({ error: 'Enter a valid email address.' });
 
-    if (email && (await store.employees.findOne({ email })))
+    if (email && ((await store.employees.findOne({ email })) || (await builtInEmail(email))))
       return res.status(409).json({ error: 'That email is already in use.' });
 
     const profile = pickProfile(req.body);
@@ -1626,6 +2128,8 @@ app.patch(
     const id = Number(req.params.id);
     const emp = await store.employees.findOne({ _id: id });
     if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+    const refusal = devEmployeeRefusal(req, emp, req.body);
+    if (refusal) return res.status(403).json({ error: refusal });
 
     let name = req.body?.name != null ? String(req.body.name).trim() : emp.name;
     // If first/last name were edited, recompute the display name from them.
@@ -1649,13 +2153,38 @@ app.patch(
       const email = String(req.body.email).trim().toLowerCase();
       if (email && !validEmail(email))
         return res.status(400).json({ error: 'Enter a valid email address.' });
-      if (email && (await store.employees.findOne({ email, _id: { $ne: id } })))
+      if (
+        email &&
+        email !== (emp.email || '') &&
+        ((await store.employees.findOne({ email, _id: { $ne: id } })) || (await builtInEmail(email)))
+      )
         return res.status(409).json({ error: 'That email is already in use.' });
       set.email = email || null;
     }
 
-    // Permissions: replace the whole list when provided.
-    if (req.body?.permissions != null) set.permissions = cleanPermissions(req.body.permissions);
+    // Your own login (an employee with the admin role editing their own record)
+    // changes only with your current password, exactly as on "Your login" — a
+    // session alone must not be enough to lock the real owner out.
+    const loginChange = !!req.body?.password || (set.email !== undefined && set.email !== (emp.email || null));
+    if (
+      req.session.employeeId === id &&
+      loginChange &&
+      !verifyPassword(String(req.body?.current_password || ''), emp.password_salt, emp.password_hash)
+    )
+      return res
+        .status(403)
+        .json({ error: 'To change your own email or password, use "Your login" — it asks for your current password.' });
+
+    // Permissions: replace the whole list when provided. For the dev, "admin"
+    // isn't theirs to change either way: the dev's editor never shows that box,
+    // so an admin employee keeps it however the rest of their list is edited.
+    if (req.body?.permissions != null) {
+      set.permissions = cleanPermissions(req.body.permissions);
+      if (isDev(req)) {
+        set.permissions = set.permissions.filter((p) => p !== 'admin');
+        if ((emp.permissions || []).includes('admin')) set.permissions.unshift('admin');
+      }
+    }
 
     // Reports to: another employee (their manager). "" clears it; can't be self.
     if (req.body?.reports_to != null) {
@@ -1676,6 +2205,11 @@ app.patch(
 
     await store.employees.updateOne({ _id: id }, { $set: set });
     const updated = await store.employees.findOne({ _id: id });
+    // Editing your own record changes your login's fingerprint; keep this
+    // browser signed in rather than bouncing you to the sign-in page. (If you
+    // just removed your own admin access, the next request signs you out.)
+    if (req.session.employeeId === id && (updated.permissions || []).includes('admin') && updated.active)
+      startSession(req, 'admin', updated, { employee: true });
     res.json(employeeView(updated));
   })
 );
@@ -1685,6 +2219,15 @@ app.delete(
   requireAdmin,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
+    if (isDev(req)) {
+      const emp = await store.employees.findOne({ _id: id });
+      if (emp && (emp.permissions || []).includes('admin'))
+        return res.status(403).json({ error: 'Only the admin can delete an admin.' });
+      if (await store.punches.findOne({ employee_id: id }))
+        return res.status(403).json({
+          error: 'This employee has time entries, so only the admin can delete them. Switch them off instead.',
+        });
+    }
     await store.employees.deleteOne({ _id: id });
     await store.punches.deleteMany({ employee_id: id }); // cascade their time entries
     await store.schedules.updateMany({}, { $pull: { employee_ids: id } }); // unassign jobs
@@ -1754,13 +2297,15 @@ function cleanLatLng(lat, lng) {
   return { lat: null, lng: null };
 }
 
-// Narrow a list of ids down to employees that actually exist.
+// Narrow a list of ids down to employees that exist and are still active: an
+// employee who has been switched off can't sign in to see the job, so putting
+// them on a crew only hides that nobody is covering it.
 async function cleanEmployeeIds(list) {
   const ids = Array.isArray(list)
     ? [...new Set(list.map(Number).filter((n) => Number.isInteger(n)))]
     : [];
   if (!ids.length) return [];
-  const found = await store.employees.find({ _id: { $in: ids } }).toArray();
+  const found = await store.employees.find({ _id: { $in: ids }, active: true }).toArray();
   return found.map((e) => e._id);
 }
 
@@ -1800,50 +2345,104 @@ function scheduleSort(a, b) {
   return at < bt ? -1 : at > bt ? 1 : 0;
 }
 
-// Address autocomplete, proxied to OpenStreetMap's free Nominatim geocoder so we
-// can set a proper User-Agent (their usage policy) and keep it server-side.
+// OpenStreetMap's free Nominatim geocoder, used for every address lookup —
+// staff and public. Its usage policy asks for an identifying User-Agent and at
+// most one request a second, so lookups queue behind each other (per running
+// copy of the app), and answers are remembered for a day so asking again costs
+// nothing. A wait that would run past a few seconds is refused instead: better
+// "busy, try again" than a request that hangs until the host kills it.
+const NOMINATIM_GAP_MS = 1100;
+const nominatimCache = new Map(); // url -> { at, data }
+let nominatimNext = 0;
+async function nominatim(url, purpose) {
+  const hit = nominatimCache.get(url);
+  if (hit && Date.now() - hit.at < 86400000) return hit.data;
+  const now = Date.now();
+  const wait = Math.max(0, nominatimNext - now);
+  if (wait > 4000) {
+    const err = new Error('Address search is busy right now. Try again in a moment.');
+    err.status = 503;
+    throw err;
+  }
+  nominatimNext = Math.max(now, nominatimNext) + NOMINATIM_GAP_MS;
+  if (wait) await new Promise((r) => setTimeout(r, wait));
+  const r = await fetch(url, {
+    headers: { 'User-Agent': `HEK-Timeclock/1.0 (${purpose})`, 'Accept-Language': 'en' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) {
+    const err = new Error('Address search is not available right now. Try again later.');
+    err.status = r.status === 429 ? 429 : 503;
+    throw err;
+  }
+  const data = await r.json();
+  if (nominatimCache.size >= 500) nominatimCache.delete(nominatimCache.keys().next().value);
+  nominatimCache.set(url, { at: Date.now(), data });
+  return data;
+}
+
+const placesFrom = (data) =>
+  (Array.isArray(data) ? data : [])
+    .map((d) => ({ label: d.display_name, lat: Number(d.lat), lng: Number(d.lon) }))
+    .filter((x) => x.label && Number.isFinite(x.lat) && Number.isFinite(x.lng));
+
+// Staff address lookup. Never throws: a failed lookup is just no results.
+async function searchAddress(raw, purpose) {
+  const q = String(raw || '').trim().slice(0, 200);
+  if (q.length < 3) return [];
+  try {
+    return placesFrom(
+      await nominatim(
+        'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=' + encodeURIComponent(q),
+        purpose
+      )
+    );
+  } catch (err) {
+    console.error('geocode failed:', err.message);
+    return [];
+  }
+}
+
 app.get(
   '/api/admin/geocode',
   requireAdmin,
   wrap(async (req, res) => {
-    const q = (req.query.q || '').trim();
-    if (q.length < 3) return res.json({ results: [] });
-    try {
-      const url =
-        'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=' +
-        encodeURIComponent(q);
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': 'HEK-Timeclock/1.0 (job scheduling address lookup)',
-          'Accept-Language': 'en',
-        },
-      });
-      if (!r.ok) return res.json({ results: [] });
-      const data = await r.json();
-      const results = (Array.isArray(data) ? data : [])
-        .map((d) => ({ label: d.display_name, lat: Number(d.lat), lng: Number(d.lon) }))
-        .filter((x) => x.label && Number.isFinite(x.lat) && Number.isFinite(x.lng));
-      res.json({ results });
-    } catch (err) {
-      console.error('geocode failed:', err.message);
-      res.json({ results: [] });
-    }
+    res.json({ results: await searchAddress(req.query.q, 'job scheduling address lookup') });
   })
 );
+
+// Whether a job's office note must be kept from this session: a dev looking at
+// a job that came from an invoice.
+const hidesBilling = (req, job) => isDev(req) && !!(job && job.source && job.source.type === 'invoice');
+
+// Jobs still worth listing as of a local day: undated ones (the backlog), and
+// any that run on or after it. Without a cut-off the board and the crew's
+// schedule return every job ever, and after a few thousand of them the reply
+// outgrows what a serverless response can carry.
+function recentJobs(since) {
+  return {
+    $or: [{ date: null }, { date: { $gte: since } }, { end_date: { $gte: since } }],
+  };
+}
 
 app.get(
   '/api/admin/schedules',
   requireAdmin,
   wrap(async (req, res) => {
-    const docs = await store.schedules.find({}).toArray();
+    // The board looks around now; older weeks are asked for with ?since=.
+    const asked = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.since || '')) ? String(req.query.since) : null;
+    const since = asked || localDay(new Date(Date.now() - 400 * 86400000));
+    const docs = await store.schedules.find(recentJobs(since)).toArray();
     const emps = await store.employees.find({}).toArray();
     const nameById = Object.fromEntries(emps.map((e) => [e._id, e.name]));
     const jobs = docs
       .map((d) => ({
         ...publicScheduleView(d),
         // Admin-only, so the internal note is added back on top of the view the
-        // employee portal gets.
-        notes_internal: d.notes_internal || null,
+        // employee portal gets. Not for the dev on a job an invoice made: its
+        // note carries the invoice's money and billing contact, and invoices
+        // are the client's business, closed to the dev account.
+        notes_internal: hidesBilling(req, d) ? null : d.notes_internal || null,
         employee_ids: d.employee_ids || [],
         employees: (d.employee_ids || []).map((id) => nameById[id] || '(removed)'),
       }))
@@ -1978,7 +2577,10 @@ app.patch(
     if (req.body?.due_date != null) set.due_date = cleanDate(req.body.due_date);
     if (req.body?.job_type != null) set.job_type = cleanJobType(req.body.job_type);
     if (req.body?.notes_driver != null) set.notes_driver = cleanNote(req.body.notes_driver);
-    if (req.body?.notes_internal != null) set.notes_internal = cleanNote(req.body.notes_internal);
+    // The dev never saw this note on an invoice's job (see the list), so what
+    // its form sends back is not an edit of it.
+    if (req.body?.notes_internal != null && !hidesBilling(req, doc))
+      set.notes_internal = cleanNote(req.body.notes_internal);
     if (req.body?.confirmed != null) set.confirmed = !!req.body.confirmed;
     if (req.body?.lat !== undefined || req.body?.lng !== undefined) {
       const { lat, lng } = cleanLatLng(req.body?.lat, req.body?.lng);
@@ -1998,10 +2600,12 @@ app.delete(
   requireAdmin,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
+    // Don't leave orphans — in the database or in the bucket. Files go first,
+    // each row with its object, and the job last: if a big job is cut short by
+    // a serverless time limit, what's left still hangs off a job that exists,
+    // and deleting it again finishes the work.
+    await dropFiles(store.jobFiles, await store.jobFiles.find({ job_id: id }).toArray());
     await store.schedules.deleteOne({ _id: id });
-    // Don't leave orphans — in the database or in the bucket.
-    await dropStored(await store.jobFiles.find({ job_id: id }).toArray());
-    await store.jobFiles.deleteMany({ job_id: id });
     res.json({ ok: true });
   })
 );
@@ -2091,7 +2695,7 @@ function sendStoredFile(res, blob) {
       `<!doctype html><meta charset="utf-8">` +
         `<meta name="viewport" content="width=device-width,initial-scale=1">` +
         `<style>body{font:16px/1.5 system-ui,sans-serif;margin:0;padding:32px 24px;` +
-        `background:#0d0d0d;color:#f3f0ea}h1{font-size:20px;margin:0 0 12px}` +
+        `background:#0c0a09;color:#f3f0ea}h1{font-size:20px;margin:0 0 12px}` +
         `p{margin:0 0 10px;color:#9a938a}b{color:#f3f0ea}</style>` +
         `<h1>This file is too big to open here</h1>` +
         `<p><b>${escHtml(blob.filename || 'The file')}</b> is ${mb(buf.length)} MB. ` +
@@ -2100,8 +2704,12 @@ function sendStoredFile(res, blob) {
     );
     return;
   }
-  res.setHeader('Content-Type', blob.content_type || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `inline; filename="${safeName(blob.filename)}"`);
+  // Served from our own address: anything that could run script goes out as a
+  // download only, and the name is written so any character survives.
+  const out = storageServing(blob.content_type, false);
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', storageDisposition(blob.filename, out.download));
+  storageGuard(res, out.contentType);
   res.send(buf);
 }
 
@@ -2182,6 +2790,57 @@ async function dropStored(docs) {
   }
 }
 
+// Finishing an upload, step 1: move its row from "pending" to "completing" in
+// one step. Abort only ever touches pending rows, so a cancel that races the
+// last step can no longer delete the row (and the object) that /complete is
+// about to file onto the job. Answers whether this request now owns the
+// completion; when it doesn't, the row as it stands says why.
+async function claimCompletion(collection, doc) {
+  const r = await collection.updateOne(
+    { _id: doc._id, status: 'pending' },
+    { $set: { status: 'completing', completing_at: new Date() } }
+  );
+  return r.modifiedCount === 1;
+}
+
+// A completion that failed part-way gives the row back to "pending", so the
+// browser's abort (or the sweep) can clean it up.
+const releaseCompletion = (collection, doc) =>
+  collection.updateOne({ _id: doc._id, status: 'completing' }, { $set: { status: 'pending' } });
+
+// Uploads started and never finished — a closed tab, a phone that died — are
+// swept up once their signed links are long dead (6 h), so their parts aren't
+// billed forever. Run from the upload-url routes, at most hourly per copy.
+const ABANDONED_UPLOAD_MS = 7 * 60 * 60 * 1000;
+let lastUploadSweep = 0;
+async function sweepAbandonedUploads() {
+  if (Date.now() - lastUploadSweep < 60 * 60 * 1000) return;
+  lastUploadSweep = Date.now();
+  const cutoff = new Date(Date.now() - ABANDONED_UPLOAD_MS);
+  try {
+    for (const collection of [store.jobFiles, store.taskAttachments]) {
+      const old = await collection
+        .find({ status: { $in: ['pending', 'completing'] }, created_at: { $lt: cutoff } })
+        .limit(50)
+        .toArray();
+      if (old.length) await dropFiles(collection, old);
+    }
+  } catch (err) {
+    console.error('upload sweep failed:', err.message);
+  }
+}
+
+// Delete file rows along with their objects, a batch at a time, each row only
+// once its object is gone — so stopping part-way never leaves a row pointing
+// at nothing, nor an object nothing points at.
+async function dropFiles(collection, docs) {
+  for (let i = 0; i < docs.length; i += 10) {
+    const batch = docs.slice(i, i + 10);
+    await Promise.all(batch.map((d) => dropStored([d])));
+    await collection.deleteMany({ _id: { $in: batch.map((d) => d._id) } });
+  }
+}
+
 app.post(
   '/api/admin/schedules/:id/folders',
   requireAdmin,
@@ -2213,17 +2872,19 @@ app.delete(
     if (doomed.length) {
       const ids = doomed.map((f) => f.id);
       // Read the rows before dropping them: the storage keys live there.
-      await dropStored(await store.jobFiles.find({ _id: { $in: ids } }).toArray());
-      await store.jobFiles.deleteMany({ _id: { $in: ids } });
+      await dropFiles(store.jobFiles, await store.jobFiles.find({ _id: { $in: ids } }).toArray());
     }
+    // Pull exactly what was deleted rather than writing back lists read before
+    // the (slow) storage deletes: an upload, rename or delete that landed on
+    // this job in the meantime must survive.
     await store.schedules.updateOne(
       { _id: job._id },
       {
-        $set: {
-          folders: (job.folders || []).filter((p) => !hit(p)),
-          files: (job.files || []).filter((f) => !hit(f.folder || '')),
-          updated_at: new Date(),
+        $pull: {
+          folders: { $in: (job.folders || []).filter((p) => hit(p)) },
+          files: { id: { $in: doomed.map((f) => f.id) } },
         },
+        $set: { updated_at: new Date() },
       }
     );
     res.json({ ok: true, removed: doomed.length });
@@ -2239,6 +2900,7 @@ app.post(
     if (!job) return;
     const plan = plannedUpload(req.body, res);
     if (!plan) return;
+    await sweepAbandonedUploads();
 
     const fileId = crypto.randomUUID();
     const key = buildKey('jobs/' + job._id, fileId, plan.filename);
@@ -2287,12 +2949,22 @@ app.post(
 
     const parts = cleanParts(req.body?.parts);
     if (!parts.length) return res.status(400).json({ error: 'No uploaded parts reported.' });
-    await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
-
-    // Trust the object, not the claim: its real length is what gets recorded,
-    // and it enforces the cap even if the browser lied at step 1.
-    const head = await storage.head({ key: doc.storage_key });
-    if (!head) return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    if (!(await claimCompletion(store.jobFiles, doc)))
+      return res.status(409).json({ error: 'That upload is already being finished. Try again in a moment.' });
+    let head;
+    try {
+      await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
+      // Trust the object, not the claim: its real length is what gets recorded,
+      // and it enforces the cap even if the browser lied at step 1.
+      head = await storage.head({ key: doc.storage_key });
+    } catch (err) {
+      await releaseCompletion(store.jobFiles, doc);
+      throw err;
+    }
+    if (!head) {
+      await releaseCompletion(store.jobFiles, doc);
+      return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    }
     if (head.size > MAX_UPLOAD_BYTES) {
       await storage.remove({ key: doc.storage_key });
       await store.jobFiles.deleteOne({ _id: doc._id });
@@ -2433,11 +3105,8 @@ app.get(
   wrap(async (req, res) => {
     const q = { clock_in_lat: { $ne: null } };
     const { from, to } = req.query;
-    if (from || to) {
-      q.clock_in = {};
-      if (from) q.clock_in.$gte = new Date(from + 'T00:00:00');
-      if (to) q.clock_in.$lte = new Date(to + 'T23:59:59.999');
-    }
+    const range = dayRange(from, to);
+    if (range) q.clock_in = range;
     const rows = await store.punches.find(q, { sort: { clock_in: -1 } }).toArray();
     const named = await withNames(rows);
     res.json(
@@ -2469,6 +3138,11 @@ app.get(
       q.$or = [
         { date: null },
         { date: { ...(from ? { $gte: String(from) } : {}), ...(to ? { $lte: String(to) } : {}) } },
+        // A multi-day job that started before the range but is still running
+        // in it is on the map too, as it is on the board.
+        ...(from
+          ? [{ date: { $lt: String(from), ...(to ? { $lte: String(to) } : {}) }, end_date: { $gte: String(from) } }]
+          : []),
       ];
     }
     const docs = (await store.schedules.find(q).toArray()).sort(scheduleSort);
@@ -2531,11 +3205,8 @@ app.patch(
 async function timesheetRows({ employeeId, from, to }) {
   const q = {};
   if (employeeId) q.employee_id = Number(employeeId);
-  if (from || to) {
-    q.clock_in = {};
-    if (from) q.clock_in.$gte = new Date(from + 'T00:00:00');
-    if (to) q.clock_in.$lte = new Date(to + 'T23:59:59.999');
-  }
+  const range = dayRange(from, to);
+  if (range) q.clock_in = range;
   const rows = await store.punches.find(q, { sort: { clock_in: -1 } }).toArray();
   const named = await withNames(rows);
   return attachMileage(
@@ -2623,27 +3294,35 @@ app.post(
     if (!emp) return res.status(400).json({ error: 'Unknown employee.' });
     if (!clock_in) return res.status(400).json({ error: 'Clock-in time is required.' });
 
-    const ci = new Date(clock_in);
-    const co = clock_out ? new Date(clock_out) : null;
+    const ci = clientTime(clock_in);
+    const co = clock_out ? clientTime(clock_out) : null;
     if (isNaN(ci)) return res.status(400).json({ error: 'Invalid clock-in time.' });
     if (co && isNaN(co)) return res.status(400).json({ error: 'Invalid clock-out time.' });
     if (co && co < ci)
       return res.status(400).json({ error: 'Clock-out must be after clock-in.' });
+    const clash = await overlappingPunch(employeeId, ci, co, null);
+    if (clash) return res.status(409).json({ error: clashMessage(clash) });
 
     const _id = await store.nextId('punches');
-    await store.punches.insertOne({
-      _id,
-      employee_id: employeeId,
-      clock_in: ci,
-      clock_out: co,
-      work_done: work_done || null,
-      missed_reason: null,
-      note: note || null,
-      shop_hours: quarterHours(req.body?.shop_hours, MAX_SHOP_HOURS),
-      lunch_hours: quarterHours(req.body?.lunch_hours, MAX_LUNCH_HOURS),
-      km_manual: manualKm(req.body?.km_manual),
-      edited: true,
-    });
+    try {
+      await store.punches.insertOne({
+        _id,
+        employee_id: employeeId,
+        clock_in: ci,
+        clock_out: co,
+        work_done: work_done || null,
+        missed_reason: null,
+        note: note || null,
+        shop_hours: quarterHours(req.body?.shop_hours, MAX_SHOP_HOURS),
+        lunch_hours: quarterHours(req.body?.lunch_hours, MAX_LUNCH_HOURS),
+        km_manual: manualKm(req.body?.km_manual),
+        edited: true,
+      });
+    } catch (err) {
+      if (err.code === 11000)
+        return res.status(409).json({ error: 'This employee already has an entry with no clock-out.' });
+      throw err;
+    }
     res.json({ id: _id });
   })
 );
@@ -2656,12 +3335,12 @@ app.patch(
     const p = await store.punches.findOne({ _id: id });
     if (!p) return res.status(404).json({ error: 'Entry not found.' });
 
-    const ci = req.body?.clock_in ? new Date(req.body.clock_in) : new Date(p.clock_in);
+    const ci = req.body?.clock_in ? clientTime(req.body.clock_in) : new Date(p.clock_in);
     let co;
     if (req.body?.clock_out === '' || req.body?.clock_out === null) {
       co = null; // explicitly reopen the entry
     } else if (req.body?.clock_out) {
-      co = new Date(req.body.clock_out);
+      co = clientTime(req.body.clock_out);
     } else {
       co = p.clock_out ? new Date(p.clock_out) : null;
     }
@@ -2694,23 +3373,32 @@ app.patch(
       paidHours({ clock_in: ci, clock_out: co, shop_hours: shopHours, lunch_hours: lunchHours }) <= 0
     )
       return res.status(400).json({ error: 'Lunch is longer than the time on the clock.' });
+    const clash = await overlappingPunch(p.employee_id, ci, co, id);
+    if (clash) return res.status(409).json({ error: clashMessage(clash) });
 
-    await store.punches.updateOne(
-      { _id: id },
-      {
-        $set: {
-          clock_in: ci,
-          clock_out: co,
-          work_done: workDone,
-          missed_reason: missedReason,
-          note,
-          shop_hours: shopHours,
-          lunch_hours: lunchHours,
-          km_manual: km,
-          edited: true,
-        },
-      }
-    );
+    try {
+      await store.punches.updateOne(
+        { _id: id },
+        {
+          $set: {
+            clock_in: ci,
+            clock_out: co,
+            work_done: workDone,
+            missed_reason: missedReason,
+            note,
+            shop_hours: shopHours,
+            lunch_hours: lunchHours,
+            km_manual: km,
+            edited: true,
+          },
+        }
+      );
+    } catch (err) {
+      // Reopening while another entry is still open: the one-open-punch index.
+      if (err.code === 11000)
+        return res.status(409).json({ error: 'This employee already has an entry with no clock-out.' });
+      throw err;
+    }
     res.json({ ok: true });
   })
 );
@@ -2724,14 +3412,51 @@ app.delete(
   })
 );
 
+// Another entry of the same employee whose time overlaps clock_in…clock_out (an
+// entry with no clock-out runs until now). Hours on top of hours would be paid
+// twice, so an edit that would cause that is refused and points at the other.
+function overlappingPunch(employeeId, ci, co, exceptId) {
+  return store.punches.findOne({
+    employee_id: employeeId,
+    ...(exceptId != null ? { _id: { $ne: exceptId } } : {}),
+    clock_in: { $lt: co || new Date() },
+    $or: [{ clock_out: null }, { clock_out: { $gt: ci } }],
+  });
+}
+const clashMessage = (p) =>
+  `That overlaps another entry for this employee (clocked in ${localDateTime(p.clock_in)}${
+    p.clock_out ? `, out ${localDateTime(p.clock_out)}` : ', still open'
+  }). Change or delete that one first.`;
+
 // ---------------------------------------------------------------------------
 // Admin: CSV export
 // ---------------------------------------------------------------------------
 
 function csvCell(v) {
   if (v == null) return '';
-  const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  let s = String(v);
+  // Text starting with = + - @ (or a tab or return) is run as a formula when
+  // the file is opened in Excel or Google Sheets — and work notes are typed by
+  // employees. A leading apostrophe makes the spreadsheet show it as text.
+  if (typeof v !== 'number' && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// "2026-10-23 17:00" in TIMEZONE — how the office reads a time. (An ISO string
+// is UTC, four or five hours off what anyone in Ontario expects to see.)
+const csvTimeFormat = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TIMEZONE,
+  hourCycle: 'h23',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+function localDateTime(d) {
+  if (d == null) return '';
+  const p = Object.fromEntries(csvTimeFormat.formatToParts(new Date(d)).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 app.get(
@@ -2762,8 +3487,8 @@ app.get(
       lines.push(
         [
           csvCell(r.name),
-          csvCell(iso(r.clock_in)),
-          csvCell(iso(r.clock_out) || ''),
+          csvCell(localDateTime(r.clock_in)),
+          csvCell(localDateTime(r.clock_out)),
           csvCell(r.shop_hours || ''),
           csvCell(r.lunch_hours || ''),
           csvCell(hoursOf(r) ?? ''),
@@ -2805,8 +3530,9 @@ const qbWrap = (fn) => (req, res) =>
         .status(err.status || 400)
         .json({ error: err.message, detail: err.detail || undefined });
     }
-    console.error(err);
-    res.status(500).json({ error: 'Server error.' });
+    const reply = errorReply(err);
+    if (reply.fault) recordFault(req, err, reply.status);
+    res.status(reply.status).json({ error: reply.message });
   });
 
 // A readable name for whoever is acting, recorded against the connection and
@@ -2858,7 +3584,9 @@ app.get(
       .toArray();
     status.mapping = {
       total: hourly.length,
-      matched: hourly.filter((e) => e.qbo_employee_id).length,
+      // Matched in the company connected now — a match from another one (the
+      // sandbox) doesn't count.
+      matched: hourly.filter((e) => qbo.matchIn(e, status.realm_id)).length,
     };
     // The callback URL for *this* deployment, so the form can offer the exact
     // string to paste into the Intuit app rather than describing it.
@@ -2936,7 +3664,7 @@ app.get(
   '/api/quickbooks/callback',
   wrap(async (req, res) => {
     const back = (params) => res.redirect(ADMIN_PATH + '?' + new URLSearchParams(params));
-    if (!(req.session && req.session.admin))
+    if (!(checkedSession(req) && req.session.admin))
       return back({ quickbooks: 'error', message: 'Sign in as an admin and try again.' });
 
     const { code, state, realmId, error, error_description: errorDescription } = req.query;
@@ -3002,9 +3730,14 @@ app.patch(
           .status(409)
           .json({ error: `${clash.name} is already matched to that QuickBooks employee.` });
     }
+    // Noted with the company it belongs to: the same id in another company is
+    // another person.
+    const realm = (await qbo.getStatus()).realm_id;
     await store.employees.updateOne(
       { _id: id },
-      qboId ? { $set: { qbo_employee_id: qboId } } : { $unset: { qbo_employee_id: '' } }
+      qboId
+        ? { $set: { qbo_employee_id: qboId, qbo_realm_id: realm || null } }
+        : { $unset: { qbo_employee_id: '', qbo_realm_id: '' } }
     );
     res.json({ ok: true, employee_id: id, qbo_employee_id: qboId || null });
   })
@@ -3018,7 +3751,7 @@ app.get(
     const period = await resolvePeriod(req.query);
     const settings = await qbo.getSettings();
     const report = await qbo.buildPeriod(period, settings);
-    const pushed = await store.qboTime.countDocuments({ period_start: period.start });
+    const pushed = await store.qboTime.countDocuments({ day: { $gte: period.start, $lte: period.end } });
     res.json({ ...report, settings, already_pushed: pushed });
   })
 );
@@ -3031,6 +3764,9 @@ app.post(
     const result = await qbo.syncPeriod(period, {
       actor: await adminActor(req),
       trigger: 'manual',
+      // Fits the host's time limit; a period too big for one go finishes on
+      // the next click (nothing is pushed twice).
+      budgetMs: Number(process.env.QBO_SYNC_BUDGET_MS) || 45000,
     });
     res.json(result);
   })
@@ -3050,9 +3786,17 @@ app.get(
 // because anything that can reach this URL can write to the company's books.
 function cronAuthorized(req) {
   const secret = process.env.CRON_SECRET || '';
-  if (secret && req.headers.authorization === `Bearer ${secret}`) return true;
-  // An admin firing it by hand from the dashboard.
-  return !!(req.session && req.session.admin && req.session.role !== 'dev');
+  if (secret) {
+    const want = Buffer.from(`Bearer ${secret}`);
+    const got = Buffer.from(String(req.headers.authorization || ''));
+    if (got.length === want.length && crypto.timingSafeEqual(got, want)) return true;
+  }
+  // An admin firing it by hand from the dashboard — by POST only. The browser
+  // sends the login cookie with a plain GET from any other site (a link, an
+  // image), which would let a page the admin happens to open set it off.
+  if (req.method !== 'POST') return false;
+  const s = checkedSession(req);
+  return !!(s && s.admin && s.role !== 'dev');
 }
 
 const cronSync = qbWrap(async (req, res) => {
@@ -3064,7 +3808,20 @@ const cronSync = qbWrap(async (req, res) => {
     });
   }
   const result = await qbo.runScheduledSync();
-  res.json(result);
+  // Counts only: the full result lists people and their hours, and a
+  // scheduler's log is no place for that.
+  const r = result.result || {};
+  res.json({
+    ran: !!result.ran,
+    skipped: result.skipped || null,
+    period: result.period || null,
+    error: result.error || null,
+    created: r.created,
+    updated: r.updated,
+    deleted: r.deleted,
+    failed: r.failed,
+    incomplete: !!r.incomplete,
+  });
 });
 app.get('/api/cron/quickbooks-sync', cronSync);
 app.post('/api/cron/quickbooks-sync', cronSync);
@@ -3090,46 +3847,321 @@ function cleanCustomer(c) {
   };
 }
 
+// `src: 'layout'` marks a line the estimator generated from the drawing, so
+// redrawing the fence replaces those lines and leaves typed ones alone.
 function cleanItems(items) {
   if (!Array.isArray(items)) return [];
   return items
-    .map((it) => ({
-      description: String(it?.description || '').trim(),
-      qty: toNum(it?.qty),
-      unit: String(it?.unit || '').trim(),
-      unit_price: toNum(it?.unit_price),
-    }))
+    .map((it) => {
+      const line = {
+        description: String(it?.description || '').trim(),
+        qty: toNum(it?.qty),
+        unit: String(it?.unit || '').trim(),
+        unit_price: toNum(it?.unit_price),
+      };
+      if (it?.src === 'layout') line.src = 'layout';
+      return line;
+    })
     .filter((it) => it.description || it.qty || it.unit_price);
 }
 
+// The same arithmetic as the editor, the PDF and the customer's page (see
+// public/totals.js), so every copy of a quote agrees to the cent.
 function quoteTotals(items, taxRate) {
-  const subtotal = (items || []).reduce((s, it) => s + it.qty * it.unit_price, 0);
-  const tax = subtotal * (toNum(taxRate) / 100);
-  return { subtotal: round2(subtotal), tax: round2(tax), total: round2(subtotal + tax) };
+  const t = docTotals.totalsOf(items, toNum(taxRate));
+  return { subtotal: t.subtotal, tax: t.tax, total: t.total };
 }
 
-function quoteView(q) {
+// The job a quote or invoice is for, which is often not where the bill goes:
+// a farm's mailing address and the back forty are different places.
+const cleanLine = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
+const cleanPct = (v) => Math.min(100, Math.max(0, toNum(v)));
+const dateOrNull = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d) ? null : d;
+};
+const QUOTE_VALID_DAYS = 30;
+
+// "Valid until" is a calendar day. A quote is still good all through that day
+// in the business's own timezone, and an accepted one never expires.
+const quoteExpired = (q) =>
+  !!q.valid_until && q.status !== 'accepted' && qbo.localDay(new Date()) > qbo.calendarDay(q.valid_until);
+
+// The drawn fence, priced, as kept on the quote — so the list and the review
+// can show cost and margin without re-running the takeoff. Recomputed here on
+// every save from the current catalog, never taken from the browser.
+function takeoffSummary(t) {
+  if (!t || !t.groups.length) return null;
+  return {
+    fence_ft: t.totals.fence_ft,
+    gates: t.totals.gates,
+    posts: t.totals.posts,
+    material_cost: t.totals.material_cost,
+    labor_cost: t.totals.labor_cost,
+    cost: t.totals.cost,
+    price: t.totals.price,
+    fences: t.groups.map((g) => ({ label: g.label, fence_ft: g.fence_ft })),
+  };
+}
+
+async function readLayout(raw) {
+  const layout = takeoff.cleanLayout(raw);
+  if (!layout) return { layout: null, takeoff: null };
+  return { layout, takeoff: takeoffSummary(takeoff.compute(layout, await catalog.getCatalog())) };
+}
+
+// `list` leaves out the heavy parts (the drawing, the signature image, the
+// last review) that only the editor needs.
+function quoteView(q, { list } = {}) {
+  const totals = quoteTotals(q.items, q.tax_rate);
+  const depositPct = q.deposit_pct || 0;
+  const t = q.takeoff || null;
   return {
     id: q._id,
     number: q.number,
     customer: q.customer || { name: '', address: '', phone: '', email: '' },
+    project: q.project || '',
+    job_site: q.job_site || '',
     quote_date: iso(q.quote_date),
+    valid_until: iso(q.valid_until),
+    expired: quoteExpired(q),
     items: q.items || [],
     tax_rate: q.tax_rate || 0,
+    deposit_pct: depositPct,
+    deposit: docTotals.deposit(totals.total, depositPct),
     notes: q.notes || '',
     status: q.status || 'draft',
     created_at: iso(q.created_at),
     updated_at: iso(q.updated_at),
-    ...quoteTotals(q.items, q.tax_rate),
+    ...totals,
+    takeoff: t,
+    margin_pct: t && totals.subtotal > 0 ? round2(((totals.subtotal - t.cost) / totals.subtotal) * 100) : null,
+    // The customer's side: the link, and what they have done with it.
+    share_token: q.share_token || null,
+    sent_at: iso(q.sent_at),
+    viewed_at: iso(q.viewed_at),
+    last_viewed_at: iso(q.last_viewed_at),
+    view_count: q.view_count || 0,
+    accepted_at: iso(q.accepted_at),
+    declined_at: iso(q.declined_at),
+    decline_reason: q.decline_reason || '',
+    signed_total: q.signed_total != null ? q.signed_total : null,
+    signature: q.signature
+      ? { name: q.signature.name, at: iso(q.signature.at), ...(list ? {} : { image: q.signature.image }) }
+      : null,
+    // False once the terms have moved on from what was signed: nothing may
+    // then present the signature as agreeing to them.
+    signature_current: signatureCurrent(q),
+    ...(list ? {} : { layout: q.layout || null, review: q.review || null }),
+    request_notes: q.request_notes || '',
+    source: q.source || null,
   };
 }
 
+// One row of the quotes list: only what the list shows. Opening a quote loads
+// the rest. Line items, terms and the drawing stay on the server — over a few
+// years of quotes they were most of the list's weight.
+function quoteListRow(q) {
+  const v = quoteView(q, { list: true });
+  return {
+    id: v.id,
+    number: v.number,
+    customer: { name: v.customer.name || '' },
+    project: v.project,
+    quote_date: v.quote_date,
+    created_at: v.created_at,
+    total: v.total,
+    margin_pct: v.margin_pct,
+    status: v.status,
+    expired: v.expired,
+    sent_at: v.sent_at,
+    viewed_at: v.viewed_at,
+    last_viewed_at: v.last_viewed_at,
+    view_count: v.view_count,
+    declined_at: v.declined_at,
+    signature: v.signature ? { name: v.signature.name } : null,
+    signature_current: v.signature_current,
+  };
+}
+
+// "<created_at>_<id>" of the last row sent: the next page starts after it.
+const quoteCursor = (q) => (q.created_at ? q.created_at.toISOString() + '_' + q._id : null);
+function parseQuoteCursor(s) {
+  const m = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)_(\d+)$/.exec(String(s || ''));
+  if (!m) return null;
+  const at = new Date(m[1]);
+  return Number.isNaN(at.getTime()) ? null : { at, id: Number(m[2]) };
+}
+
+// The quotes list, newest first. With ?limit=N it comes a page at a time —
+// { quotes, next }, and ?before=<next> asks for the page after — in the short
+// row shape above. Without it, every quote in the full shape, as it always was.
+//
+// The drawing is read (not sent) even for the list: whether a signature still
+// stands depends on it, and leaving it out once made every signed quote with a
+// drawing read "Changed since it was signed".
 app.get(
   '/api/admin/quotes',
   requireQuotes,
   wrap(async (req, res) => {
-    const rows = await store.quotes.find({}, { sort: { created_at: -1 } }).toArray();
-    res.json(rows.map(quoteView));
+    const projection = { review: 0, 'signature.image': 0 };
+    if (req.query.limit === undefined) {
+      const rows = await store.quotes.find({}, { sort: { created_at: -1 }, projection }).toArray();
+      return res.json(rows.map((q) => quoteView(q, { list: true })));
+    }
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const after = parseQuoteCursor(req.query.before);
+    const filter = after
+      ? { $or: [{ created_at: { $lt: after.at } }, { created_at: after.at, _id: { $lt: after.id } }] }
+      : {};
+    const rows = await store.quotes
+      .find(filter, { sort: { created_at: -1, _id: -1 }, projection, limit: limit + 1 })
+      .toArray();
+    const more = rows.length > limit;
+    if (more) rows.pop();
+    res.json({
+      quotes: rows.map(quoteListRow),
+      next: more && rows.length ? quoteCursor(rows[rows.length - 1]) : null,
+    });
+  })
+);
+
+// ---- the estimator's helpers (registered before "/:id" so Express never
+//      reads "catalog" as a quote id) ----
+
+// The materials & labour catalog. Everyone who can quote reads it; only the
+// office changes the prices in it.
+app.get(
+  '/api/admin/quotes/catalog',
+  requireQuotes,
+  wrap(async (req, res) => {
+    res.json({ ...(await catalog.getCatalog()), can_edit: !!(checkedSession(req) && req.session.admin) });
+  })
+);
+
+app.patch(
+  '/api/admin/quotes/catalog',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ ...(await catalog.saveCatalog(req.body || {})), can_edit: true });
+  })
+);
+
+app.post(
+  '/api/admin/quotes/catalog/reset',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ ...(await catalog.resetCatalog()), can_edit: true });
+  })
+);
+
+// Find the customer's property for the satellite estimator.
+app.get(
+  '/api/admin/quotes/geocode',
+  requireQuotes,
+  wrap(async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    let results = await searchAddress(q, 'fence quote address lookup');
+    // OpenStreetMap knows most rural roads but few rural house numbers, so a
+    // farm address finds nothing as typed. The road itself still lands the map
+    // in the right place to find the property by eye.
+    const street = q.replace(/^\s*\d+[a-z]?\s+/i, '');
+    if (!results.length && street !== q)
+      results = (await searchAddress(street, 'fence quote address lookup')).map((r) => ({ ...r, approx: true }));
+    res.json({ results });
+  })
+);
+
+// How steep each drawn leg is. Natural Resources Canada's elevation service
+// (CDEM, free under the Open Government Licence) is sampled along the leg; the
+// rise over the run is its grade. It is a ~20 m terrain model with whole-metre
+// heights — good for "this run climbs a hill", not for a gentle swale, so a
+// short leg reads as flat rather than as noise. Canada only.
+const inCanada = (lat, lng) => lat > 41.6 && lat < 84 && lng > -141.1 && lng < -52;
+
+// Ground distance in metres, unrounded. (distanceKm rounds to 0.1 km for the
+// mileage sheet, which would turn every yard-sized leg into 0 or 100 m.)
+function metresBetween(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLng = toRad(b[1] - a[1]);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// A leg's grade in percent; 0 for a leg too short for the terrain model to
+// say anything about; null when the service could not be asked or answered.
+async function legGrade(a, b, timeoutMs = 6000) {
+  const lenM = metresBetween(a, b);
+  if (lenM < 12) return 0;
+  const steps = Math.max(1, Math.min(8, Math.round(lenM / 15)));
+  const path = `LINESTRING(${a[1]} ${a[0]},${b[1]} ${b[0]})`;
+  const r = await fetch(
+    `https://geogratis.gc.ca/services/elevation/cdem/profile?path=${encodeURIComponent(path)}&steps=${steps}`,
+    { headers: { 'User-Agent': 'HEK-Timeclock/1.0 (fence slope check)' }, signal: AbortSignal.timeout(timeoutMs) }
+  );
+  if (!r.ok) return null;
+  const alts = (await r.json()).map((p) => Number(p && p.altitude)).filter(Number.isFinite);
+  if (alts.length < 2) return null;
+  return Math.round(((Math.max(...alts) - Math.min(...alts)) / lenM) * 1000) / 10;
+}
+
+app.post(
+  '/api/admin/quotes/terrain',
+  requireQuotes,
+  wrap(async (req, res) => {
+    const layout = takeoff.cleanLayout({ segments: (req.body && req.body.segments) || [] });
+    if (!layout) return res.json({ terrain: {} });
+    const first = layout.segments[0].points[0];
+    if (!inCanada(first[0], first[1]))
+      return res.json({ terrain: {}, note: 'Slope data covers Canada only.' });
+    const jobs = [];
+    for (const s of layout.segments)
+      for (let i = 1; i < s.points.length; i++) jobs.push({ id: s.id, i: i - 1, a: s.points[i - 1], b: s.points[i] });
+    // Keyed by run id, which comes from the request: no prototype, so no id can
+    // reach Object.prototype. (cleanLayout refuses such ids too.)
+    const terrain = Object.create(null);
+    for (const s of layout.segments) terrain[s.id] = new Array(Math.max(0, s.points.length - 1)).fill(null);
+    let unknown = 0;
+    // A few at a time — it is a public government service. A leg it can't
+    // answer for stays null ("not checked"), never 0 ("level"), so the editor
+    // can say so and ask again later.
+    const LIMIT = 60;
+    unknown += Math.max(0, jobs.length - LIMIT);
+    const todo = jobs.slice(0, LIMIT);
+    // One deadline for the whole check, well inside a serverless time limit:
+    // a slow service then means "not checked" for the legs left over, not a
+    // request the host kills and an editor left with nothing.
+    const deadline = Date.now() + 8000;
+    for (let k = 0; k < todo.length; k += 6) {
+      if (Date.now() > deadline) {
+        unknown += todo.length - k;
+        break;
+      }
+      await Promise.all(
+        todo.slice(k, k + 6).map(async (j) => {
+          let g = null;
+          try {
+            g = await legGrade(j.a, j.b, Math.max(1000, Math.min(6000, deadline - Date.now())));
+          } catch (err) {
+            g = null;
+          }
+          if (g == null) unknown++;
+          terrain[j.id][j.i] = g;
+        })
+      );
+    }
+    res.json({
+      terrain: { ...terrain },
+      unknown,
+      note: !unknown
+        ? null
+        : unknown === jobs.length
+          ? 'The elevation service did not answer — slope was not checked.'
+          : `Slope couldn't be checked for ${unknown} of ${jobs.length} legs — they are priced as level.`,
+    });
   })
 );
 
@@ -3153,15 +4185,25 @@ app.post(
 
     const _id = await store.nextId('quotes');
     const now = new Date();
+    const quoteDate = dateOrNull(b.quote_date) || now;
+    const status = QUOTE_STATUSES.has(b.status) ? b.status : 'draft';
     const doc = {
       _id,
       number: 'Q' + String(1000 + _id),
       customer,
-      quote_date: b.quote_date ? new Date(b.quote_date) : now,
+      project: cleanLine(b.project, 200),
+      job_site: cleanLine(b.job_site, 400),
+      quote_date: quoteDate,
+      valid_until:
+        dateOrNull(b.valid_until) || new Date(quoteDate.getTime() + QUOTE_VALID_DAYS * 86400000),
       items: cleanItems(b.items),
       tax_rate: toNum(b.tax_rate),
+      deposit_pct: cleanPct(b.deposit_pct),
       notes: String(b.notes || '').trim(),
-      status: QUOTE_STATUSES.has(b.status) ? b.status : 'draft',
+      status,
+      ...(await readLayout(b.layout)),
+      ...(status === 'sent' ? { sent_at: now } : {}),
+      ...(status === 'accepted' ? { accepted_at: now } : {}),
       created_at: now,
       updated_at: now,
     };
@@ -3184,13 +4226,72 @@ app.patch(
     if (b.items != null) set.items = cleanItems(b.items);
     if (b.tax_rate != null) set.tax_rate = toNum(b.tax_rate);
     if (b.notes != null) set.notes = String(b.notes).trim();
-    if (b.quote_date != null && b.quote_date) set.quote_date = new Date(b.quote_date);
-    if (b.status != null && QUOTE_STATUSES.has(b.status)) set.status = b.status;
+    if (b.quote_date != null && dateOrNull(b.quote_date)) set.quote_date = dateOrNull(b.quote_date);
+    // Blank means "no expiry", so an explicit null is honoured, not skipped.
+    if (b.valid_until !== undefined) set.valid_until = dateOrNull(b.valid_until);
+    if (b.project != null) set.project = cleanLine(b.project, 200);
+    if (b.job_site != null) set.job_site = cleanLine(b.job_site, 400);
+    if (b.deposit_pct != null) set.deposit_pct = cleanPct(b.deposit_pct);
+    if (b.status != null && QUOTE_STATUSES.has(b.status) && b.status !== (q.status || 'draft')) {
+      // The customer can change the status too (accepting or declining online),
+      // so a status change says which status it is changing FROM. If that is no
+      // longer the stored one, the editor is out of date — most likely the
+      // customer has just answered — and the change is refused rather than
+      // silently undoing what they did.
+      if (b.status_from != null && b.status_from !== (q.status || 'draft'))
+        return res.status(409).json({
+          error:
+            q.status === 'accepted'
+              ? 'The customer has just accepted this quote. Reopen it to see their signature.'
+              : q.status === 'declined'
+                ? 'The customer has just declined this quote. Reopen it to see why.'
+                : 'This quote changed since you opened it. Reopen it and try again.',
+          status: q.status || 'draft',
+        });
+      set.status = b.status;
+      // Marked by hand — e.g. a paper copy came back signed.
+      if (b.status === 'sent' && !q.sent_at) set.sent_at = set.updated_at;
+      if (b.status === 'accepted' && !q.accepted_at) set.accepted_at = set.updated_at;
+    }
+    if (b.layout !== undefined) Object.assign(set, await readLayout(b.layout));
 
     const name = (set.customer ? set.customer.name : q.customer && q.customer.name) || '';
     if (!name) return res.status(400).json({ error: 'Customer name is required.' });
 
-    await store.quotes.updateOne({ _id: id }, { $set: set });
+    // An accepted quote is the record of what was agreed. Contact details can
+    // be corrected, but the work, price and terms change only after reopening
+    // it (status back to Sent or Draft), and then it is signed again.
+    const accepted = (q.status || 'draft') === 'accepted';
+    const reopening = accepted && set.status !== undefined && set.status !== 'accepted';
+    if (accepted && !reopening && quoteVersion({ ...q, ...set }) !== quoteVersion(q))
+      return res.status(409).json({
+        error:
+          'This quote has been accepted, so its work, price and terms are locked. To change them, set the status ' +
+          'back to Sent — the customer will then need to sign the new version.',
+        locked: true,
+      });
+    const update = { $set: set };
+    if (reopening) {
+      // The signature was given to the old version. It is kept on file, but it
+      // no longer stands for this quote — the customer signs again.
+      update.$push = {
+        signature_history: {
+          signature: q.signature || null,
+          accepted_at: q.accepted_at || null,
+          signed_total: q.signed_total != null ? q.signed_total : null,
+          signed_items: q.signed_items || null,
+          signed_version: q.signed_version || null,
+          reopened_at: set.updated_at,
+        },
+      };
+      update.$unset = { signature: '', accepted_at: '', signed_total: '', signed_items: '', signed_version: '', signed_layout: '' };
+    }
+
+    // Only if the status is still the one read above: a customer's answer that
+    // lands in between must not be overwritten by this save.
+    const written = await store.quotes.updateOne({ _id: id, status: q.status }, update);
+    if (!written.matchedCount)
+      return res.status(409).json({ error: 'This quote changed while you were saving. Reopen it and try again.' });
     const updated = await store.quotes.findOne({ _id: id });
     res.json(quoteView(updated));
   })
@@ -3200,8 +4301,302 @@ app.delete(
   '/api/admin/quotes/:id',
   requireQuotes,
   wrap(async (req, res) => {
-    await store.quotes.deleteOne({ _id: Number(req.params.id) });
+    const id = Number(req.params.id);
+    const q = await store.quotes.findOne({ _id: id });
+    if (!q) return res.json({ ok: true });
+    // A signed or invoiced quote is the only record of what the customer agreed
+    // to, and its link is in their inbox. It stays.
+    if (q.status === 'accepted' || q.signature || (await store.invoices.findOne({ quote_id: id })))
+      return res.status(409).json({
+        error: 'This quote has been accepted or invoiced, so it is kept as the record of what was agreed.',
+      });
+    await store.quotes.deleteOne({ _id: id, status: { $ne: 'accepted' }, signature: { $exists: false } });
     res.json({ ok: true });
+  })
+);
+
+// The customer's link: a long random token, made the first time the quote is
+// sent or previewed and kept for good, so a link already in someone's inbox
+// never stops working. `sent: true` also records that it went out.
+app.post(
+  '/api/admin/quotes/:id/share',
+  requireQuotes,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const q = await store.quotes.findOne({ _id: id });
+    if (!q) return res.status(404).json({ error: 'Quote not found.' });
+    if (!q.share_token)
+      // Only if still unset, so two clicks at once can't hand out two links.
+      await store.quotes.updateOne(
+        { _id: id, share_token: { $in: [null, ''] } },
+        { $set: { share_token: crypto.randomBytes(18).toString('base64url') } }
+      );
+    if (req.body && req.body.sent) {
+      const now = new Date();
+      const set = { updated_at: now };
+      if (!q.sent_at) set.sent_at = now;
+      if ((q.status || 'draft') === 'draft') set.status = 'sent';
+      await store.quotes.updateOne({ _id: id }, { $set: set });
+    }
+    res.json(quoteView(await store.quotes.findOne({ _id: id })));
+  })
+);
+
+// "Analyze with AI": the arithmetic checks, then Claude's read of the quote.
+// The result is kept on the quote so it is still there the next time it opens.
+const analyzing = new Set(); // quote ids with a review in progress on this instance
+app.post(
+  '/api/admin/quotes/:id/analyze',
+  requireQuotes,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const q = await store.quotes.findOne({ _id: id });
+    if (!q) return res.status(404).json({ error: 'Quote not found.' });
+    // A double click shouldn't pay for the same review twice.
+    if (analyzing.has(id)) return res.status(409).json({ error: 'Already reviewing this quote — one moment.' });
+    if (q.review && q.review.at && Date.now() - new Date(q.review.at).getTime() < 15000 && q.updated_at < new Date(q.review.at))
+      return res.json(q.review);
+    analyzing.add(id);
+    try {
+      const result = await quoteReview.review(q, {
+        catalog: await catalog.getCatalog(),
+        rateBook: await rateBook.getRateBook(),
+        expired: quoteExpired(q),
+      });
+      await store.quotes.updateOne({ _id: id }, { $set: { review: result } });
+      res.json(result);
+    } finally {
+      analyzing.delete(id);
+    }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// The customer's quote page ("/quote?k=<token>") — no login. The token is the
+// whole of the access: it is long and random, a miss counts as a failed
+// attempt, and too many misses from one address lock it out like a bad
+// password does. What it returns is what the customer is shown — never the
+// cost, margin or review.
+// ---------------------------------------------------------------------------
+
+const quotePortalLimiter = limiter('quote-portal');
+const isStaff = (req) => !!(checkedSession(req) && (req.session.admin || req.session.employeeId));
+
+// What the customer is agreeing to, as a short fingerprint: the lines, tax,
+// deposit, terms, job and expiry. The page sends back the fingerprint of the
+// version it showed; if the office has changed any of it since, the signature
+// is refused and the page reloads the new version — nobody can end up on
+// record as agreeing to a price they never saw.
+function quoteVersion(q) {
+  const items = (q.items || []).map((it) => [
+    it.description || '',
+    Number(it.qty) || 0,
+    it.unit || '',
+    Number(it.unit_price) || 0,
+  ]);
+  // The drawing too: the page shows the customer where the fence goes, so a
+  // moved run or a removed gate is a different quote even at the same price.
+  const l = q.layout && Array.isArray(q.layout.segments) ? q.layout : null;
+  const drawing = l
+    ? [
+        l.segments.map((s) => [
+          s.system || '',
+          Number(s.height_ft) || 0,
+          !!s.tearout,
+          (s.points || []).map((p) => [Number(p[0]) || 0, Number(p[1]) || 0]),
+        ]),
+        (l.gates || []).map((g) => [g.seg || '', Number(g.leg) || 0, Number(g.t) || 0, Number(g.width) || 0, !!g.double]),
+      ]
+    : null;
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify([
+        items,
+        Number(q.tax_rate) || 0,
+        Number(q.deposit_pct) || 0,
+        q.notes || '',
+        q.project || '',
+        q.job_site || '',
+        iso(q.valid_until),
+        drawing,
+      ])
+    )
+    .digest('base64url')
+    .slice(0, 16);
+}
+
+// Whether a quote's signature still stands for what the quote says now. A
+// quote signed before versions were kept falls back on its signed total.
+function signatureCurrent(q) {
+  if (!q.signature || q.status !== 'accepted') return false;
+  if (q.signed_version) return q.signed_version === quoteVersion(q);
+  if (q.signed_total == null) return true;
+  return docTotals.toCents(q.signed_total) === docTotals.toCents(quoteTotals(q.items, q.tax_rate).total);
+}
+
+function portalView(q, cat) {
+  const totals = quoteTotals(q.items, q.tax_rate);
+  const depositPct = q.deposit_pct || 0;
+  const layout = q.layout
+    ? { segments: q.layout.segments, gates: q.layout.gates, center: q.layout.center, zoom: q.layout.zoom }
+    : null;
+  return {
+    number: q.number,
+    status: q.status || 'draft',
+    expired: quoteExpired(q),
+    customer: { name: (q.customer && q.customer.name) || '', address: (q.customer && q.customer.address) || '' },
+    project: q.project || '',
+    job_site: q.job_site || '',
+    quote_date: iso(q.quote_date),
+    valid_until: iso(q.valid_until),
+    items: (q.items || []).map((it) => ({
+      description: it.description,
+      qty: it.qty,
+      unit: it.unit,
+      unit_price: it.unit_price,
+    })),
+    tax_rate: q.tax_rate || 0,
+    ...totals,
+    deposit_pct: depositPct,
+    deposit: docTotals.deposit(totals.total, depositPct),
+    notes: q.notes || '',
+    layout,
+    // The legend, so the page doesn't need the catalog: each fence's name,
+    // colour and footage, and the gates — without the estimator's own prices.
+    legend: layout
+      ? takeoff.layoutLegend(layout, cat).map((g) => ({
+          label: g.label,
+          color: g.color,
+          fence_ft: g.fence_ft,
+          gates: (g.gates || []).map((x) => ({ count: x.count, label: x.label })),
+        }))
+      : [],
+    version: quoteVersion(q),
+    accepted_at: iso(q.accepted_at),
+    declined_at: iso(q.declined_at),
+    signature: q.signature ? { name: q.signature.name, at: iso(q.signature.at), image: q.signature.image } : null,
+    signature_current: signatureCurrent(q),
+  };
+}
+
+async function quoteByToken(req, res) {
+  const token = String(req.params.token || '');
+  const q = /^[A-Za-z0-9_-]{20,64}$/.test(token) ? await store.quotes.findOne({ share_token: token }) : null;
+  if (!q) {
+    await recordFail(req._rlKey);
+    res.status(404).json({ error: 'This quote link is not valid. Please check it, or contact HEK Fencing.' });
+    return null;
+  }
+  return q;
+}
+
+app.get(
+  '/api/public/quote/:token',
+  quotePortalLimiter,
+  wrap(async (req, res) => {
+    const q = await quoteByToken(req, res);
+    if (!q) return;
+    // The office previewing its own link isn't the customer reading it.
+    if (!isStaff(req)) {
+      const now = new Date();
+      await store.quotes.updateOne(
+        { _id: q._id },
+        { $set: { last_viewed_at: now, ...(q.viewed_at ? {} : { viewed_at: now }) }, $inc: { view_count: 1 } }
+      );
+    }
+    res.json(portalView(q, await catalog.getCatalog()));
+  })
+);
+
+// Approve & sign. The signature is the picture they drew plus their typed
+// name, stamped with when and from where. What they signed for — the lines
+// and the total — is kept alongside, so a later edit can't quietly change
+// what was agreed.
+app.post(
+  '/api/public/quote/:token/accept',
+  quotePortalLimiter,
+  wrap(async (req, res) => {
+    const q = await quoteByToken(req, res);
+    if (!q) return;
+    const b = req.body || {};
+    if (q.status === 'accepted') return res.status(409).json({ error: 'This quote has already been accepted.' });
+    if (quoteExpired(q))
+      return res.status(410).json({ error: 'This quote has expired. Please contact us for an updated price.' });
+    const name = cleanLine(b.name, 120);
+    if (name.length < 2) return res.status(400).json({ error: 'Please type your full name.' });
+    const image = String(b.signature || '');
+    if (!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(image) || image.length < 200)
+      return res.status(400).json({ error: 'Please sign in the box.' });
+    if (image.length > 400000) return res.status(400).json({ error: 'That signature is too large — please clear it and sign again.' });
+    if (b.agree !== true) return res.status(400).json({ error: 'Please tick the box to accept the quote.' });
+
+    // Signing what is on their screen, not whatever the quote says now.
+    const changed = () =>
+      res.status(409).json({
+        error: 'We have updated this quote since you opened it. Please look over the new version before signing.',
+        changed: true,
+      });
+    if (String(b.version || '') !== quoteVersion(q)) return changed();
+
+    const now = new Date();
+    const totals = quoteTotals(q.items, q.tax_rate);
+    // Only if nothing has changed since it was read a moment ago — an edit
+    // saved in between must not be signed for on the customer's behalf.
+    const r = await store.quotes.updateOne(
+      { _id: q._id, status: { $ne: 'accepted' }, updated_at: q.updated_at },
+      {
+        $set: {
+          status: 'accepted',
+          accepted_at: now,
+          signature: {
+            name,
+            image,
+            at: now,
+            ip: cleanLine(clientIp(req), 60),
+            agent: cleanLine(req.headers['user-agent'], 200),
+          },
+          signed_total: totals.total,
+          signed_items: q.items || [],
+          // Exactly what was signed: the version (checked against the page's
+          // just above) and the drawing that went with it.
+          signed_version: quoteVersion(q),
+          signed_layout: q.layout ? { segments: q.layout.segments, gates: q.layout.gates || [] } : null,
+          updated_at: now,
+        },
+        $unset: { declined_at: '', decline_reason: '' },
+      }
+    );
+    if (!r.matchedCount) return changed();
+    res.json(portalView(await store.quotes.findOne({ _id: q._id }), await catalog.getCatalog()));
+  })
+);
+
+app.post(
+  '/api/public/quote/:token/decline',
+  quotePortalLimiter,
+  wrap(async (req, res) => {
+    const q = await quoteByToken(req, res);
+    if (!q) return;
+    if (q.status === 'accepted')
+      return res.status(409).json({ error: 'This quote has already been accepted — please call us to make a change.' });
+    const now = new Date();
+    // Not over an acceptance that lands at the same moment (another tab, or
+    // the office marking it accepted): only a quote still not accepted.
+    const r = await store.quotes.updateOne(
+      { _id: q._id, status: { $ne: 'accepted' } },
+      {
+        $set: {
+          status: 'declined',
+          declined_at: now,
+          decline_reason: cleanLine(req.body && req.body.reason, 1000),
+          updated_at: now,
+        },
+      }
+    );
+    if (!r.matchedCount)
+      return res.status(409).json({ error: 'This quote has already been accepted — please call us to make a change.' });
+    res.json(portalView(await store.quotes.findOne({ _id: q._id }), await catalog.getCatalog()));
   })
 );
 
@@ -3266,7 +4661,18 @@ app.get(
 // "which service, how much of it".
 // ---------------------------------------------------------------------------
 
-const estimateLimiter = limiter('estimate');
+// Every request counts here, not just failed ones: these cost money (the road
+// photo is billed per picture) or lean on a free service's goodwill (the map
+// tiles, the address search), whether or not they "succeed".
+const geoBudget = budget('estimate-geo', 30, RL_WINDOW_MS);
+const tileBudget = budget('estimate-tile', 600, RL_WINDOW_MS);
+const photoBudget = budget('estimate-photo', 30, RL_WINDOW_MS);
+const priceBudget = budget('estimate-price', 200, RL_WINDOW_MS);
+const requestBudget = budget('estimate-request', 5, 60 * 60 * 1000);
+// Ceilings for everyone together, per day. Generous for real customers; a
+// flood that keeps changing address stops here.
+const STREETVIEW_DAILY_CAP = Number(process.env.STREETVIEW_DAILY_CAP) || 500;
+const REQUEST_DAILY_CAP = Number(process.env.ESTIMATE_REQUEST_DAILY_CAP) || 200;
 
 app.get(
   '/api/estimate/config',
@@ -3281,31 +4687,23 @@ app.get(
 // of the public endpoints.
 app.get(
   '/api/estimate/geocode',
-  estimateLimiter,
+  geoBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled) return res.json({ results: [] });
     const q = String(req.query.q || '').trim().slice(0, 200);
     if (q.length < 3) return res.json({ results: [] });
     try {
-      const url =
+      const data = await nominatim(
         'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=ca,us&q=' +
-        encodeURIComponent(q);
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': 'HEK-Timeclock/1.0 (customer estimate address lookup)',
-          'Accept-Language': 'en',
-        },
-      });
-      if (!r.ok) return res.json({ results: [] });
-      const data = await r.json();
-      const results = (Array.isArray(data) ? data : [])
-        .map((d) => ({ label: d.display_name, lat: Number(d.lat), lng: Number(d.lon) }))
-        .filter((x) => x.label && Number.isFinite(x.lat) && Number.isFinite(x.lng));
-      res.json({ results });
+          encodeURIComponent(q),
+        'customer estimate address lookup'
+      );
+      res.json({ results: placesFrom(data) });
     } catch (err) {
+      // Said plainly, so "nothing found" never stands in for "couldn't look".
       console.error('estimate geocode failed:', err.message);
-      res.json({ results: [] });
+      res.status(err.status || 503).json({ error: err.status ? err.message : 'Address search failed. Try again.', results: [] });
     }
   })
 );
@@ -3314,23 +4712,19 @@ app.get(
 // them, so the request carries a street address rather than bare coordinates.
 app.get(
   '/api/estimate/reverse',
-  estimateLimiter,
+  geoBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled) return res.json({ label: null });
     const { lat, lng } = cleanLatLng(req.query.lat, req.query.lng);
     if (lat == null) return res.json({ label: null });
     try {
-      const url =
-        `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`;
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': 'HEK-Timeclock/1.0 (customer estimate address lookup)',
-          'Accept-Language': 'en',
-        },
-      });
-      if (!r.ok) return res.json({ label: null });
-      const data = await r.json();
+      // Rounded to about a metre: close enough for a street address, and
+      // repeat asks for the same spot hit the cache.
+      const data = await nominatim(
+        `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat.toFixed(5)}&lon=${lng.toFixed(5)}`,
+        'customer estimate address lookup'
+      );
       res.json({ label: (data && data.display_name) || null });
     } catch (err) {
       console.error('estimate reverse geocode failed:', err.message);
@@ -3352,7 +4746,7 @@ app.get(
 // as a picture. Serving the tiles from our own origin avoids that entirely.
 app.get(
   '/api/estimate/tile/:z/:x/:y',
-  estimateLimiter,
+  tileBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled) return res.status(404).end();
@@ -3393,10 +4787,13 @@ app.get(
 // server — the browser only ever asks us for a picture.
 app.get(
   '/api/estimate/streetview',
-  estimateLimiter,
+  photoBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled) return res.status(404).json({ error: 'Estimates are closed.' });
+    // Each picture is billed to the business's Google account.
+    if (await overDailyCap('estimate-photo', STREETVIEW_DAILY_CAP))
+      return res.status(429).json({ error: 'Road photos are unavailable for the rest of today.' });
     const key = await estimates.googleKey();
     if (!key)
       return res.status(409).json({ error: 'No Google Maps key is set up, so there is no photo.' });
@@ -3452,7 +4849,7 @@ app.get(
 // property. The overlay needs both before it can draw anything.
 app.get(
   '/api/estimate/streetview/meta',
-  estimateLimiter,
+  photoBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled) return res.status(404).json({ error: 'Estimates are closed.' });
@@ -3478,7 +4875,7 @@ app.get(
 // see is the figure that gets filed.
 app.post(
   '/api/estimate/price',
-  estimateLimiter,
+  priceBudget,
   wrap(async (req, res) => {
     const settings = await estimates.getSettings();
     if (!settings.enabled)
@@ -3489,22 +4886,20 @@ app.post(
 
 app.post(
   '/api/estimate/request',
-  estimateLimiter,
+  requestBudget,
   wrap(async (req, res) => {
+    if (await overDailyCap('estimate-request', REQUEST_DAILY_CAP))
+      return res
+        .status(429)
+        .json({ error: 'We can\'t take more requests online today. Please call or email us instead.' });
     try {
       const doc = await estimates.createRequest(req.body || {}, {
         ip: clientIp(req),
         agent: req.headers['user-agent'],
       });
-      // A failed-attempt counter is only meant to catch abuse, so a genuine
-      // request clears it — a busy day of real enquiries never locks anyone out.
-      await clearFails(req._rlKey);
       res.json({ ok: true, reference: 'R' + String(1000 + doc._id), total: doc.total });
     } catch (err) {
-      if (err.status) {
-        await recordFail(req._rlKey);
-        return res.status(err.status).json({ error: err.message });
-      }
+      if (err.status) return res.status(err.status).json({ error: err.message });
       throw err;
     }
   })
@@ -3543,6 +4938,48 @@ app.get(
   })
 );
 
+// Just the number of new requests, for the sidebar badge on every dashboard
+// load — no need to ship the whole queue for one figure.
+app.get(
+  '/api/admin/estimate/requests/count',
+  requireAdmin,
+  wrap(async (req, res) => {
+    res.json({ unread: await estimates.countNew() });
+  })
+);
+
+// The fence system a rate-book service is, or undefined (tear-out, repairs and
+// the like are per-foot services too, but not a fence anyone can draw).
+const systemForService = (service) =>
+  Object.keys(takeoff.SYSTEMS).find((k) => takeoff.SYSTEMS[k].ratebook === service);
+
+// The line of a request that is the traced fence: the first per-foot line
+// whose service is a fence system. Null when none is.
+const fenceLineOf = (r) =>
+  (r.items || []).find((i) => takeoff.isLinearFoot(i.unit) && systemForService(i.service)) || null;
+
+// A public request's traced runs as an estimator layout, as the fence they
+// priced (the rate book and the catalog name the same fences), at the height
+// they picked in the 3D view if they did.
+function layoutFromRequest(r) {
+  const runs = (r.measurement && r.measurement.runs) || [];
+  if (!runs.length) return null;
+  const line = fenceLineOf(r);
+  const system = (line && systemForService(line.service)) || 'wood_privacy';
+  const height = (r.preview && Number(r.preview.height_ft)) || takeoff.SYSTEMS[system].height;
+  return {
+    address: r.site || '',
+    segments: runs.map((points, i) => ({ id: 's' + (i + 1), system, height_ft: height, points })),
+    gates: [],
+  };
+}
+
+// The editor's starting terms for a new quote (the same words as in quotes.js).
+const QUOTE_DEFAULT_TERMS =
+  'Free estimate. Prices in CAD; top-quality materials and professional ' +
+  'installation included unless noted. A deposit may be required to ' +
+  'schedule your installation.';
+
 // Approving a request is what turns it into a quote — the page never does.
 app.post(
   '/api/admin/estimate/requests/:id/approve',
@@ -3554,34 +4991,71 @@ app.post(
     if (r.quote_id)
       return res.status(409).json({ error: 'That request has already been turned into a quote.' });
 
+    // Everything that can fail is worked out before the request is claimed, so
+    // a failure here leaves it approvable instead of "already quoted".
+    const layout = await readLayout(layoutFromRequest(r));
+    const fence = layout.layout ? fenceLineOf(r) : null;
+    const items = (r.items || []).map((i) => ({
+      description: i.description,
+      qty: i.qty,
+      unit: i.unit,
+      unit_price: i.unit_price,
+      // With the drawing attached, the fence line IS the drawn fence: tagged
+      // as such, "Put on quote" replaces it with the estimator's lines instead
+      // of pricing the fence a second time. Only that line — tear-out or a
+      // second service priced by the foot is not part of the drawing.
+      ...(fence && i.service === fence.service ? { src: 'layout' } : {}),
+    }));
+    // The page lifted a small job to the minimum charge, and that is the total
+    // the customer was shown; the quote carries the difference as its own line.
+    if (r.below_minimum) {
+      const lines = round2(items.reduce((s, i) => s + (Number(i.qty) || 0) * (Number(i.unit_price) || 0), 0));
+      const topUp = round2((Number(r.subtotal) || 0) - lines);
+      if (topUp > 0) items.push({ description: 'Minimum job charge', qty: 1, unit: 'each', unit_price: topUp });
+    }
+
     const quoteId = await store.nextId('quotes');
     const now = new Date();
+    // Claimed first, in one step, so a double click can't make two quotes.
+    const claim = await store.estimateRequests.updateOne(
+      { _id: id, quote_id: null },
+      { $set: { status: 'approved', quote_id: quoteId, approved_at: now } }
+    );
+    if (!claim.modifiedCount)
+      return res.status(409).json({ error: 'That request has already been turned into a quote.' });
+
     const quote = {
       _id: quoteId,
       number: 'Q' + String(1000 + quoteId),
       customer: cleanCustomer(r.customer),
       quote_date: now,
-      items: cleanItems(
-        (r.items || []).map((i) => ({
-          description: i.description,
-          qty: i.qty,
-          unit: i.unit,
-          unit_price: i.unit_price,
-        }))
-      ),
+      valid_until: new Date(now.getTime() + QUOTE_VALID_DAYS * 86400000),
+      items: cleanItems(items),
       tax_rate: toNum(r.tax_rate),
-      notes: r.notes || '',
+      // The quote's notes are its printed terms. What the customer wrote on
+      // the request is kept for the office to read, not sent back to them as
+      // something they agree to.
+      notes: QUOTE_DEFAULT_TERMS,
+      request_notes: cleanLine(r.notes, 2000),
       status: 'draft',
+      // The line the customer traced comes across as the quote's fence
+      // layout, so the estimator starts from their drawing, not a blank map.
+      ...layout,
       // Where it came from, so the estimator can reread the original request.
       source: { type: 'estimate', request_id: id },
       created_at: now,
       updated_at: now,
     };
-    await store.quotes.insertOne(quote);
-    await store.estimateRequests.updateOne(
-      { _id: id },
-      { $set: { status: 'approved', quote_id: quoteId, approved_at: now } }
-    );
+    try {
+      await store.quotes.insertOne(quote);
+    } catch (err) {
+      // Give the request back rather than leave it pointing at nothing.
+      await store.estimateRequests.updateOne(
+        { _id: id, quote_id: quoteId },
+        { $set: { status: r.status || 'new', quote_id: null }, $unset: { approved_at: '' } }
+      );
+      throw err;
+    }
     res.json({ ok: true, quote: quoteView(quote) });
   })
 );
@@ -3622,48 +5096,73 @@ app.delete(
 // Stored statuses only. paid / overdue are computed in invoiceView.
 const INVOICE_STATUSES = new Set(['draft', 'sent', 'void']);
 const DEFAULT_TERMS_DAYS = 30;
+// Payment terms printed on the invoice. "custom" means someone picked a due
+// date by hand, so the terms no longer describe it.
+const INVOICE_TERMS = { receipt: 0, net7: 7, net15: 15, net30: 30, net45: 45, net60: 60, custom: null };
 
+// Each payment carries an id of its own, made here — never taken from the
+// browser — so removing one names exactly that payment, whatever has been
+// added or removed since the page was drawn.
 function cleanPayments(list) {
   if (!Array.isArray(list)) return [];
   return list
     .map((p) => ({
+      id: crypto.randomUUID(),
       amount: round2(toNum(p?.amount)),
       date: p?.date ? new Date(p.date) : new Date(),
-      method: String(p?.method || '').trim(),
-      note: String(p?.note || '').trim(),
+      method: String(p?.method || '').trim().slice(0, 60),
+      note: String(p?.note || '').trim().slice(0, 500),
     }))
     .filter((p) => p.amount > 0 && !isNaN(p.date));
+}
+
+// Payments recorded before they had ids get them, once, the first time the
+// invoice is opened. Written only if the list is still exactly as read, so a
+// payment added meanwhile is never lost; the fresh copy is returned either way.
+async function withPaymentIds(inv) {
+  if (!inv || (inv.payments || []).every((p) => p.id)) return inv;
+  const payments = inv.payments.map((p) => (p.id ? p : { ...p, id: crypto.randomUUID() }));
+  await store.invoices.updateOne({ _id: inv._id, payments: inv.payments }, { $set: { payments } });
+  return store.invoices.findOne({ _id: inv._id });
 }
 
 const todayLocal = () => qbo.localDay(new Date());
 
 function invoiceView(inv) {
   const totals = quoteTotals(inv.items, inv.tax_rate);
-  const payments = (inv.payments || []).map((p) => ({ ...p, date: iso(p.date) }));
+  const payments = (inv.payments || []).map((p) => ({ ...p, id: p.id || null, date: iso(p.date) }));
   const paid = round2(payments.reduce((s, p) => s + toNum(p.amount), 0));
   const balance = round2(totals.total - paid);
-  const dueDay = inv.due_date ? qbo.localDay(inv.due_date) : null;
+  // A picked due date is a calendar day; see calendarDay in quickbooks.js.
+  const dueDay = inv.due_date ? qbo.calendarDay(inv.due_date) : null;
 
   // The stored status only says what the office did with it. Whether it is
   // settled or late falls out of the numbers.
   let status = inv.status || 'draft';
   if (status !== 'void' && status !== 'draft') {
     if (totals.total > 0 && balance <= 0) status = 'paid';
-    else if (dueDay && dueDay < todayLocal()) status = 'overdue';
+    // Late only while something is actually owed: a no-charge invoice (a
+    // warranty call, say) is never overdue.
+    else if (balance > 0 && dueDay && dueDay < todayLocal()) status = 'overdue';
   }
 
   return {
     id: inv._id,
     number: inv.number,
     customer: inv.customer || { name: '', address: '', phone: '', email: '' },
+    project: inv.project || '',
+    job_site: inv.job_site || '',
     items: inv.items || [],
     tax_rate: inv.tax_rate || 0,
     notes: inv.notes || '',
     issue_date: iso(inv.issue_date),
     due_date: iso(inv.due_date),
+    terms: inv.terms || 'net30',
+    po: inv.po || '',
     stored_status: inv.status || 'draft',
     status,
     quote_id: inv.quote_id || null,
+    quote_number: inv.quote_number || null,
     // Where this invoice stands in QuickBooks, so the list can show it without
     // asking Intuit on every page load.
     qbo: inv.qbo
@@ -3692,6 +5191,10 @@ function readInvoiceFields(b, { partial } = {}) {
   if (b.notes != null) set.notes = String(b.notes || '').trim();
   if (b.issue_date != null) set.issue_date = b.issue_date ? new Date(b.issue_date) : new Date();
   if (b.due_date != null) set.due_date = b.due_date ? new Date(b.due_date) : null;
+  if (b.project != null) set.project = cleanLine(b.project, 200);
+  if (b.job_site != null) set.job_site = cleanLine(b.job_site, 400);
+  if (b.po != null) set.po = cleanLine(b.po, 60);
+  if (b.terms != null && Object.prototype.hasOwnProperty.call(INVOICE_TERMS, b.terms)) set.terms = b.terms;
   if (b.status != null && INVOICE_STATUSES.has(b.status)) set.status = b.status;
   if (b.payments != null) set.payments = cleanPayments(b.payments);
   return set;
@@ -3701,11 +5204,27 @@ app.get(
   '/api/admin/invoices',
   requireAdmin,
   wrap(async (req, res) => {
-    const rows = await store.invoices.find({}, { sort: { created_at: -1 } }).toArray();
-    const invoices = rows.map(invoiceView);
+    const rows = await store.invoices
+      .find({}, { sort: { created_at: -1 }, projection: { notes: 0, terms: 0, po: 0 } })
+      .toArray();
+    const all = rows.map(invoiceView);
     // Totals for the header tiles. Voided invoices are money that was never
     // owed, so they're left out of both.
-    const live = invoices.filter((i) => i.status !== 'void');
+    const live = all.filter((i) => i.status !== 'void');
+    // Each row carries only what the list shows; opening one loads the rest.
+    const invoices = all.map((i) => ({
+      id: i.id,
+      number: i.number,
+      customer: { name: (i.customer && i.customer.name) || '' },
+      project: i.project,
+      issue_date: i.issue_date,
+      due_date: i.due_date,
+      status: i.status,
+      total: i.total,
+      paid: i.paid,
+      balance: i.balance,
+      qbo: i.qbo ? { id: i.qbo.id } : null,
+    }));
     res.json({
       invoices,
       totals: {
@@ -3724,9 +5243,9 @@ app.get(
   '/api/admin/invoices/:id',
   requireAdmin,
   wrap(async (req, res) => {
-    const inv = await store.invoices.findOne({ _id: Number(req.params.id) });
+    const inv = await withPaymentIds(await store.invoices.findOne({ _id: Number(req.params.id) }));
     if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
-    res.json(invoiceView(inv));
+    res.json({ ...invoiceView(inv), shipment: await shipmentOf(inv) });
   })
 );
 
@@ -3741,12 +5260,14 @@ app.post(
     const _id = await store.nextId('invoices');
     const now = new Date();
     const issue = set.issue_date || now;
+    const termDays = INVOICE_TERMS[set.terms] ?? DEFAULT_TERMS_DAYS;
     const doc = {
       _id,
       number: 'INV-' + String(1000 + _id),
       ...set,
+      terms: set.terms || 'net30',
       issue_date: issue,
-      due_date: set.due_date || new Date(issue.getTime() + DEFAULT_TERMS_DAYS * 86400000),
+      due_date: set.due_date || new Date(issue.getTime() + termDays * 86400000),
       status: set.status || 'draft',
       payments: set.payments || [],
       quote_id: Number.isInteger(b.quote_id) ? b.quote_id : null,
@@ -3766,11 +5287,31 @@ app.patch(
     const inv = await store.invoices.findOne({ _id: id });
     if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
     const set = readInvoiceFields(req.body || {}, { partial: true });
+    // Money received is recorded and removed through its own routes, one
+    // payment at a time. A form save must never rewrite the list — an editor
+    // opened before a payment was recorded would quietly erase it.
+    delete set.payments;
     if (set.customer && !set.customer.name)
       return res.status(400).json({ error: 'Customer name is required.' });
     set.updated_at = new Date();
+
+    // Voiding one that is in QuickBooks voids it there too, or the customer
+    // keeps getting reminders and a pay link for money they don't owe. If that
+    // can't be done now, it is still voided here and the office is told.
+    let warning = null;
+    if (set.status === 'void' && (inv.status || 'draft') !== 'void' && inv.qbo && inv.qbo.id) {
+      try {
+        const realm = (await qbo.getStatus()).realm_id;
+        if (qbo.sameCompany(inv.qbo, realm)) {
+          await qbo.voidInvoice(inv.qbo.id);
+          set['qbo.voided_at'] = new Date();
+        } else warning = 'Voided here. It was sent to a QuickBooks company that is not connected now — void it there too.';
+      } catch (err) {
+        warning = `Voided here, but QuickBooks didn't void its copy (${err.detail || err.message}). Void it in QuickBooks too.`;
+      }
+    }
     await store.invoices.updateOne({ _id: id }, { $set: set });
-    res.json(invoiceView(await store.invoices.findOne({ _id: id })));
+    res.json({ ...invoiceView(await store.invoices.findOne({ _id: id })), ...(warning ? { warning } : {}) });
   })
 );
 
@@ -3793,21 +5334,38 @@ app.post(
   })
 );
 
+// Removes the payment with this id — by id, not by its row on someone's
+// screen, which may no longer be the row it is on.
 app.delete(
-  '/api/admin/invoices/:id/payments/:index',
+  '/api/admin/invoices/:id/payments/:paymentId',
   requireAdmin,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
-    const inv = await store.invoices.findOne({ _id: id });
+    const inv = await withPaymentIds(await store.invoices.findOne({ _id: id }));
     if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
-    const index = Number(req.params.index);
-    const payments = [...(inv.payments || [])];
-    if (!Number.isInteger(index) || index < 0 || index >= payments.length)
-      return res.status(404).json({ error: 'Payment not found.' });
-    payments.splice(index, 1);
+    const pid = String(req.params.paymentId);
+    const payment = (inv.payments || []).find((p) => p.id === pid);
+    if (!payment)
+      return res.status(404).json({ error: 'That payment is no longer on this invoice. Reload it to see the current list.' });
+    // Recorded in QuickBooks too: take it back there first, so the two don't
+    // disagree about what is owed.
+    const qboPaymentId = inv.qbo && inv.qbo.payment_ids && inv.qbo.payment_ids[pid];
+    if (qboPaymentId) {
+      try {
+        await qbo.deletePayment(qboPaymentId);
+      } catch (err) {
+        return res.status(502).json({
+          error: `QuickBooks wouldn't remove this payment (${err.detail || err.message}). Remove it there first, then here.`,
+        });
+      }
+    }
     await store.invoices.updateOne(
       { _id: id },
-      { $set: { payments, updated_at: new Date() } }
+      {
+        $pull: { payments: { id: pid } },
+        $set: { updated_at: new Date() },
+        ...(qboPaymentId ? { $unset: { ['qbo.payment_ids.' + pid]: '' } } : {}),
+      }
     );
     res.json(invoiceView(await store.invoices.findOne({ _id: id })));
   })
@@ -3832,25 +5390,44 @@ app.post(
 
     const _id = await store.nextId('invoices');
     const now = new Date();
+    // Claimed on the quote first, in one step: two people (or two tabs)
+    // converting at once would both pass the check above and bill the job twice.
+    const claim = await store.quotes.updateOne({ _id: quoteId, invoice_id: null }, { $set: { invoice_id: _id } });
+    if (!claim.modifiedCount)
+      return res.status(409).json({ error: 'That quote has just been turned into an invoice.' });
     const doc = {
       _id,
       number: 'INV-' + String(1000 + _id),
       customer: q.customer || { name: '', address: '', phone: '', email: '' },
+      project: q.project || '',
+      job_site: q.job_site || '',
       items: q.items || [],
       tax_rate: q.tax_rate || 0,
       notes: q.notes || '',
       issue_date: now,
       due_date: new Date(now.getTime() + DEFAULT_TERMS_DAYS * 86400000),
+      terms: 'net30',
+      po: '',
       status: 'draft',
       payments: [],
       quote_id: quoteId,
+      quote_number: q.number,
       created_at: now,
       updated_at: now,
     };
-    await store.invoices.insertOne(doc);
+    try {
+      await store.invoices.insertOne(doc);
+    } catch (err) {
+      // Give the quote back rather than leave it claimed by nothing.
+      await store.quotes.updateOne({ _id: quoteId, invoice_id: _id }, { $set: { invoice_id: null } });
+      throw err;
+    }
     // Accepting is implied by billing for it.
     if (q.status !== 'accepted')
-      await store.quotes.updateOne({ _id: quoteId }, { $set: { status: 'accepted', updated_at: now } });
+      await store.quotes.updateOne(
+        { _id: quoteId },
+        { $set: { status: 'accepted', updated_at: now, ...(q.accepted_at ? {} : { accepted_at: now }) } }
+      );
     res.json(invoiceView(doc));
   })
 );
@@ -3867,8 +5444,190 @@ app.delete(
       return res
         .status(409)
         .json({ error: 'This invoice has payments recorded. Void it instead of deleting it.' });
-    await store.invoices.deleteOne({ _id: Number(req.params.id) });
+    // Once it is in QuickBooks the customer may already have it, with a pay
+    // link. Deleting our copy would leave theirs open and owed with nothing
+    // here to show for it; voiding voids both.
+    if (inv.qbo && inv.qbo.id)
+      return res
+        .status(409)
+        .json({ error: 'This invoice is in QuickBooks. Void it instead of deleting it — that voids it there too.' });
+    // Only while that is still true: a payment recorded a moment ago, or a push
+    // to QuickBooks, keeps it.
+    const r = await store.invoices.deleteOne({
+      _id: inv._id,
+      'payments.0': { $exists: false },
+      'qbo.id': { $exists: false },
+    });
+    if (!r.deletedCount)
+      return res.status(409).json({ error: 'This invoice just changed. Reload it and try again.' });
+    // Its quote can be invoiced again.
+    if (inv.quote_id != null)
+      await store.quotes.updateOne({ _id: inv.quote_id, invoice_id: inv._id }, { $set: { invoice_id: null } });
     res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Invoice -> shipment. Puts the job on the Schedule board's "To be scheduled"
+// list with everything the crew and the office need, so nothing is retyped.
+// It goes in without a date on purpose: booking the day is the scheduler's
+// call, made on the board like any other job.
+// ---------------------------------------------------------------------------
+
+const fmtMoney = (n) =>
+  '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtQty = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
+
+// The shipment an invoice made, as the board has it now — or null if none was
+// made or it has since been deleted.
+//
+// An invoice can have several (a split delivery), so it keeps every job id it
+// made; the one shown is the latest still on the board, with a count.
+const shipmentIdsOf = (inv) => [...(inv.shipment_ids || []), ...(inv.shipment_id ? [inv.shipment_id] : [])];
+async function shipmentOf(inv) {
+  const ids = shipmentIdsOf(inv);
+  if (!ids.length) return null;
+  const jobs = await store.schedules.find({ _id: { $in: ids } }).toArray();
+  if (!jobs.length) return null;
+  const job = jobs.sort((a, b) => b._id - a._id)[0];
+  return {
+    id: job._id,
+    date: job.date || null,
+    end_date: job.end_date || null,
+    time: job.time || null,
+    job_type: job.job_type || 'Delivery',
+    count: jobs.length,
+  };
+}
+
+// A street address for the job's one-line address field. Typed addresses are
+// multi-line on the invoice; the schedule's input would silently drop the line
+// breaks and run the lines together, so they become ", " here.
+const oneLine = (s) =>
+  String(s || '')
+    .split(/\s*[\r\n]+\s*/)
+    .filter(Boolean)
+    .join(', ')
+    .trim();
+
+// Join lines into a note no longer than the job form keeps (cleanNote cuts
+// at 2000), dropping whole lines from the end rather than cutting one in half.
+function fitNote(lines, max = 2000) {
+  const out = [];
+  let len = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (len + line.length + 1 > max - 60) {
+      const left = lines.slice(i).filter((l) => l.startsWith('•')).length;
+      if (left) out.push(`…and ${left} more — see the invoice.`);
+      break;
+    }
+    out.push(line);
+    len += line.length + 1;
+  }
+  return out.join('\n');
+}
+
+app.post(
+  '/api/admin/invoices/:id/shipment',
+  requireAdmin,
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const inv = await store.invoices.findOne({ _id: id });
+    if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
+    // The board is its own feature; if it has been switched off there is
+    // nowhere for the shipment to go.
+    if (!(await getEntitlements()).schedule)
+      return res.status(403).json({ error: 'Scheduling is turned off, so there is no board to add it to.' });
+    const existing = await shipmentOf(inv);
+    if (existing && !(req.body && req.body.again))
+      return res.status(409).json({ error: 'This invoice already has a shipment on the schedule.', shipment: existing });
+
+    // Where it is going. The quote's drawing, when there is one, says exactly
+    // where on the property — better than whatever a geocoder guesses.
+    const quote = inv.quote_id ? await store.quotes.findOne({ _id: inv.quote_id }) : null;
+    const layout = quote && quote.layout && quote.layout.segments && quote.layout.segments.length ? quote.layout : null;
+    const c = inv.customer || {};
+    const address = oneLine(inv.job_site || c.address || (layout && layout.address) || '');
+    if (!address)
+      return res.status(400).json({ error: 'Add a job site or billing address to the invoice first — the crew needs to know where it goes.' });
+    let lat = null;
+    let lng = null;
+    if (layout) {
+      const pts = layout.segments.flatMap((s) => s.points);
+      ({ lat, lng } = cleanLatLng(
+        pts.reduce((s, p) => s + p[0], 0) / pts.length,
+        pts.reduce((s, p) => s + p[1], 0) / pts.length
+      ));
+    }
+
+    const v = invoiceView(inv);
+    const items = (inv.items || []).filter((it) => it.description || Number(it.qty));
+    const bullet = (it) => {
+      const head = String(it.description || '').split('\n')[0].trim();
+      const qty = Number(it.qty) || 0;
+      return `• ${qty ? `${fmtQty(qty)}${it.unit ? ' ' + it.unit : ''} — ` : ''}${head}`;
+    };
+
+    // For the crew: who to call, what is going, and — if the job was drawn —
+    // the load list the estimator worked out.
+    const crew = [
+      `Customer: ${[c.name, c.phone].filter(Boolean).join(' · ')}`,
+      `${inv.number}${inv.po ? ` · PO ${inv.po}` : ''}${inv.project ? ` · ${inv.project}` : ''}`,
+    ];
+    if (items.length) crew.push('', 'What’s going:', ...items.map(bullet));
+    if (layout) {
+      const t = takeoff.compute(layout, await catalog.getCatalog());
+      if (t.materials.length) {
+        crew.push('', `Load list (from the drawing — ${t.totals.fence_ft} ft, ${t.totals.gates} gate${t.totals.gates === 1 ? '' : 's'}):`);
+        crew.push(...t.materials.map((m) => `• ${fmtQty(m.qty)} ${m.unit} — ${m.label}`));
+      }
+    }
+
+    // For the office only: the money side, which the crew never sees.
+    const office = fitNote([
+      `From invoice ${inv.number}${inv.quote_number ? ` (quote ${inv.quote_number})` : ''}.`,
+      `Total ${fmtMoney(v.total)} · paid ${fmtMoney(v.paid)} · balance ${fmtMoney(v.balance)}${
+        v.due_date
+          ? ` · due ${new Date(qbo.calendarDay(inv.due_date) + 'T12:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric', year: 'numeric' })}`
+          : ''
+      }`,
+      `Bill to: ${[c.name, c.address, c.phone, c.email].filter(Boolean).join(', ')}`,
+      inv.notes ? `Invoice notes: ${inv.notes}` : '',
+    ].filter(Boolean));
+
+    const _id = await store.nextId('schedules');
+    const now = new Date();
+    // Claim the invoice's next shipment in one step: two clicks at once both
+    // read the same count, and only one of them can move it on.
+    const seq = inv.shipment_seq || 0;
+    const claim = await store.invoices.updateOne(
+      { _id: id, shipment_seq: seq ? seq : { $in: [null, 0] } },
+      { $set: { shipment_seq: seq + 1 }, $push: { shipment_ids: _id } }
+    );
+    if (!claim.modifiedCount)
+      return res.status(409).json({ error: 'A shipment for this invoice was just created.', shipment: await shipmentOf(inv) });
+    await store.schedules.insertOne({
+      _id,
+      address,
+      // The first line is the card's title on the board.
+      description: `${c.name || 'Customer'}${inv.project ? ' — ' + inv.project : ''}\n${inv.number}`,
+      date: null,
+      end_date: null,
+      time: null,
+      due_date: null,
+      job_type: cleanJobType(req.body && req.body.job_type),
+      notes_driver: fitNote(crew),
+      notes_internal: office,
+      confirmed: false,
+      lat,
+      lng,
+      employee_ids: [],
+      source: { type: 'invoice', invoice_id: id, invoice_number: inv.number },
+      created_at: now,
+      updated_at: now,
+    });
+    res.json({ id: _id, shipment: await shipmentOf(await store.invoices.findOne({ _id: id })) });
   })
 );
 
@@ -3880,12 +5639,56 @@ app.delete(
 
 // Record what QuickBooks said against our copy, so the UI can show where an
 // invoice stands without asking Intuit again on every page load.
+// (Not touching updated_at: that is when the invoice itself was last edited.)
 async function saveQboState(id, patch) {
   const set = {};
   for (const [k, v] of Object.entries(patch)) set['qbo.' + k] = v;
-  set.updated_at = new Date();
   await store.invoices.updateOne({ _id: id }, { $set: set });
 }
+
+// One push or send per invoice at a time: two clicks (or two people) must not
+// both create it in QuickBooks. A claim older than two minutes is a crashed
+// attempt and can be taken over.
+async function claimQboWork(id) {
+  const r = await store.invoices.updateOne(
+    { _id: id, $or: [{ qbo_busy_at: null }, { qbo_busy_at: { $lt: new Date(Date.now() - 120000) } }] },
+    { $set: { qbo_busy_at: new Date() } }
+  );
+  return r.modifiedCount === 1;
+}
+const releaseQboWork = (id) => store.invoices.updateOne({ _id: id }, { $unset: { qbo_busy_at: '' } });
+
+// Push the invoice as it stands, then any payments recorded here that
+// QuickBooks doesn't have yet. Returns the push result and the refreshed doc.
+async function pushToQbo(inv) {
+  const view = invoiceView(inv);
+  // Push the totals the office sees, not the raw doc, so what lands in
+  // QuickBooks matches the invoice on screen.
+  const result = await qbo.pushInvoice({ ...view, qbo: inv.qbo });
+  const sameCo = qbo.sameCompany(inv.qbo, result.realm_id);
+  const known = (sameCo && sameCo.id === result.id && inv.qbo.payment_ids) || {};
+  await saveQboState(inv._id, {
+    id: result.id,
+    doc_number: result.doc_number,
+    total: result.total,
+    customer_id: result.customer.id,
+    realm_id: result.realm_id,
+    hash: result.hash,
+    mismatch: result.mismatch,
+    synced_at: new Date(),
+    payment_ids: known,
+  });
+  const added = await qbo.pushPayments(view, { invoiceId: result.id, customerId: result.customer.id, known });
+  if (Object.keys(added).length)
+    await saveQboState(inv._id, { payment_ids: { ...known, ...added } });
+  return { result, payments: Object.keys(added).length, inv: await store.invoices.findOne({ _id: inv._id }) };
+}
+
+const mismatchWarning = (m) =>
+  m
+    ? `QuickBooks totalled this at ${m.theirs.toFixed(2)} where we have ${m.ours.toFixed(2)}. QuickBooks works tax out ` +
+      'from its own tax code, so check the tax setting before sending.'
+    : null;
 
 app.post(
   '/api/admin/invoices/:id/quickbooks',
@@ -3897,29 +5700,22 @@ app.post(
     if ((inv.status || 'draft') === 'void')
       return res.status(409).json({ error: 'That invoice is void — nothing to send.' });
 
-    // Push the totals the office sees, not the raw doc, so what lands in
-    // QuickBooks matches the invoice on screen.
-    const view = invoiceView(inv);
-    const result = await qbo.pushInvoice({ ...view, qbo: inv.qbo });
-    await saveQboState(id, {
-      id: result.id,
-      doc_number: result.doc_number,
-      total: result.total,
-      customer_id: result.customer.id,
-      synced_at: new Date(),
-    });
-    res.json({
-      ok: true,
-      qbo: result,
-      link: await qbo.invoiceLink(result.id),
-      // Surfaced rather than swallowed: our flat tax percentage and
-      // QuickBooks' tax engine can legitimately disagree.
-      warning: result.mismatch
-        ? `QuickBooks totalled this at ${result.mismatch.theirs.toFixed(2)} where we have ` +
-          `${result.mismatch.ours.toFixed(2)}. QuickBooks works tax out from its own tax code, ` +
-          `so check the tax setting before sending.`
-        : null,
-    });
+    if (!(await claimQboWork(id)))
+      return res.status(409).json({ error: 'This invoice is already being sent to QuickBooks.' });
+    try {
+      const { result, payments } = await pushToQbo(inv);
+      res.json({
+        ok: true,
+        qbo: result,
+        payments_sent: payments,
+        link: await qbo.invoiceLink(result.id),
+        // Surfaced rather than swallowed: our flat tax percentage and
+        // QuickBooks' tax engine can legitimately disagree.
+        warning: mismatchWarning(result.mismatch),
+      });
+    } finally {
+      await releaseQboWork(id);
+    }
   })
 );
 
@@ -3933,18 +5729,51 @@ app.post(
     if (!inv.qbo || !inv.qbo.id)
       return res.status(409).json({ error: 'Send it to QuickBooks first.' });
 
+    if ((inv.status || 'draft') === 'void')
+      return res.status(409).json({ error: 'That invoice is void — nothing to send.' });
+
     const to = String((req.body && req.body.email) || (inv.customer && inv.customer.email) || '').trim();
     if (!to)
       return res
         .status(400)
         .json({ error: 'No email address to send to — add one to the invoice first.' });
 
-    const sent = await qbo.sendInvoice(inv.qbo.id, to);
-    await saveQboState(id, { sent_at: new Date(), sent_to: sent.sent_to, email_status: sent.status });
-    // Emailing it is the moment it stops being a draft on our side too.
-    if ((inv.status || 'draft') === 'draft')
-      await store.invoices.updateOne({ _id: id }, { $set: { status: 'sent' } });
-    res.json({ ok: true, sent_to: sent.sent_to, status: sent.status });
+    if (!(await claimQboWork(id)))
+      return res.status(409).json({ error: 'This invoice is already being sent to QuickBooks.' });
+    try {
+      // QuickBooks emails its own copy, so first make sure it is this one:
+      // edited since the push (or pushed to another company), it goes over
+      // again; payments recorded here go over too.
+      let current = inv;
+      if (!(await qbo.pushedIsCurrent({ ...invoiceView(inv), qbo: inv.qbo })))
+        current = (await pushToQbo(inv)).inv;
+      else {
+        const known = inv.qbo.payment_ids || {};
+        const added = await qbo.pushPayments(invoiceView(inv), { invoiceId: inv.qbo.id, customerId: inv.qbo.customer_id, known });
+        if (Object.keys(added).length) await saveQboState(id, { payment_ids: { ...known, ...added } });
+        current = await store.invoices.findOne({ _id: id });
+      }
+      // The customer is asked for whatever QuickBooks says is owed. If that
+      // isn't what this invoice says (QuickBooks' tax engine, a payment taken
+      // there), say so instead of sending a different figure.
+      const view = invoiceView(current);
+      const owed = await qbo.invoiceBalance(current.qbo.id);
+      if (owed != null && Math.abs(owed - view.balance) > 0.01)
+        return res.status(409).json({
+          error:
+            `QuickBooks shows ${owed.toFixed(2)} owing on this invoice, but it says ${view.balance.toFixed(2)} here. ` +
+            'Sort out the difference (the tax setting, or a payment recorded in only one place) before emailing it.',
+        });
+
+      const sent = await qbo.sendInvoice(current.qbo.id, to);
+      await saveQboState(id, { sent_at: new Date(), sent_to: sent.sent_to, email_status: sent.status });
+      // Emailing it is the moment it stops being a draft on our side too.
+      if ((inv.status || 'draft') === 'draft')
+        await store.invoices.updateOne({ _id: id }, { $set: { status: 'sent' } });
+      res.json({ ok: true, sent_to: sent.sent_to, status: sent.status });
+    } finally {
+      await releaseQboWork(id);
+    }
   })
 );
 
@@ -3962,8 +5791,9 @@ const inboxWrap = (fn) => (req, res) =>
       return res
         .status(err.status || 400)
         .json({ error: err.message, detail: err.detail || undefined });
-    console.error(err);
-    res.status(500).json({ error: 'Server error.' });
+    const reply = errorReply(err);
+    if (reply.fault) recordFault(req, err, reply.status);
+    res.status(reply.status).json({ error: reply.message });
   });
 
 function leadView(l) {
@@ -4011,8 +5841,13 @@ app.get(
   '/api/admin/inbox/leads',
   requireAdmin,
   inboxWrap(async (req, res) => {
-    const status = String(req.query.status || 'new');
-    const q = status === 'all' ? {} : { status };
+    // One status, "all", or several separated by commas ("not_quote,skipped,failed").
+    const wanted = String(req.query.status || 'new')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 10);
+    const q = wanted.includes('all') ? {} : { status: { $in: wanted } };
     const rows = await store.inboxLeads
       .find(q, { sort: { received_at: -1 }, limit: 100 })
       .toArray();
@@ -4024,7 +5859,16 @@ app.post(
   '/api/admin/inbox/scan',
   requireAdmin,
   inboxWrap(async (req, res) => {
-    res.json(await inbox.scan({ trigger: 'manual', actor: await adminActor(req) }));
+    // How long a scan may run in this request; the default suits Vercel and
+    // Render. On a host with a shorter limit (Netlify: 10 s unless raised) set
+    // INBOX_SCAN_BUDGET_MS to fit it.
+    res.json(
+      await inbox.scan({
+        trigger: 'manual',
+        actor: await adminActor(req),
+        budgetMs: Number(process.env.INBOX_SCAN_BUDGET_MS) || undefined,
+      })
+    );
   })
 );
 
@@ -4041,31 +5885,52 @@ app.post(
     if (lead.quote_id)
       return res.status(409).json({ error: 'That email has already been turned into a quote.' });
 
-    const draft = req.body && req.body.draft ? req.body.draft : lead.draft || {};
-    const customer = cleanCustomer(draft.customer);
-    if (!customer.name) return res.status(400).json({ error: 'Customer name is required.' });
+    const raw = req.body && req.body.draft ? req.body.draft : lead.draft || {};
+    // Only the cleaned draft is kept, on the quote and on the lead alike: the
+    // lead card shows it again later, so whatever the browser sent must not be
+    // stored as it came.
+    const draft = {
+      customer: cleanCustomer(raw.customer),
+      items: cleanItems(raw.items),
+      tax_rate: toNum(raw.tax_rate),
+      notes: cleanLine(raw.notes, 4000),
+    };
+    if (!draft.customer.name) return res.status(400).json({ error: 'Customer name is required.' });
 
     const quoteId = await store.nextId('quotes');
     const now = new Date();
+    // Claimed first, in one step, so a double click can't make two quotes.
+    const claim = await store.inboxLeads.updateOne(
+      { _id: id, quote_id: null },
+      { $set: { status: 'approved', quote_id: quoteId, draft, approved_at: now } }
+    );
+    if (!claim.modifiedCount)
+      return res.status(409).json({ error: 'That email has already been turned into a quote.' });
     const quote = {
       _id: quoteId,
       number: 'Q' + String(1000 + quoteId),
-      customer,
+      customer: draft.customer,
       quote_date: now,
-      items: cleanItems(draft.items),
-      tax_rate: toNum(draft.tax_rate),
-      notes: String(draft.notes || '').trim(),
+      valid_until: new Date(now.getTime() + QUOTE_VALID_DAYS * 86400000),
+      items: draft.items,
+      tax_rate: draft.tax_rate,
+      notes: draft.notes,
       status: 'draft',
       // Where it came from, so the estimator can reread the email later.
       source: { type: 'inbox', lead_id: id, subject: lead.subject, from: lead.from_email },
       created_at: now,
       updated_at: now,
     };
-    await store.quotes.insertOne(quote);
-    await store.inboxLeads.updateOne(
-      { _id: id },
-      { $set: { status: 'approved', quote_id: quoteId, draft, approved_at: now } }
-    );
+    try {
+      await store.quotes.insertOne(quote);
+    } catch (err) {
+      // Give the lead back rather than leave it pointing at nothing.
+      await store.inboxLeads.updateOne(
+        { _id: id, quote_id: quoteId },
+        { $set: { status: lead.status || 'new', quote_id: null }, $unset: { approved_at: '' } }
+      );
+      throw err;
+    }
     res.json({ ok: true, quote: quoteView(quote) });
   })
 );
@@ -4092,7 +5957,14 @@ const cronInboxScan = inboxWrap(async (req, res) => {
         : 'CRON_SECRET is not set on the server, so the scheduled scan is disabled.',
     });
   }
-  res.json(await inbox.runScheduledScan());
+  // Counts only: the full result names customers' emails, and a scheduler's
+  // log is no place for that.
+  const r = await inbox.runScheduledScan();
+  res.json(
+    r && typeof r === 'object'
+      ? Object.fromEntries(Object.entries(r).filter(([, v]) => v == null || typeof v !== 'object'))
+      : r
+  );
 });
 app.get('/api/cron/inbox-scan', cronInboxScan);
 app.post('/api/cron/inbox-scan', cronInboxScan);
@@ -4300,8 +6172,11 @@ app.delete(
   requireAdmin,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
+    // Its files go too — the rows and the stored objects, which are otherwise
+    // paid for forever with nothing pointing at them — and the task last, as
+    // with a job.
+    await dropFiles(store.taskAttachments, await store.taskAttachments.find({ task_id: id }).toArray());
     await store.tasks.deleteOne({ _id: id });
-    await store.taskAttachments.deleteMany({ task_id: id }); // drop its files too
     res.json({ ok: true });
   })
 );
@@ -4367,6 +6242,7 @@ app.post(
     if (!t) return res.status(404).json({ error: 'Task not found.' });
     const plan = plannedUpload(req.body, res);
     if (!plan) return;
+    await sweepAbandonedUploads();
 
     const attId = crypto.randomUUID();
     const key = buildKey('tasks/' + id, attId, plan.filename);
@@ -4408,10 +6284,20 @@ app.post(
 
     const parts = cleanParts(req.body?.parts);
     if (!parts.length) return res.status(400).json({ error: 'No uploaded parts reported.' });
-    await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
-
-    const head = await storage.head({ key: doc.storage_key });
-    if (!head) return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    if (!(await claimCompletion(store.taskAttachments, doc)))
+      return res.status(409).json({ error: 'That upload is already being finished. Try again in a moment.' });
+    let head;
+    try {
+      await storage.completeUpload({ key: doc.storage_key, uploadId: doc.upload_id, parts });
+      head = await storage.head({ key: doc.storage_key });
+    } catch (err) {
+      await releaseCompletion(store.taskAttachments, doc);
+      throw err;
+    }
+    if (!head) {
+      await releaseCompletion(store.taskAttachments, doc);
+      return res.status(502).json({ error: 'That upload did not arrive. Try again.' });
+    }
     if (head.size > MAX_UPLOAD_BYTES) {
       await storage.remove({ key: doc.storage_key });
       await store.taskAttachments.deleteOne({ _id: doc._id });
@@ -4580,7 +6466,10 @@ app.delete(
     if (!v) return res.status(404).json({ error: 'Request not found.' });
     if (v.status !== 'pending')
       return res.status(400).json({ error: 'That request has already been decided.' });
-    await store.vacations.deleteOne({ _id: id });
+    // Only while still pending, in the same step: an approval that lands
+    // between the check above and this delete must not be wiped out.
+    const gone = await store.vacations.deleteOne({ _id: id, employee_id: req.employee._id, status: 'pending' });
+    if (!gone.deletedCount) return res.status(400).json({ error: 'That request has already been decided.' });
     res.json({ ok: true });
   })
 );
@@ -4805,6 +6694,11 @@ app.patch(
     } else if (action === 'draft') {
       set.status = 'draft';
       set.published_at = null;
+      // A schedule date that has already passed would publish it again on the
+      // next look at the board (see promoteScheduledBulletins) — pulling it
+      // back to a draft clears that. A date still ahead stays scheduled.
+      const at = set.publish_at !== undefined ? set.publish_at : b.publish_at;
+      if (at && new Date(at) <= now) set.publish_at = null;
     }
     set.updated_at = now;
     await store.bulletins.updateOne({ _id: id }, { $set: set });
@@ -4865,16 +6759,45 @@ app.post(
 
 // ---------------------------------------------------------------------------
 // Static pages
+//
+// Each page names its scripts, stylesheet and logo by content hash —
+// /v/<hash>/<file>, see assets.js — and those addresses are cached for a year:
+// a returning visit loads them off the device without asking. The pages
+// themselves are checked with the server every time (no-cache, answered 304
+// when unchanged), and that is what keeps the year-long copies honest: a new
+// deploy gives a changed file a new address.
 // ---------------------------------------------------------------------------
 
-app.use(express.static(path.join(__dirname, 'public')));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const sendPage = (file) => (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('html').send(assets.page(file, PUBLIC_DIR));
+};
+
+app.get('/v/:hash/:name', (req, res, next) => {
+  const want = assets.parse(req.path);
+  const current = want && assets.hashes(PUBLIC_DIR).get(want.name);
+  if (!current) return next();
+  // An address from an older page still gets today's file — just not to keep.
+  const keep = current === want.hash;
+  res.sendFile(path.join(PUBLIC_DIR, want.name), {
+    maxAge: keep ? 365 * 86400000 : 0,
+    immutable: keep,
+  });
+});
+
+app.get(['/', '/index.html'], sendPage(path.join(PUBLIC_DIR, 'index.html')));
 
 // The public estimate maker. Served explicitly (not just as /estimate.html) so
 // the clean "/estimate" URL works on hosts that route everything through this
 // app. The page itself checks whether the feature is switched on.
-app.get('/estimate', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'estimate.html'));
-});
+app.get(['/estimate', '/estimate.html'], sendPage(path.join(PUBLIC_DIR, 'estimate.html')));
+
+// The customer's quote: view, approve and sign ("/quote?k=<token>"). Same
+// reasoning as /estimate for the explicit route.
+app.get(['/quote', '/quote.html'], sendPage(path.join(PUBLIC_DIR, 'quote.html')));
+
+app.use(express.static(PUBLIC_DIR));
 
 // Old URLs that no longer exist (the shared PIN clock, old admin paths) — send
 // any stale bookmarks to the login page instead of 404ing. Employees now clock
@@ -4885,28 +6808,25 @@ for (const legacy of ['/timeclock', '/fence', '/office']) {
 
 // Admin page is served from /views (outside the static folder) at ADMIN_PATH,
 // so it is not reachable at a guessable /admin or /admin.html URL.
-app.get(ADMIN_PATH, (req, res) => {
-  res.sendFile(path.join(__dirname, 'views', 'admin.html'));
-});
+app.get(ADMIN_PATH, sendPage(path.join(__dirname, 'views', 'admin.html')));
 
 // Anything that threw outside a wrap()ed handler still lands here, so the dev
 // dashboard sees it rather than only the console. Registered after the routes,
 // which is where Express looks for an error handler.
+// A body that isn't JSON, or is too big, lands here from express.json with its
+// own 400/413 — answered as that, not as a server fault, and not recorded.
 app.use((err, req, res, next) => {
-  console.error(err);
-  metrics
-    .recordError({
-      path: req.path,
-      method: req.method,
-      status: err && err.status ? err.status : 500,
-      message: err && err.message,
-      stack: err && err.stack,
-      who: req.session && req.session.admin ? 'admin' : req.session && req.session.employeeId ? 'employee' : 'anonymous',
-      timezone: TIMEZONE,
-    })
-    .catch(() => {});
+  const reply = errorReply(err);
+  if (reply.fault) recordFault(req, err, reply.status);
   if (res.headersSent) return next(err);
-  res.status(500).json({ error: 'Server error.' });
+  res.status(reply.status).json({
+    error:
+      reply.status === 400 && err.type === 'entity.parse.failed'
+        ? 'That request could not be read.'
+        : reply.status === 413
+          ? 'That is too large to send.'
+          : reply.message,
+  });
 });
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
@@ -4919,12 +6839,8 @@ app.get('/dbcheck', async (req, res) => {
     await store.client.db().command({ ping: 1 });
     res.json({ db: 'connected', hasUrl: !!process.env.DATABASE_URL });
   } catch (err) {
-    res.json({
-      db: 'FAILED',
-      error: err.message,
-      code: err.code || err.codeName || null,
-      hasUrl: !!process.env.DATABASE_URL,
-    });
+    console.error('dbcheck failed:', err.message);
+    res.json({ db: 'FAILED', hasUrl: !!process.env.DATABASE_URL, detail: 'See the server log for why.' });
   }
 });
 
@@ -4944,6 +6860,7 @@ if (require.main === module) {
   connect()
     .then(async () => {
       await getDevRecord().catch(() => {}); // ensure the dev account exists in the DB
+      await replaceDefaultAdminPassword().catch(() => {});
       app.listen(PORT, () => {
         console.log(`HEK Timeclock running on http://localhost:${PORT}`);
         console.log(`  Employee portal:    http://localhost:${PORT}/`);

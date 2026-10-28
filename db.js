@@ -33,11 +33,21 @@ const store = {
 };
 
 // Memoized so repeated calls (e.g. per serverless-function invocation) reuse a
-// single connection/pool instead of reconnecting every time.
+// single connection/pool instead of reconnecting every time. A failed attempt
+// is forgotten, not kept: on a warm serverless instance a remembered failure
+// (an Atlas election, a DNS blip at cold start) would answer every later
+// request with the same error until the platform happened to recycle it.
 let connecting = null;
 
 function connect() {
-  if (!connecting) connecting = doConnect();
+  if (!connecting)
+    connecting = doConnect().catch((err) => {
+      connecting = null;
+      const half = store.client;
+      store.client = null;
+      if (half) half.close().catch(() => {});
+      throw err;
+    });
   return connecting;
 }
 
@@ -116,47 +126,68 @@ async function doConnect() {
   // without bound.
   store.appErrors = store.db.collection('app_errors');
 
-  // Unique login email, but only for employees that actually have one set
-  // (older records may have no email and must not collide on null).
-  await store.employees.createIndex(
-    { email: 1 },
-    { unique: true, partialFilterExpression: { email: { $type: 'string' } } }
-  );
-  await store.punches.createIndex({ employee_id: 1 });
-  await store.punches.createIndex({ employee_id: 1, clock_out: 1 });
-  await store.quotes.createIndex({ created_at: -1 });
-  await store.schedules.createIndex({ date: 1 });
-  await store.schedules.createIndex({ employee_ids: 1 });
-  await store.jobFiles.createIndex({ job_id: 1 });
-  // Finds uploads that were started and never finished, so abandoned objects can
-  // be swept up instead of being paid for indefinitely.
-  await store.jobFiles.createIndex({ status: 1, created_at: 1 });
-  await store.tasks.createIndex({ status: 1, order: 1 });
-  await store.tasks.createIndex({ assignee_id: 1 });
-  await store.taskAttachments.createIndex({ task_id: 1 });
-  await store.taskAttachments.createIndex({ status: 1, created_at: 1 });
-  await store.vacations.createIndex({ employee_id: 1 });
-  await store.vacations.createIndex({ status: 1, created_at: -1 });
-  await store.bulletins.createIndex({ status: 1, published_at: -1 });
-  await store.bulletins.createIndex({ status: 1, publish_at: 1 });
-  await store.qboTime.createIndex({ period_start: 1 });
-  await store.qboTime.createIndex({ employee_id: 1, day: 1 });
-  await store.qboRuns.createIndex({ start: 1, _id: -1 });
-  await store.invoices.createIndex({ created_at: -1 });
-  await store.invoices.createIndex({ status: 1, due_date: 1 });
-  await store.invoices.createIndex({ quote_id: 1 });
-  // Unique on the email's Message-ID so the same message is never read (or
-  // paid for) twice, even if two scans overlap.
-  await store.inboxLeads.createIndex({ message_id: 1 }, { unique: true });
-  await store.inboxLeads.createIndex({ status: 1, received_at: -1 });
-  await store.estimateRequests.createIndex({ status: 1, created_at: -1 });
-  // Health data ages out on its own — 60 days is plenty to spot a trend.
-  await store.metricVisitors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 });
-  await store.metricVisitors.createIndex({ day: 1 });
-  await store.appErrors.createIndex({ at: -1 });
-  await store.appErrors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 });
-  // Auto-remove stale rate-limit records an hour after they were last touched.
-  await store.rateLimits.createIndex({ windowStart: 1 }, { expireAfterSeconds: 3600 });
+  // Created together rather than one round trip at a time — this runs on every
+  // cold start. A failure is logged, not fatal: an index that can't be built
+  // (old duplicate rows, say) must not take the whole app down with it.
+  const indexes = [
+    // Unique login email, but only for employees that actually have one set
+    // (older records may have no email and must not collide on null).
+    store.employees.createIndex(
+      { email: 1 },
+      { unique: true, partialFilterExpression: { email: { $type: 'string' } } }
+    ),
+    store.punches.createIndex({ employee_id: 1 }),
+    store.punches.createIndex({ employee_id: 1, clock_out: 1 }),
+    // At most one open punch per employee. Checking first and then inserting
+    // left a gap that two phones clocking in together could both get through.
+    store.punches.createIndex(
+      { employee_id: 1 },
+      { name: 'one_open_punch', unique: true, partialFilterExpression: { clock_out: null } }
+    ),
+    store.quotes.createIndex({ created_at: -1 }),
+    // The customer's link. Unique, and only on quotes that have one.
+    store.quotes.createIndex(
+      { share_token: 1 },
+      { unique: true, partialFilterExpression: { share_token: { $type: 'string' } } }
+    ),
+    store.schedules.createIndex({ date: 1 }),
+    store.schedules.createIndex({ employee_ids: 1 }),
+    store.jobFiles.createIndex({ job_id: 1 }),
+    // Finds uploads that were started and never finished, so abandoned objects can
+    // be swept up instead of being paid for indefinitely.
+    store.jobFiles.createIndex({ status: 1, created_at: 1 }),
+    store.tasks.createIndex({ status: 1, order: 1 }),
+    store.tasks.createIndex({ assignee_id: 1 }),
+    store.taskAttachments.createIndex({ task_id: 1 }),
+    store.taskAttachments.createIndex({ status: 1, created_at: 1 }),
+    store.vacations.createIndex({ employee_id: 1 }),
+    store.vacations.createIndex({ status: 1, created_at: -1 }),
+    store.bulletins.createIndex({ status: 1, published_at: -1 }),
+    store.bulletins.createIndex({ status: 1, publish_at: 1 }),
+    store.qboTime.createIndex({ period_start: 1 }),
+    store.qboTime.createIndex({ employee_id: 1, day: 1 }),
+    store.qboRuns.createIndex({ start: 1, _id: -1 }),
+    store.invoices.createIndex({ created_at: -1 }),
+    store.invoices.createIndex({ status: 1, due_date: 1 }),
+    store.invoices.createIndex({ quote_id: 1 }),
+    // Unique on the email's Message-ID so the same message is never read (or
+    // paid for) twice, even if two scans overlap.
+    store.inboxLeads.createIndex({ message_id: 1 }, { unique: true }),
+    store.inboxLeads.createIndex({ status: 1, received_at: -1 }),
+    store.estimateRequests.createIndex({ status: 1, created_at: -1 }),
+    // Health data ages out on its own — 60 days is plenty to spot a trend.
+    store.metricVisitors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 }),
+    store.metricVisitors.createIndex({ day: 1 }),
+    store.appErrors.createIndex({ at: -1 }),
+    store.appErrors.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 86400 }),
+    // Auto-remove stale rate-limit records an hour after they were last touched.
+    store.rateLimits.createIndex({ windowStart: 1 }, { expireAfterSeconds: 3600 }),
+    // Daily ceilings carry their own expiry instead (they outlive an hour).
+    store.rateLimits.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
+  ];
+  const results = await Promise.allSettled(indexes);
+  for (const r of results)
+    if (r.status === 'rejected') console.error('[db] could not create an index:', r.reason && r.reason.message);
 }
 
 // Atomic auto-incrementing integer id per collection name, so employees and

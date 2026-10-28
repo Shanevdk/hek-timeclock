@@ -9,7 +9,9 @@
 
   let config = null; // { services, tax_rate, ... } once loaded
   let priceTimer = null;
-  let latest = null; // the server's last pricing of the current lines
+  let priceSeq = 0; // numbers each pricing, so only the newest reply is used
+  let pricing = null; // the newest pricing, settled once its reply is in
+  let latest = null; // the server's pricing of the current lines, if it has one
 
   function esc(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({
@@ -17,8 +19,17 @@
     }[c]));
   }
 
+  // Priced by the running foot ("linear ft") — not "sq ft", which a traced
+  // length has nothing to do with.
+  const isLinearFoot = (unit) => /^(linear\s*)?(ft|foot|feet)\.?$/i.test(String(unit || '').trim());
+
   const money = (n) =>
     '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // A smooth scroll is motion too: someone who has asked their device for less
+  // of it gets the plain jump.
+  const scrollMotion = () =>
+    window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
 
   async function api(path, opts) {
     const res = await fetch(path, {
@@ -32,9 +43,23 @@
     } catch (e) {
       data = null;
     }
-    if (!res.ok) throw new Error((data && data.error) || 'Something went wrong. Please try again.');
+    if (!res.ok) throw refusal(res.status, data);
     if (data === null) throw new Error('Something went wrong. Please try again.');
     return data;
+  }
+
+  // The error for a request the server said no to, in its own words where it
+  // gave any — when it is turning requests away it says how long to wait. The
+  // status goes with it, so a caller can tell "slow down" from "broken".
+  function refusal(status, data) {
+    const err = new Error(
+      (data && data.error) ||
+        (status === 429
+          ? 'Too many requests — wait a moment and try again.'
+          : 'Something went wrong. Please try again.')
+    );
+    err.status = status;
+    return err;
   }
 
   // ---- lines ----
@@ -96,26 +121,72 @@
     priceTimer = setTimeout(price, 250);
   }
 
-  async function price() {
+  // Price the lines now. Each pricing is numbered and only the newest one's
+  // reply counts: replies can arrive out of order, and a slow one for an older
+  // edit must not overwrite the total for a newer one.
+  function price() {
+    clearTimeout(priceTimer);
+    priceTimer = null;
+    pricing = askPrice(++priceSeq);
+    return pricing;
+  }
+
+  async function askPrice(seq) {
     const items = readLines();
     if (!items.length) {
       latest = null;
       showTotals({ subtotal: 0, tax: 0, total: 0, tax_rate: config.tax_rate, below_minimum: false });
-      $('estRequest').disabled = true;
+      priceNote('');
+      syncRequest();
       return;
     }
     try {
-      latest = await api('/api/estimate/price', {
+      const priced = await api('/api/estimate/price', {
         method: 'POST',
         body: JSON.stringify({ items }),
       });
+      if (seq !== priceSeq) return;
+      latest = priced;
       showTotals(latest);
-      $('estRequest').disabled = !latest.items.length;
+      priceNote('');
+      syncRequest();
     } catch (e) {
+      if (seq !== priceSeq) return;
       // Leave the last good figure on screen rather than flashing an error at
-      // someone who is mid-typing.
-      $('estRequest').disabled = true;
+      // someone who is mid-typing — but it is no longer theirs to confirm. Being
+      // turned away for asking too often is worth saying, though, or the button
+      // greys out for no reason they can see.
+      latest = null;
+      priceNote(e.status === 429 ? e.message : '');
+      syncRequest();
     }
+  }
+
+  // "Request a quote" is only for a total the server has given for the lines
+  // on screen. While the button is busy waiting on that total (openModal) it
+  // is left alone: Snappy.busy() hands it back exactly as it found it — enabled,
+  // since it was just pressed — so this runs again the moment it lets go, and a
+  // price that fell through meanwhile still leaves it greyed out.
+  function syncRequest() {
+    const btn = $('estRequest');
+    if (btn.getAttribute('aria-busy') !== 'true') btn.disabled = !(latest && latest.items.length);
+  }
+
+  // Wait until the total is the server's answer for exactly the lines on
+  // screen: price an edit still waiting on its timer, then sit out the reply —
+  // and again if another edit lands meanwhile.
+  async function settlePrice() {
+    let p;
+    do {
+      if (priceTimer) price();
+      p = pricing;
+      await p;
+    } while (p !== pricing || priceTimer);
+  }
+
+  function priceNote(text) {
+    $('estPriceNote').textContent = text;
+    $('estPriceNote').style.display = text ? 'block' : 'none';
   }
 
   function showTotals(t) {
@@ -135,7 +206,6 @@
   let lines = [];       // the Leaflet polyline for each run
   let dots = [];        // corner markers, so a point can be seen and undone
   let layers = {};
-  let searchTimer = null;
 
   const M_TO_FT = 3.280839895;
 
@@ -156,9 +226,36 @@
     return m;
   }
 
+  // The map, once Leaflet is in. estimate.html only preloads the library, so it
+  // never holds up the page; Snappy.leaflet() puts it to use, and by the time
+  // anyone opens the map it has usually been warmed already (see the boot at
+  // the bottom). Resolves to null if it can't load: the map's box says so, the
+  // rest of the page carries on — a length can always be typed in — and the
+  // next try (opening the map, Find, My location) asks again.
+  let mapReady = null;
   function ensureMap() {
-    if (map) return map;
-    if (!window.L) return null;
+    if (!mapReady) {
+      mapNote('Loading the map…', true);
+      mapReady = Snappy.leaflet()
+        .then(buildMap)
+        .catch((e) => {
+          console.error(e);
+          mapReady = null;
+          mapNote('The map could not load. Check your connection and try again — or type the length in yourself.');
+          return null;
+        });
+    }
+    return mapReady;
+  }
+
+  // A line in the map's own box, until there is a map in it. A wait is a
+  // placeholder (.wait): seen only if Leaflet is slow to arrive.
+  function mapNote(text, waiting) {
+    $('estMap').innerHTML = `<p class="est-map-note${waiting ? ' wait' : ''}">${esc(text)}</p>`;
+  }
+
+  function buildMap() {
+    $('estMap').textContent = ''; // the note goes; Leaflet builds its own panes in here
     map = L.map('estMap', { doubleClickZoom: false }).setView([42.93, -80.6], 13);
     // Satellite by default: a street map shows roads, not where a fence goes.
     layers.sat = L.tileLayer(
@@ -188,11 +285,11 @@
     dots = [];
     runs.forEach((run) => {
       if (run.length > 1) {
-        lines.push(L.polyline(run, { color: '#c89b5c', weight: 4, opacity: 0.95 }).addTo(map));
+        lines.push(L.polyline(run, { color: '#c3965a', weight: 4, opacity: 0.95 }).addTo(map));
       }
       run.forEach((p, i) => {
         const mk = L.circleMarker(p, {
-          radius: 5, color: '#fff', weight: 2, fillColor: '#a97f43', fillOpacity: 1,
+          radius: 5, color: '#fff', weight: 2, fillColor: '#ac7d3f', fillOpacity: 1,
         }).addTo(map);
         // Each corner shows how far the fence has run to that point.
         let sofar = 0;
@@ -209,6 +306,8 @@
     // Nothing to stand up until there is at least one stretch of fence.
     const drawable = runs.some((r) => r.length >= 2);
     if ($('map3d')) $('map3d').disabled = !drawable;
+    // With a fence drawn, the 3D view is one press away: start fetching it.
+    if (drawable) warm3D();
     if (preview && $('est3d').style.display !== 'none') queue3D();
   }
 
@@ -217,7 +316,7 @@
   function useLength() {
     const feet = Math.round(totalMetres() * M_TO_FT);
     if (feet <= 0) return;
-    const perFoot = (s) => /ft|foot|feet/i.test(s.unit);
+    const perFoot = (s) => isLinearFoot(s.unit);
     let row = [...document.querySelectorAll('.est-line')].find((r) => {
       const svc = config.services.find((s) => s.key === r.querySelector('.est-service').value);
       return svc && perFoot(svc);
@@ -235,7 +334,7 @@
     row.querySelector('.est-quantity').value = feet;
     syncUnit(row);
     queuePrice();
-    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.scrollIntoView({ behavior: scrollMotion(), block: 'center' });
     row.querySelector('.est-quantity').focus();
   }
 
@@ -253,26 +352,34 @@
       if (!quiet) say('Your browser cannot share a location — search for the address instead.');
       return;
     }
-    say('Finding you…');
+    // Waiting, not news: a position the device already knows comes back at
+    // once, and then this never shows.
+    say('Finding you…', true);
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
+      async (pos) => {
         const { latitude: lat, longitude: lng, accuracy } = pos.coords;
-        ensureMap();
-        map.setView([lat, lng], 19);
-        if (hereMarker) map.removeLayer(hereMarker);
+        const m = await ensureMap();
+        if (!m) return say(''); // no map to put them on; its box says why
+        m.setView([lat, lng], 19);
+        if (hereMarker) m.removeLayer(hereMarker);
         // A soft dot rather than a pin: it marks where they are, and must not
         // be mistaken for a fence corner.
         hereMarker = L.circleMarker([lat, lng], {
           radius: 7, color: '#fff', weight: 2, fillColor: '#2f9257', fillOpacity: 0.9,
           interactive: false,
-        }).addTo(map);
+        }).addTo(m);
         say(
           accuracy > 100
             ? `Roughly here (within ${Math.round(accuracy)} m) — drag the map to your property.`
             : 'Here you are. Now click along where the fence goes.'
         );
-        setTimeout(() => say(''), 6000);
-        fillAddress(lat, lng);
+        const hush = setTimeout(() => say(''), 6000);
+        fillAddress(lat, lng).catch((e) => {
+          // Turned away for asking too often: say so, and leave it up — a
+          // search or a price would be turned away too.
+          clearTimeout(hush);
+          say(e.message);
+        });
       },
       (err) => {
         if (quiet) return say('');
@@ -285,32 +392,53 @@
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
     );
 
-    function say(text) {
+    function say(text, waiting) {
       note.textContent = text;
+      note.classList.toggle('wait', !!waiting);
       note.style.display = text ? 'block' : 'none';
     }
   }
 
   // Turn the located position into a street address, so the request the office
   // receives says where the job is rather than a pair of coordinates.
+  let filling = false; // one lookup at a time: two quick presses ask once
   async function fillAddress(lat, lng) {
-    if ($('mapSearch').value.trim()) return; // never overwrite what they typed
+    if ($('mapSearch').value.trim() || filling) return; // never overwrite what they typed
+    filling = true;
     try {
       const d = await api(`/api/estimate/reverse?lat=${lat}&lng=${lng}`);
-      if (d.label) $('mapSearch').value = d.label;
+      if (d.label && !$('mapSearch').value.trim()) $('mapSearch').value = d.label;
     } catch (e) {
-      /* the address is a nicety — the measurement is what matters */
+      // The address is a nicety — the measurement is what matters — so only a
+      // rate limit is passed on, being worth knowing about.
+      if (e.status === 429) throw e;
+    } finally {
+      filling = false;
     }
   }
 
   $('mapLocate').addEventListener('click', () => locate({}));
 
   // ---- finding the property ----
-  async function searchAddress() {
+  // Only when asked — Enter or the Find button. The lookup is OpenStreetMap's,
+  // whose rules forbid searching as someone types. One search at a time: Find
+  // is disabled while one is on its way (its spinner only if the wait is long
+  // enough to notice), and Enter meanwhile is ignored — asking again would
+  // only spend another of the visitor's lookups.
+  function searchAddress() {
+    const btn = $('mapSearchBtn');
+    if (btn.getAttribute('aria-busy') === 'true') return;
     const q = $('mapSearch').value.trim();
     if (q.length < 3) return;
+    return Snappy.busy(btn, () => findAddress(q));
+  }
+
+  async function findAddress(q) {
     const box = $('mapResults');
+    // Whatever was listed before goes at once, so nothing stale can be picked
+    // meanwhile; "Looking…" is a placeholder, seen only if the answer is slow.
     box.innerHTML = '<div class="est-result-note">Looking…</div>';
+    box.classList.add('wait');
     box.style.display = 'block';
     try {
       const d = await api('/api/estimate/geocode?q=' + encodeURIComponent(q));
@@ -319,12 +447,19 @@
         box.innerHTML = '<div class="est-result-note">Nothing found — try the town and province too.</div>';
         return;
       }
+      // Picking a place only moves the map, so with a mouse it happens as the
+      // button goes down (data-press="fast", snappy.js).
       box.innerHTML = results
-        .map((r, i) => `<button type="button" data-r="${i}">${esc(r.label)}</button>`)
+        .map((r, i) => `<button type="button" data-r="${i}" data-press="fast">${esc(r.label)}</button>`)
         .join('');
       box.dataset.results = JSON.stringify(results);
     } catch (e) {
-      box.innerHTML = '<div class="est-result-note">Could not search just now.</div>';
+      // Say what went wrong rather than leave them rewording an address that
+      // was fine — turned away for searching too often means wait.
+      const why = e.status ? e.message : 'Could not search just now.';
+      box.innerHTML = `<div class="est-result-note">${esc(why)}</div>`;
+    } finally {
+      box.classList.remove('wait'); // the answer itself shows at once
     }
   }
 
@@ -336,9 +471,8 @@
     if (!r) return;
     $('mapResults').style.display = 'none';
     $('mapSearch').value = r.label;
-    ensureMap();
     // Close enough to see the yard and start clicking corners.
-    map.setView([r.lat, r.lng], 19);
+    ensureMap().then((m) => m && m.setView([r.lat, r.lng], 19));
   });
 
   $('mapToggle').addEventListener('click', () => {
@@ -347,26 +481,25 @@
     panel.style.display = open ? 'none' : 'block';
     $('mapHint').style.display = open ? 'none' : 'block';
     $('mapToggle').textContent = open ? 'Measure on a map' : 'Hide the map';
-    if (!open) {
-      ensureMap();
+    if (open) return;
+    // The panel is open already; the map fills it as soon as Leaflet is in.
+    ensureMap().then((m) => {
+      if (!m || panel.style.display === 'none') return; // shut again meanwhile
       // Leaflet needs telling once the container has a size.
-      setTimeout(() => map && map.invalidateSize(), 50);
+      setTimeout(() => m.invalidateSize(), 50);
       // Go to them on first open. Quiet, because this is us asking rather than
-      // them pressing the button — a refusal should not read as an error.
+      // them pressing the button — a refusal should not read as an error. Not
+      // when the map couldn't load: there would be nothing to show them on.
       if (!locateTried) {
         locateTried = true;
         setTimeout(() => locate({ quiet: true }), 250);
       }
-    }
+    });
   });
 
   $('mapSearchBtn').addEventListener('click', searchAddress);
   $('mapSearch').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); searchAddress(); }
-  });
-  $('mapSearch').addEventListener('input', () => {
-    clearTimeout(searchTimer);
-    if ($('mapSearch').value.trim().length >= 4) searchTimer = setTimeout(searchAddress, 600);
   });
 
   $('mapUndo').addEventListener('click', () => {
@@ -407,24 +540,59 @@
   // in step with what the customer has picked.
   let preview = null;
   let previewTimer = null;
+  let open3DSeq = 0; // numbers each press, so only the newest sets the view up
 
   const drawableRuns = () => runs.filter((r) => r.length >= 2);
 
+  // The viewer — three.js and fence3d.js — is the heaviest thing on the page
+  // and only this step uses it, so estimate.html leaves it unfetched until
+  // window.loadFence3D() asks. However often that is called there is one copy
+  // on its way, and after a failure the next call tries again. Resolves to
+  // { FencePreview, styleForService, styleList }.
+  function load3D() {
+    if (window.Fence3D) return Promise.resolve(window.Fence3D);
+    return Promise.resolve().then(() => window.loadFence3D());
+  }
+
+  // Fetch the viewer while they are still tracing, so it is there by the time
+  // they press "See it in 3D": once a fence is drawn — the step before — and
+  // only when the device has nothing better to do. Not on Save-Data or a 2G
+  // connection, where it is worth the download only to someone who asks for
+  // it. A failure here says nothing; the press tries again and says why.
+  let warmed3D = false;
+  function warm3D() {
+    if (warmed3D || window.Fence3D) return;
+    const c = navigator.connection;
+    if (c && (c.saveData || /(^|-)2g$/.test(c.effectiveType || ''))) return;
+    warmed3D = true;
+    Snappy.idle(() => load3D().catch(() => {}));
+  }
+
+  // The words over the 3D picture. Progress is a placeholder (.wait): it fades
+  // in only once the wait is long enough to notice, so a quick build never
+  // flashes it. Anything else — a failure — shows at once. The stylesheet's
+  // flex layout centres it, so showing it means clearing the inline display.
+  function note3D(text, waiting) {
+    const note = $('est3dNote');
+    note.textContent = text || '';
+    note.classList.toggle('wait', !!(text && waiting));
+    note.style.display = text ? '' : 'none';
+  }
+
   // Default the look to whatever fence they are actually pricing.
-  function styleFromLines() {
-    if (!window.Fence3D) return 'privacy';
+  function styleFromLines(F) {
     for (const row of document.querySelectorAll('.est-line')) {
       const key = row.querySelector('.est-service').value;
       const svc = config.services.find((s) => s.key === key);
-      if (svc && /ft|foot|feet/i.test(svc.unit)) return window.Fence3D.styleForService(key);
+      if (svc && isLinearFoot(svc.unit)) return F.styleForService(key);
     }
     return 'privacy';
   }
 
-  function fillStyleOptions() {
+  function fillStyleOptions(F) {
     const sel = $('est3dStyle');
-    if (!sel || sel.options.length || !window.Fence3D) return;
-    sel.innerHTML = window.Fence3D
+    if (!sel || sel.options.length) return;
+    sel.innerHTML = F
       .styleList()
       .map((s) => `<option value="${s.key}">${esc(s.label)}</option>`)
       .join('');
@@ -440,30 +608,63 @@
     if (!preview) return;
     const list = drawableRuns();
     if (!list.length) return;
-    $('est3dNote').style.display = 'block';
-    $('est3dNote').textContent = 'Building your fence…';
+    note3D('Building your fence…', true);
     try {
-      await preview.load({
+      const built = await preview.load({
         runs: list,
         styleKey: $('est3dStyle').value,
         heightFt: Number($('est3dHeight').value) || 6,
       });
-      $('est3dNote').style.display = 'none';
+      // Overtaken by a newer build (another corner, a new height) — the note
+      // is that one's to clear.
+      if (!built) return;
+      note3D('');
+      // The fence stands either way; if the aerial photo was turned away, say
+      // why the ground under it is bare.
+      $('est3dMsg').textContent = built.notice ? `Some of the aerial photo did not load. ${built.notice}` : '';
+      $('est3dMsg').style.display = built.notice ? 'block' : 'none';
     } catch (e) {
-      $('est3dNote').textContent = 'Could not build the 3D view.';
+      note3D('Could not build the 3D view.');
     }
     drawStreetView();
   }
 
-  function open3D() {
-    if (!window.Fence3D) return;
-    fillStyleOptions();
-    $('est3d').style.display = 'block';
-    $('est3dStyle').value = styleFromLines();
-    if (!preview) preview = new window.Fence3D.FencePreview($('est3dCanvas'));
+  // The section opens the moment it is asked for, with a placeholder over the
+  // picture until the viewer is in — and usually it already is (warm3D). If it
+  // can't load, only this section says so: the map, the price and the request
+  // all carry on without it.
+  async function open3D() {
+    const seq = ++open3DSeq;
+    const box = $('est3d');
+    box.style.display = 'block';
+    if (!preview) note3D('Loading the 3D view…', true);
+    box.scrollIntoView({ behavior: scrollMotion(), block: 'start' });
+    let F;
+    try {
+      F = await load3D();
+    } catch (e) {
+      console.error(e);
+      if (seq === open3DSeq) note3D('The 3D view could not load. Check your connection, then try again or reload the page.');
+      return;
+    }
+    // Pressed again meanwhile (that press carries on from here), hidden again,
+    // or the request sent: either way, nothing for this one to do.
+    if (seq !== open3DSeq || box.style.display === 'none' || $('estMain').style.display === 'none') return;
+    fillStyleOptions(F);
+    $('est3dStyle').value = styleFromLines(F);
+    if (!preview) {
+      try {
+        preview = new F.FencePreview($('est3dCanvas'));
+      } catch (e) {
+        // No WebGL: switched off, or a device too old for it.
+        console.error(e);
+        note3D('This browser cannot show the 3D view.');
+        return;
+      }
+    }
+    preview.resume(); // drawing again, if it was hidden
     build3D();
     if (config && config.street_view) loadStreetView();
-    $('est3d').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   // ---- from the road ----
@@ -476,6 +677,7 @@
   const SV_CAM_HEIGHT = 2.5;
   const SV_FOV = 90;
   let panoAt = null;
+  let svFor = null; // the spot whose photo is on screen, or on its way
 
   function bearingDeg(a, b) {
     const toRad = (d) => (d * Math.PI) / 180;
@@ -501,21 +703,44 @@
     if (!mid) return;
     const sv = $('estSv');
     sv.style.display = 'block';
+    // Reopening the view on the same fence keeps the photo it already has (or
+    // is already fetching) rather than asking again: every ask counts against
+    // the visitor, and Google bills for the photo.
+    const spot = mid.join(',');
+    if (spot === svFor) return;
+    svFor = spot;
     $('estSvMsg').textContent = 'Looking for a photo of your street…';
     try {
       const meta = await api(`/api/estimate/streetview/meta?lat=${mid[0]}&lng=${mid[1]}`);
       panoAt = [meta.lat, meta.lng];
       const heading = bearingDeg(panoAt, mid);
+      // Fetched rather than set as the picture's src, so a refusal — turned away
+      // for asking too often, say — comes back in words instead of leaving
+      // "Looking for a photo" up for good.
+      const res = await fetch(
+        `/api/estimate/streetview?lat=${mid[0]}&lng=${mid[1]}&heading=${heading.toFixed(1)}&fov=${SV_FOV}`
+      );
+      if (!res.ok) throw refusal(res.status, await res.json().catch(() => null));
+      const photo = URL.createObjectURL(await res.blob());
       $('estSvImg').onload = () => {
+        URL.revokeObjectURL(photo); // decoded; the picture keeps its own copy
         $('estSvMsg').textContent = meta.date
           ? `Google's photo, taken ${meta.date}. Tick the box to see roughly where the fence lands.`
           : "Google's photo of your street.";
         drawStreetView();
       };
-      $('estSvImg').src =
-        `/api/estimate/streetview?lat=${mid[0]}&lng=${mid[1]}&heading=${heading.toFixed(1)}&fov=${SV_FOV}`;
+      $('estSvImg').onerror = () => {
+        URL.revokeObjectURL(photo);
+        panoAt = null;
+        svFor = null; // worth another try next time
+        $('estSvMsg').textContent = 'The photo of your street could not be shown.';
+      };
+      $('estSvImg').src = photo;
     } catch (e) {
       panoAt = null;
+      // "No photo of this spot" stays true for this spot; anything else — a
+      // dropped connection, being asked to wait — is worth another try.
+      if (e.status !== 404) svFor = null;
       sv.style.display = 'block';
       $('estSvImg').removeAttribute('src');
       $('estSvMsg').textContent =
@@ -579,7 +804,13 @@
   }
 
   // ---- request ----
-  function openModal() {
+  async function openModal() {
+    // An edit may still be waiting to be priced, or its price on the way back.
+    // Let it land, so the figure they are asked to confirm is for the lines on
+    // screen and not the ones before. The button is disabled meanwhile, so it
+    // can't open the form twice, and spins only if that wait is long enough to
+    // notice — usually the price is in already and nothing shows at all.
+    await Snappy.busy($('estRequest'), settlePrice);
     if (!latest || !latest.items.length) return;
     $('estModalTotal').textContent = money(latest.total);
     $('estMsg').textContent = '';
@@ -593,10 +824,8 @@
 
   async function send() {
     $('estMsg').textContent = '';
-    const btn = $('estSend');
-    btn.disabled = true;
     try {
-      const r = await api('/api/estimate/request', {
+      const filing = api('/api/estimate/request', {
         method: 'POST',
         body: JSON.stringify({
           customer: {
@@ -619,15 +848,30 @@
           site: $('mapSearch').value.trim(),
         }),
       });
+      // Disabled the moment it is pressed, so a double press can't file the
+      // request twice; "Sending…" and a spinner only if the server is slow
+      // enough for the wait to be noticed.
+      const r = await Snappy.busy($('estSend'), filing, { label: 'Sending…' });
       closeModal();
       $('estRef').textContent = r.reference;
+      // The server priced the lines again as it filed them; that is the figure
+      // the office has, so it is the one to show.
+      if (r.total != null) {
+        $('estDoneTotal').textContent = money(r.total);
+        $('estDoneTotalLine').style.display = 'block';
+      }
       $('estMain').style.display = 'none';
       $('estDone').style.display = 'block';
+      // The 3D view went with the form, and there is no way back to it — let
+      // it go rather than keep the GPU busy.
+      clearTimeout(previewTimer);
+      if (preview) {
+        preview.destroy();
+        preview = null;
+      }
       window.scrollTo(0, 0);
     } catch (e) {
       $('estMsg').textContent = e.message;
-    } finally {
-      btn.disabled = false;
     }
   }
 
@@ -655,6 +899,7 @@
   if ($('est3dHide'))
     $('est3dHide').addEventListener('click', () => {
       $('est3d').style.display = 'none';
+      if (preview) preview.pause(); // out of sight, so stop drawing it
     });
   if ($('est3dStyle')) $('est3dStyle').addEventListener('change', build3D);
   if ($('est3dHeight')) $('est3dHeight').addEventListener('change', build3D);
@@ -670,6 +915,9 @@
     });
 
   $('estRequest').addEventListener('click', openModal);
+  // Snappy.busy() takes aria-busy off as it lets go of the button; that is the
+  // moment to put its state right again (syncRequest).
+  new MutationObserver(syncRequest).observe($('estRequest'), { attributes: true, attributeFilter: ['aria-busy'] });
   $('estSend').addEventListener('click', send);
   $('estCancel').addEventListener('click', closeModal);
   $('estModalBack').addEventListener('click', (e) => {
@@ -705,9 +953,20 @@
       $('estTaxRate').textContent = c.tax_rate;
       $('estMain').style.display = 'block';
       addLine();
+      // The map library is downloaded already (estimate.html preloads it). Set
+      // it up while the visitor reads, so "Measure on a map" opens on a map
+      // rather than a wait. Nothing is asked of our server: the map's own tiles
+      // load only once it is opened.
+      Snappy.idle(() => Snappy.leaflet().catch(() => {}));
     })
-    .catch(() => {
+    .catch((e) => {
       $('estLoading').style.display = 'none';
       $('estOffline').style.display = 'block';
+      // Turned away for asking too often is not "closed" — say what the
+      // server said instead.
+      if (e.status === 429) {
+        $('estOfflineTitle').textContent = 'Please try again shortly';
+        $('estOfflineText').textContent = e.message;
+      }
     });
 })();

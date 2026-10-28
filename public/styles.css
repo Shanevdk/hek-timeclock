@@ -1,12 +1,15 @@
 /* Theme palette. Light is the base; dark is applied when the user picks "dark"
    or when their system is dark and they haven't overridden it. The variable
-   names are kept (e.g. --black) so the rest of the stylesheet is unchanged. */
+   names are kept (e.g. --black) so the rest of the stylesheet is unchanged.
+   Both are taken from the logo: dark mode is its gold (#c3965a) on its warm
+   black (#0c0a09); light mode uses a deeper shade of the same gold so text on
+   white stays readable. */
 :root {
   --black: #f4f2ee;   /* page background */
   --panel: #ffffff;   /* cards / bars */
   --panel-2: #efeae1; /* inputs, keys */
-  --gold: #a97f43;
-  --gold-dim: #8a6733;
+  --gold: #ac7d3f;
+  --gold-dim: #8a6532;
   --line: #e3ddd2;
   --text: #22201c;
   --muted: #6f685f;
@@ -18,12 +21,12 @@
 }
 
 :root[data-theme='dark'] {
-  --black: #0d0d0d;
-  --panel: #171717;
-  --panel-2: #1f1f1f;
-  --gold: #c89b5c;
-  --gold-dim: #a97f43;
-  --line: #2c2c2c;
+  --black: #0c0a09;
+  --panel: #161413;
+  --panel-2: #1e1c1b;
+  --gold: #c3965a;
+  --gold-dim: #ac7d3f;
+  --line: #2b2928;
   --text: #f3f0ea;
   --muted: #9a938a;
   --sched-head: #3a4150;
@@ -35,12 +38,12 @@
 
 @media (prefers-color-scheme: dark) {
   :root[data-theme='system'] {
-    --black: #0d0d0d;
-    --panel: #171717;
-    --panel-2: #1f1f1f;
-    --gold: #c89b5c;
-    --gold-dim: #a97f43;
-    --line: #2c2c2c;
+    --black: #0c0a09;
+    --panel: #161413;
+    --panel-2: #1e1c1b;
+    --gold: #c3965a;
+    --gold-dim: #ac7d3f;
+    --line: #2b2928;
     --text: #f3f0ea;
     --muted: #9a938a;
   --sched-head: #3a4150;
@@ -253,29 +256,23 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The logo lives in /logo.svg and is pulled in with <use>, so one file feeds
+   every page. Its gold and its wordmark are custom properties: the letters
+   take the theme's gold and the wordmark the text colour, so "FENCING" is
+   white on dark and ink on light. */
+.brand-logo,
+.brand-mark {
+  display: block;
+  --logo-mark: var(--gold);
+  --logo-word: var(--text);
+}
 .brand {
-  text-align: center;
-  padding: 28px 16px 8px;
+  padding: 28px 16px 12px;
 }
-.brand .hek {
-  font-size: 44px;
-  font-weight: 800;
-  letter-spacing: 8px;
-  color: var(--gold);
-  line-height: 1;
-}
-.brand .sub {
-  margin-top: 6px;
-  font-size: 15px;
-  letter-spacing: 10px;
-  color: var(--text);
-  font-weight: 600;
-}
-.brand .inc {
-  font-size: 12px;
-  color: var(--gold-dim);
-  font-style: italic;
-  letter-spacing: 2px;
+.brand-logo {
+  width: 210px;
+  height: 144px;
+  margin: 0 auto;
 }
 
 .wrap {
@@ -354,13 +351,10 @@ h1, h2 { font-weight: 700; }
   height: 100vh;
 }
 .side-brand {
-  font-weight: 800;
-  letter-spacing: 4px;
-  color: var(--gold);
-  font-size: 22px;
   padding: 6px 10px 20px;
 }
-.side-brand small { display: block; color: var(--text); font-weight: 600; letter-spacing: 2px; font-size: 11px; margin-top: 4px; }
+.side-brand .brand-mark { width: 77px; height: 27px; }
+.side-brand small { display: block; color: var(--text); font-weight: 600; letter-spacing: 2px; font-size: 11px; margin-top: 7px; }
 /* Grouped nav: an icon + heading per section, items indented beneath it.
    Scrolls on its own so a tall list never pushes the account box off-screen. */
 .side-nav {
@@ -495,8 +489,9 @@ h1, h2 { font-weight: 700; }
     /* A bar, not a floating card: keep the glass, drop the lifted shadow. */
     box-shadow: var(--glass-inner);
   }
-  .mobile-brand { font-weight: 800; letter-spacing: 3px; color: var(--gold); font-size: 17px; }
-  .mobile-brand small { color: var(--text); font-weight: 600; letter-spacing: 2px; font-size: 10px; margin-left: 6px; }
+  .mobile-brand { display: flex; align-items: center; gap: 8px; }
+  .mobile-brand .brand-mark { width: 51px; height: 18px; }
+  .mobile-brand small { color: var(--text); font-weight: 600; letter-spacing: 2px; font-size: 10px; }
 
   /* The drawer is a sheet of glass slid over the page — rounded on the side
      that leaves the edge, so it reads as an object rather than a wall. */
@@ -622,7 +617,7 @@ tr.skel-row:hover td { background: none; box-shadow: none; }
 .tip:hover::after, .tip:focus-visible::after { opacity: 1; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 12px; }
 .badge.on { background: rgba(63,174,106,.18); color: var(--green); }
-.badge.edited { background: rgba(200,155,92,.18); color: var(--gold); }
+.badge.edited { background: rgba(195,150,90,.18); color: var(--gold); }
 
 input, select, textarea {
   background: var(--panel-2);
@@ -799,11 +794,11 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .tax-input { width: 54px; padding: 4px 6px !important; font-size: 14px; text-align: right; }
 
 .badge.status-draft { background: var(--panel-2); color: var(--muted); }
-.badge.status-sent { background: rgba(200, 155, 92, .18); color: var(--gold); }
+.badge.status-sent { background: rgba(195, 150, 90, .18); color: var(--gold); }
 .badge.status-accepted { background: rgba(63, 174, 106, .18); color: var(--green); }
 .badge.status-declined { background: rgba(209, 91, 82, .18); color: var(--red); }
 /* Time-off request statuses */
-.badge.status-pending { background: rgba(200, 155, 92, .18); color: var(--gold); }
+.badge.status-pending { background: rgba(195, 150, 90, .18); color: var(--gold); }
 .badge.status-approved { background: rgba(63, 174, 106, .18); color: var(--green); }
 
 /* Small count badge on a sidebar nav tab (e.g. pending time-off requests) */
@@ -877,7 +872,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .perm-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .perm-empty { margin: 6px 0 0; padding: 10px; font-size: 13px; color: var(--muted); }
 /* Highlight the part of a label that matched the search. */
-.perm-hit { background: rgba(200, 155, 92, .28); border-radius: 3px; }
+.perm-hit { background: rgba(195, 150, 90, .28); border-radius: 3px; }
 
 /* ---- Client access toggles (dev panel) ---- */
 .feature-row {
@@ -1086,7 +1081,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .tc-id { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: 0.03em; }
 .tc-pri { font-size: 11px; font-weight: 700; border-radius: 20px; padding: 1px 8px; }
 .pri-low { background: var(--panel-2); color: var(--muted); }
-.pri-medium { background: rgba(200, 155, 92, 0.18); color: var(--gold); }
+.pri-medium { background: rgba(195, 150, 90, 0.18); color: var(--gold); }
 .pri-high { background: rgba(209, 91, 82, 0.16); color: var(--red); }
 .pri-urgent { background: var(--red); color: #fff; }
 .tc-title { font-size: 14px; font-weight: 600; line-height: 1.35; color: var(--text); }
@@ -1491,7 +1486,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 .mt-add input { flex: 1; min-width: 0; }
 .mt-add .btn { width: auto; flex-shrink: 0; }
 .badge.prio-low { background: var(--panel-2); color: var(--muted); }
-.badge.prio-medium { background: rgba(200, 155, 92, .18); color: var(--gold); }
+.badge.prio-medium { background: rgba(195, 150, 90, .18); color: var(--gold); }
 .badge.prio-high { background: rgba(209, 91, 82, .16); color: var(--red); }
 .badge.prio-urgent { background: rgba(209, 91, 82, .28); color: var(--red); }
 
@@ -1531,8 +1526,8 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   font-size: 12px;
   font-weight: 600;
   color: var(--gold);
-  background: rgba(200, 155, 92, .15);
-  border: 1px solid rgba(200, 155, 92, .35);
+  background: rgba(195, 150, 90, .15);
+  border: 1px solid rgba(195, 150, 90, .35);
 }
 .clock-modal .cm-input { width: 100%; margin-bottom: 12px; }
 /* Missed clock-out notice inside the modal */
@@ -1595,8 +1590,8 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   margin: 14px 0 0;
   padding: 12px 14px;
   border-radius: 10px;
-  background: rgba(200, 155, 92, .12);
-  border: 1px solid rgba(200, 155, 92, .35);
+  background: rgba(195, 150, 90, .12);
+  border: 1px solid rgba(195, 150, 90, .35);
 }
 .qb-need-title { font-size: 13px; font-weight: 600; color: var(--gold); margin-bottom: 6px; }
 .qb-needs ul { margin: 0; padding-left: 20px; }
@@ -1654,8 +1649,8 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
   margin: 0 0 16px;
   padding: 12px 14px;
   border-radius: 10px;
-  background: rgba(200, 155, 92, .12);
-  border: 1px solid rgba(200, 155, 92, .35);
+  background: rgba(195, 150, 90, .12);
+  border: 1px solid rgba(195, 150, 90, .35);
 }
 .lead-missing ul { margin: 0; padding-left: 20px; }
 .lead-missing li { font-size: 13px; color: var(--text); margin-bottom: 3px; }
@@ -2091,7 +2086,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 }
 .sched-day.is-past .sched-day-body { background: var(--panel-2); }
 .sched-day-body.drop-over {
-  background: rgba(200, 155, 92, .14);
+  background: rgba(195, 150, 90, .14);
   outline: 2px dashed var(--gold);
   outline-offset: -3px;
 }
@@ -2160,7 +2155,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px
 }
 .sched-backlog-body > .sched-card { flex: 0 0 230px; }
 .sched-backlog-body.drop-over {
-  background: rgba(200, 155, 92, .14);
+  background: rgba(195, 150, 90, .14);
   outline: 2px dashed var(--gold);
   outline-offset: -4px;
 }
@@ -2667,7 +2662,7 @@ a.jf-name:hover { color: var(--gold); text-decoration: underline; }
   padding: 8px 12px;
   border: 1px solid var(--gold);
   border-radius: 10px;
-  background: rgba(200, 155, 92, .1);
+  background: rgba(195, 150, 90, .1);
 }
 .sched-bulk[hidden] { display: none; }
 .sched-bulk-count { font-weight: 700; font-size: 13.5px; }
@@ -2828,7 +2823,7 @@ a.jf-name:hover { color: var(--gold); text-decoration: underline; }
    The selected tab picks up the same specular treatment as the sheet it sits
    on, so the gold reads as lit glass rather than a flat swatch. */
 .tab.active {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .45), 0 2px 10px rgba(169, 127, 67, .28);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .45), 0 2px 10px rgba(172, 125, 63, .28);
 }
 @media (prefers-reduced-transparency: reduce) {
   .tab.active { box-shadow: none; }
@@ -3155,3 +3150,813 @@ textarea:focus {
 @media (max-width: 680px) {
   :root { --lq-blur: calc(var(--liquid) * 18px); }
 }
+
+/* ---- Quotes & invoices: the editor is the document ----------------------
+   A quote or invoice is edited on a sheet laid out like the page the
+   customer gets (paper.js prints the same layout). The sheet is paper in
+   both themes on purpose: it is a preview of something printed, so its
+   colours are fixed here rather than taken from the palette. Fields sit flat
+   on the sheet and only show an edge when pointed at or typed in. */
+.doc-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  max-width: 880px;
+  margin: 0 auto 14px;
+}
+.doc-bar h2 { margin: 0; flex: 1 1 auto; min-width: 0; font-size: 20px; }
+.doc-bar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.doc-bar-actions label { margin: 0; font-size: 12px; }
+.doc-bar-actions select { width: auto; padding: 8px 10px; font-size: 14px; }
+.doc-bar-actions [hidden] { display: none; }
+.doc-note { max-width: 880px; margin: -4px auto 12px; color: var(--muted); font-size: 13px; }
+.doc-note:empty { display: none; }
+.doc-after { max-width: 880px; margin: 16px auto 0; }
+#qMsg, #invMsg { max-width: 880px; margin: 0 auto 10px; }
+#qMsg:empty, #invMsg:empty { min-height: 0; margin: 0; }
+
+.paper {
+  --p-ink: #22201c;
+  --p-muted: #6f685f;
+  --p-faint: #a59d92;
+  --p-line: #ece7de;
+  --p-gold: #ac7d3f;
+  --p-head: #f4f0e8;
+  --p-field: #fbf8f2;
+  position: relative;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 44px 48px 48px;
+  display: grid;
+  gap: 26px;
+  background: #fff;
+  color: var(--p-ink);
+  color-scheme: light;
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(34, 32, 28, .08), 0 14px 40px rgba(34, 32, 28, .14);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.paper .pf {
+  display: block;
+  width: calc(100% + 12px);
+  margin: 0 -6px;
+  padding: 3px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  box-shadow: none;
+  color: var(--p-ink);
+  font: inherit;
+  line-height: 1.45;
+  resize: none;
+  transition: border-color .12s, background-color .12s;
+}
+.paper textarea.pf { overflow: hidden; }
+.paper .pf::placeholder { color: var(--p-faint); }
+.paper .pf:hover { border-color: var(--p-line); }
+.paper .pf:focus { outline: none; border-color: var(--p-gold); background: var(--p-field); }
+.paper .pf-strong { font-size: 16px; font-weight: 700; }
+.paper .r { text-align: right; }
+.paper-lbl {
+  display: block;
+  margin: 0 0 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: #8a8278;
+}
+
+.paper-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-bottom: 20px;
+  border-bottom: 3px solid var(--p-gold);
+}
+.paper-logo img { display: block; width: 120px; height: auto; }
+.paper-co { margin-top: 12px; color: var(--p-muted); font-size: 11.5px; line-height: 1.7; }
+.paper-title { text-align: right; flex: none; }
+.paper-title h3 { margin: 0 0 10px; font-size: 30px; letter-spacing: 4px; color: var(--p-gold); line-height: 1; text-transform: uppercase; }
+.paper-meta { margin: 0; display: grid; gap: 2px; }
+.paper-meta > div { display: grid; grid-template-columns: auto 148px; gap: 10px; align-items: center; justify-content: end; }
+.paper-meta dt, .paper-meta dt label { margin: 0; font-size: 12.5px; color: var(--p-muted); text-align: right; }
+.paper-meta dd { margin: 0; }
+.paper-meta .pf { font-size: 13px; font-weight: 600; text-align: right; }
+.paper-meta select.pf { appearance: none; -webkit-appearance: none; text-align-last: right; cursor: pointer; }
+.paper-meta > div[hidden] { display: none; }
+.paper-static { display: block; padding: 3px 0; font-size: 13px; font-weight: 600; text-align: right; }
+.paper-static.pending { color: var(--p-faint); font-weight: 400; font-style: italic; }
+
+.paper-parties { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.paper-party { display: grid; gap: 1px; align-content: start; min-width: 0; }
+.paper-party .pf:not(.pf-strong) { color: #555; }
+
+.paper-quick .quick-adds { margin: 0; gap: 6px; }
+.paper .chip {
+  background: var(--p-head);
+  border: 1px solid transparent;
+  color: #6b5228;
+  box-shadow: none;
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+.paper .chip:hover { background: #fff; border-color: var(--p-gold); color: var(--p-gold); }
+
+.paper-items-wrap { overflow-x: auto; }
+.paper-items { width: 100%; border-collapse: collapse; font-size: 14px; }
+.paper-items th {
+  background: var(--p-head);
+  color: #6b5228;
+  padding: 9px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .6px;
+  text-transform: uppercase;
+  border: 0;
+  text-align: left;
+}
+.paper-items th.r { text-align: right; }
+.paper-items td { padding: 6px 10px; border-bottom: 1px solid var(--p-line); vertical-align: top; color: var(--p-ink); }
+.paper-items th:nth-child(2), .paper-items td:nth-child(2) { width: 76px; }
+.paper-items th:nth-child(3), .paper-items td:nth-child(3) { width: 96px; }
+.paper-items th:nth-child(4), .paper-items td:nth-child(4) { width: 112px; }
+.paper-items th:nth-child(5), .paper-items td:nth-child(5) { width: 112px; }
+.paper-items th:nth-child(6), .paper-items td:nth-child(6) { width: 34px; padding-inline: 0; }
+.paper-items .i-total { padding-top: 10px; text-align: right; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.paper-items .pf.r { font-variant-numeric: tabular-nums; }
+.paper-del {
+  background: none;
+  border: 0;
+  color: var(--p-faint);
+  font-size: 15px;
+  line-height: 1;
+  padding: 8px 6px;
+  cursor: pointer;
+  border-radius: 4px;
+  box-shadow: none;
+}
+.paper-del:hover, .paper-del:focus-visible { color: var(--red); }
+.paper-add {
+  justify-self: start;
+  margin-top: -16px;
+  background: none;
+  border: 1px dashed #d9d1c4;
+  color: var(--p-gold);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: none;
+}
+.paper-add:hover { border-color: var(--p-gold); background: var(--p-field); }
+
+.paper-foot { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 36px; align-items: start; }
+.paper-notes .pf { color: #444; font-size: 13px; }
+.paper-totals { display: grid; gap: 1px; font-variant-numeric: tabular-nums; }
+.pt-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 6px 10px; }
+.pt-row[hidden] { display: none; }
+.pt-row > span:first-child { color: var(--p-muted); display: flex; align-items: center; gap: 4px; }
+.paper .pt-pct { display: inline-block; width: 58px; margin: 0; text-align: right; color: var(--p-ink); border-color: var(--p-line); }
+.pt-grand { border-top: 2px solid var(--p-ink); margin-top: 4px; padding-top: 10px; font-size: 16px; font-weight: 700; }
+.pt-grand > span:first-child { color: var(--p-ink); }
+.pt-due { background: var(--p-gold); color: #fff; border-radius: 6px; margin-top: 8px; padding: 10px 12px; font-size: 16px; font-weight: 700; }
+.pt-due > span:first-child { color: #fff; }
+.pt-dim { color: var(--p-faint); }
+
+.paper-accept { padding-top: 16px; border-top: 1px solid var(--p-line); }
+.paper-accept p { margin: 0 0 34px; color: #555; font-size: 12.5px; }
+.paper-sig { display: flex; gap: 32px; }
+.paper-sig div { flex: 2; border-top: 1px solid var(--p-ink); padding-top: 5px; font-size: 11.5px; color: var(--p-muted); }
+.paper-sig div:last-child { flex: 1; }
+
+/* Heads the totals it describes. */
+.paper-stamp {
+  justify-self: end;
+  margin: 0 10px 12px 0;
+  transform: rotate(-6deg);
+  border: 3px solid #2f9257;
+  color: #2f9257;
+  padding: 4px 18px;
+  border-radius: 8px;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 5px;
+  opacity: .8;
+  pointer-events: none;
+}
+.paper-stamp[hidden] { display: none; }
+.paper .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .paper { padding: 26px 16px 28px; gap: 22px; border-radius: 4px; }
+  .paper-head { flex-direction: column; }
+  .paper-title { text-align: left; width: 100%; }
+  .paper-meta > div { grid-template-columns: 96px minmax(0, 1fr); justify-content: start; }
+  .paper-meta dt, .paper-meta dt label, .paper-meta .pf, .paper-static { text-align: left; }
+  .paper-meta select.pf { text-align-last: left; }
+  .paper-parties, .paper-foot { grid-template-columns: 1fr; gap: 20px; }
+  /* Line items stack: description across the top, the numbers under it. */
+  .paper-items thead { display: none; }
+  .paper-items, .paper-items tbody { display: block; }
+  .paper-items tr {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1.3fr 34px;
+    grid-template-areas: 'desc desc desc del' 'qty unit price .' 'total total total total';
+    gap: 2px 8px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--p-line);
+  }
+  .paper-items td { display: block; width: auto !important; padding: 0; border: 0; }
+  .paper-items td:nth-child(1) { grid-area: desc; }
+  .paper-items td:nth-child(2) { grid-area: qty; }
+  .paper-items td:nth-child(3) { grid-area: unit; }
+  .paper-items td:nth-child(4) { grid-area: price; }
+  .paper-items td:nth-child(5) { grid-area: total; padding-top: 4px; }
+  .paper-items td:nth-child(6) { grid-area: del; }
+  .paper-items .pf.r { text-align: left; }
+}
+
+/* ---- Quote workspace: estimator, sheet and rail --------------------------
+   The quote editor is three things side by side on a wide screen: the
+   satellite estimator and the sheet in one column, and a rail of tools — cost
+   and margin, the customer's link, the AI review — beside them. On anything
+   narrower the rail drops under the sheet, where it is reached after the
+   quote is written, which is the order it is used in. */
+.q-shell { max-width: 880px; margin: 0 auto; }
+.q-shell .doc-bar, .q-shell #qMsg { max-width: none; }
+.q-work { display: grid; gap: 18px; }
+.q-main { display: grid; gap: 18px; min-width: 0; }
+.q-main .paper { width: 100%; }
+@media (min-width: 1280px) {
+  .q-shell { max-width: 1220px; }
+  .q-work { grid-template-columns: minmax(0, 1fr) 300px; align-items: start; }
+}
+.q-rail { display: grid; gap: 14px; align-content: start; min-width: 0; }
+.q-card.card { padding: 16px; }
+.q-card h4, .q-est-panel h4, .q-est-mat h4 { margin: 0 0 10px; font-size: 14px; letter-spacing: .2px; }
+.q-card-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.q-card-h h4 { margin: 0; }
+.q-wide, .btn.sm.q-wide { width: 100%; display: block; }
+.q-rail .btn.sm { padding: 9px 12px; font-size: 13.5px; }
+.q-rail .btn + .btn, .q-rail .btn + .q-rail-two, .q-rail-two + .btn { margin-top: 8px; }
+.q-rail-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.q-rail-note { margin: 8px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+/* A note above the quote sheet: the lock on an accepted quote, or what the
+   customer wrote on the web form. */
+.q-note-box { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 13px; line-height: 1.5; }
+.q-note-box b { color: var(--gold); }
+.q-note-box[hidden] { display: none; }
+.q-rail-stamp { margin: 10px 0 0; font-size: 11.5px; color: var(--muted); }
+.q-busy::after { content: ''; display: inline-block; width: 10px; height: 10px; margin-left: 8px; border-radius: 50%; border: 2px solid var(--gold); border-right-color: transparent; animation: q-spin .8s linear infinite; vertical-align: -1px; }
+@keyframes q-spin { to { transform: rotate(360deg); } }
+
+.q-sum-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+.q-sum-row span { color: var(--muted); }
+.q-sum-total { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 9px; font-size: 17px; }
+.q-sum-total b { color: var(--gold); }
+.q-profit { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.q-profit[hidden] { display: none; }
+.q-profit b.neg { color: var(--red); }
+.q-margin { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.q-margin span { font-size: 13px; font-weight: 700; white-space: nowrap; }
+.q-margin-bar { position: relative; flex: 1; height: 8px; border-radius: 6px; background: var(--panel-2); }
+.q-margin-bar i { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 6px; background: var(--green); transition: width .25s; }
+.q-margin-bar i.warn { background: var(--gold); }
+.q-margin-bar i.bad { background: var(--red); }
+.q-margin-bar em { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--text); opacity: .55; border-radius: 1px; }
+
+.q-timeline { list-style: none; margin: 0 0 6px; padding: 0; display: grid; }
+.q-timeline li { position: relative; display: grid; grid-template-columns: 70px 1fr; column-gap: 8px; padding: 5px 0 5px 18px; font-size: 13px; color: var(--muted); }
+.q-timeline li::before { content: ''; position: absolute; left: 3px; top: 10px; width: 8px; height: 8px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel); }
+.q-timeline li:not(:last-child)::after { content: ''; position: absolute; left: 7px; top: 20px; bottom: -6px; width: 2px; background: var(--line); }
+.q-timeline li.done { color: var(--text); }
+.q-timeline li.done::before { border-color: var(--green); background: var(--green); }
+.q-timeline li.done.bad::before { border-color: var(--red); background: var(--red); }
+.q-timeline b { font-weight: 600; }
+.q-timeline em { grid-column: 2; font-style: normal; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.q-link { width: 100%; margin-top: 8px; font-size: 12px; padding: 7px 9px; }
+.q-link[hidden], .q-warn[hidden] { display: none; }
+.q-warn { margin-top: 10px; padding: 9px 11px; border-radius: 8px; font-size: 12.5px; line-height: 1.45; background: rgba(209, 91, 82, .12); color: var(--red); }
+
+.q-verdict { display: grid; gap: 3px; padding: 10px 12px; border-radius: 10px; margin-bottom: 10px; border-left: 4px solid var(--green); background: rgba(63, 174, 106, .1); }
+.q-verdict b { font-size: 13.5px; }
+.q-verdict span { font-size: 12.5px; line-height: 1.45; }
+.q-verdict.v-warn { border-color: var(--gold); background: rgba(195, 150, 90, .12); }
+.q-verdict.v-bad { border-color: var(--red); background: rgba(209, 91, 82, .12); }
+.q-flags { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.q-flags li { display: grid; gap: 2px; padding-left: 12px; border-left: 3px solid var(--line); font-size: 12.5px; line-height: 1.45; }
+.q-flags li b { font-size: 13px; }
+.q-flags li span { color: var(--muted); }
+.q-flags li.sev-high { border-color: var(--red); }
+.q-flags li.sev-medium { border-color: var(--gold); }
+.q-upsells { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.q-upsells h5 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+.q-upsell { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; font-size: 12.5px; line-height: 1.45; }
+.q-upsell > div { flex: 1; display: grid; gap: 2px; min-width: 0; }
+.q-upsell span { color: var(--muted); }
+.q-upsell .btn.sm { flex: none; padding: 6px 10px; font-size: 12.5px; white-space: nowrap; }
+
+/* ---- the estimator ---- */
+.q-est.card { padding: 0; overflow: hidden; }
+.q-est-toggle {
+  display: flex; align-items: center; gap: 12px; width: 100%; padding: 14px 18px;
+  background: none; border: 0; box-shadow: none; color: var(--text); text-align: left; cursor: pointer; font: inherit;
+}
+.q-est-icon { flex: none; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 10px; background: rgba(195, 150, 90, .16); color: var(--gold); }
+.q-est-title { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.q-est-title b { font-size: 15px; }
+.q-est-title small { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.q-est-chev { flex: none; color: var(--muted); transition: transform .2s; }
+.q-est.open .q-est-chev { transform: rotate(180deg); }
+.q-est-body { padding: 0 18px 18px; display: grid; gap: 14px; }
+.q-est-body[hidden] { display: none; }
+.q-est-search { position: relative; display: flex; gap: 8px; }
+.q-est-search input { flex: 1; min-width: 0; }
+.q-est-search .est-results { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 500; margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.25); max-height: 260px; overflow-y: auto; }
+.q-est-search .est-results button { display: block; width: 100%; text-align: left; padding: 9px 12px; background: none; border: 0; border-bottom: 1px solid var(--line); color: var(--text); font: inherit; font-size: 13px; cursor: pointer; box-shadow: none; }
+.q-est-search .est-results button:hover { background: var(--panel-2); }
+.q-est-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 14px; }
+.q-est-mapwrap { position: relative; min-height: 440px; }
+.q-est-map {
+  position: absolute; inset: 0; border-radius: 12px; overflow: hidden; border: 1px solid var(--line);
+  background: #2a2c2a; z-index: 0; isolation: isolate; outline: none;
+}
+.q-est-layers { top: 10px; right: 10px; z-index: 450; }
+.q-est-map.fm-drawing, .q-est-map.fm-drawing .leaflet-interactive,
+.q-est-map.fm-gating, .q-est-map.fm-gating .leaflet-interactive { cursor: crosshair; }
+.fm-hint {
+  display: none; position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 450;
+  padding: 8px 12px; border-radius: 10px; background: rgba(20, 17, 13, .82); color: #fff; font-size: 13px; line-height: 1.4;
+  pointer-events: none; text-align: center;
+}
+.leaflet-tooltip.fm-len {
+  padding: 1px 6px; border-radius: 6px; border: 0; background: rgba(20, 17, 13, .78); color: #fff;
+  font-size: 11.5px; font-weight: 700; box-shadow: none; white-space: nowrap;
+}
+.leaflet-tooltip.fm-len::before, .leaflet-tooltip.fm-gate::before { display: none; }
+.leaflet-tooltip.fm-live { background: var(--gold); color: #1a1205; }
+.leaflet-tooltip.fm-gate { padding: 1px 6px; border-radius: 6px; border: 0; background: #2f9257; color: #fff; font-size: 11px; font-weight: 700; box-shadow: none; }
+.fm-handle { border-radius: 50%; background: #fff; border: 3px solid #c3965a; box-shadow: 0 1px 4px rgba(0,0,0,.5); cursor: move; box-sizing: border-box; }
+.q-est-side { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.q-est-panel { padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+.q-est-panel select, .q-est-panel input:not([type='checkbox']) { width: 100%; padding: 8px 10px; font-size: 14px; }
+.q-est-panel label { margin: 8px 0 4px; font-size: 12px; }
+.q-est-panel-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.q-est-panel-h h4 { margin: 0; }
+.q-est-panel-h .link-btn[hidden] { display: none; }
+.q-est-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: end; }
+.q-est-check { display: flex !important; align-items: center; gap: 6px; margin: 0 0 9px !important; font-size: 12.5px !important; color: var(--text) !important; cursor: pointer; }
+.q-est-check input { width: auto; margin: 0; }
+.q-est-panel .q-wide { margin-top: 12px; }
+.q-est-gate { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 8px; }
+.q-est-gate .btn.sm { padding: 8px 12px; }
+.q-est-tools { display: flex; justify-content: space-between; margin-top: 10px; }
+.q-est-tools .link-btn { padding: 2px 0; font-size: 12.5px; }
+.q-est-total { font-weight: 800; color: var(--gold); font-variant-numeric: tabular-nums; }
+.q-est-runs { display: grid; gap: 6px; margin-top: 8px; max-height: 260px; overflow-y: auto; }
+.q-est-empty { margin: 4px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.q-run { display: grid; grid-template-columns: 1fr auto; align-items: center; border-radius: 8px; border: 1px solid transparent; }
+.q-run.sel { border-color: var(--gold); background: rgba(195, 150, 90, .1); }
+.q-run-main { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: none; border: 0; box-shadow: none; color: var(--text); text-align: left; cursor: pointer; font: inherit; min-width: 0; }
+.q-run-main i { flex: none; width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(0,0,0,.35); }
+.q-run-main span { display: grid; min-width: 0; }
+.q-run-main b { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-run-main small { font-size: 11.5px; color: var(--muted); }
+.q-run-slope { font-style: normal; color: var(--gold); font-weight: 600; }
+.q-run-gate { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; padding: 0 8px 4px 28px; font-size: 12px; color: var(--muted); }
+.q-run-gate span { flex: 1; }
+.q-run-gate span::before { content: 'Gate · '; color: #2f9257; font-weight: 700; }
+
+.q-est-mat { border-top: 1px solid var(--line); padding-top: 14px; }
+.q-est-mat-h { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.q-est-mat-h h4 { margin: 0; }
+.q-est-mat-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.q-est-mat-actions select { width: auto; padding: 8px 10px; font-size: 13.5px; }
+.q-est-mat-actions .btn.sm { padding: 9px 14px; }
+.q-mat-wrap { overflow: auto; max-height: 340px; border: 1px solid var(--line); border-radius: 10px; }
+.q-mat { font-size: 13px; }
+.q-mat th { position: sticky; top: 0; background: var(--panel-2); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); padding: 8px 10px; z-index: 1; }
+.q-mat td { padding: 6px 10px; font-variant-numeric: tabular-nums; }
+.q-mat td small { color: var(--muted); }
+.q-mat .r { text-align: right; white-space: nowrap; }
+.q-mat-sub td { background: var(--panel-2); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); padding: 6px 10px; }
+.q-mat-totals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.q-mat-totals > div { display: grid; gap: 2px; padding: 10px 12px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--line); font-variant-numeric: tabular-nums; min-width: 0; }
+.q-mat-totals span { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.q-mat-totals b { font-size: 17px; }
+.q-mat-totals small { font-size: 11.5px; color: var(--muted); }
+.q-mat-totals .hi { border-color: var(--gold); background: rgba(195, 150, 90, .12); }
+.q-mat-totals .hi b { color: var(--gold); }
+.q-est-note { margin: 10px 0 0; font-size: 12.5px; color: var(--muted); }
+.q-est-note:empty { display: none; }
+
+@media (max-width: 900px) {
+  .q-est-grid { grid-template-columns: 1fr; }
+  .q-est-mapwrap { min-height: 0; height: 58vh; max-height: 460px; }
+  .q-mat-totals { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 520px) {
+  .q-est-toggle { padding: 12px 14px; }
+  .q-est-body { padding: 0 12px 14px; }
+  .q-est-mat-actions, .q-est-mat-actions select, .q-est-mat-actions .btn.sm { width: 100%; }
+}
+
+/* The drawing and the signature, on the sheet. */
+.paper-layout[hidden] { display: none; }
+.paper-layout svg { width: 100%; height: auto; }
+.paper-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 8px; font-size: 12px; color: #555; }
+.paper-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.25); }
+.paper-signed { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 24px; }
+.paper-signed[hidden], #qSigLines[hidden] { display: none; }
+.paper-signed img { height: 72px; max-width: 300px; object-fit: contain; border-bottom: 1px solid var(--p-ink); }
+.paper-signed div { font-size: 12.5px; color: #555; }
+
+/* ---- estimator prices (catalog) ---- */
+.modal.q-cat-modal { max-width: 920px; max-height: 92vh; overflow-y: auto; padding: 20px 22px 0; }
+.q-cat-head { display: flex; align-items: center; justify-content: space-between; }
+.q-cat-head h3 { margin: 0; }
+.q-cat-modal h4 { margin: 18px 0 8px; font-size: 14px; }
+.q-cat-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.q-cat-settings label { display: grid; gap: 4px; margin: 0; font-size: 12.5px; color: var(--text); }
+.q-cat-settings label span { font-size: 11px; color: var(--muted); }
+.q-cat-settings input { width: 100%; padding: 7px 9px; font-size: 14px; }
+.q-cat-table input:not([type='checkbox']) { width: 82px; padding: 5px 7px; font-size: 13px; text-align: right; }
+.q-cat-table td { vertical-align: middle; }
+.q-cat-per { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.q-swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.3); }
+.q-cat-foot { position: sticky; bottom: 0; display: flex; align-items: center; gap: 12px; margin: 16px -22px 0; padding: 12px 22px; background: var(--panel); border-top: 1px solid var(--line); }
+.q-cat-foot .msg { flex: 1; margin: 0; min-height: 0; font-size: 13px; }
+.q-cat-foot .btn[hidden] { display: none; }
+
+/* ---- the customer's quote page ("/quote") --------------------------------
+   A document, not the app: fixed paper colours in either theme, a single
+   column a phone can read, and one obvious thing to do — approve and sign. */
+body.qp-page {
+  --black: #f4f2ee; --panel: #ffffff; --panel-2: #f4f0e8; --gold: #ac7d3f; --gold-dim: #8a6532;
+  --line: #e6dfd2; --text: #22201c; --muted: #6f685f; --green: #2f9257; --red: #c0453b;
+  color-scheme: light;
+  margin: 0; background: #f4f2ee; color: #22201c;
+  font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; line-height: 1.5;
+}
+.qp-page [hidden] { display: none !important; }
+/* A plain sheet: no washes of light behind it. */
+body.qp-page::before { display: none; }
+.qp-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; background: #fff; border-bottom: 3px solid #ac7d3f; }
+.qp-brand img { display: block; width: 76px; height: auto; }
+.qp-top-meta { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #6f685f; }
+.qp-pill { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; background: rgba(172, 125, 63, .15); color: #8a6532; }
+.qp-pill.ok { background: rgba(47, 146, 87, .14); color: #2f9257; }
+.qp-pill.bad { background: rgba(192, 69, 59, .12); color: #c0453b; }
+.qp-wrap { max-width: 860px; margin: 0 auto; padding: 18px 16px 40px; display: grid; gap: 16px; }
+.qp-card { background: #fff; border: 1px solid #ece7de; border-radius: 14px; padding: 22px; box-shadow: 0 1px 2px rgba(34,32,28,.05), 0 8px 24px rgba(34,32,28,.06); min-width: 0; }
+.qp-card h1 { margin: 2px 0 2px; font-size: 24px; line-height: 1.2; }
+.qp-card h2 { margin: 0 0 14px; font-size: 17px; }
+.qp-loading { text-align: center; color: #6f685f; }
+.qp-missing { text-align: center; }
+.qp-lbl { font-size: 10.5px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase; color: #8a8278; }
+.qp-mt { margin-top: 14px; }
+.qp-dim { margin: 0; color: #6f685f; font-size: 14px; white-space: pre-line; }
+.qp-project { margin: 2px 0 0; font-weight: 700; font-size: 16px; }
+.qp-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 300px); gap: 24px; }
+.qp-hero-r { padding-left: 24px; border-left: 1px solid #ece7de; }
+.qp-total { font-size: 34px; font-weight: 800; color: #ac7d3f; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.qp-deposit { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: #f4f0e8; font-size: 13.5px; }
+.qp-meta { margin: 12px 0 0; display: grid; gap: 2px; font-size: 13.5px; }
+.qp-meta div { display: flex; justify-content: space-between; gap: 10px; }
+.qp-meta dt { color: #6f685f; }
+.qp-meta dd { margin: 0; font-weight: 600; }
+.qp-hero-actions { display: grid; gap: 8px; margin-top: 16px; }
+.qp-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 12px 18px; border-radius: 10px;
+  border: 1px solid #d9d1c4; background: #fff; color: #22201c; font: inherit; font-size: 15px; font-weight: 600;
+  text-decoration: none; cursor: pointer; box-shadow: none;
+}
+.qp-btn:hover { border-color: #ac7d3f; }
+.qp-btn.qp-primary { background: #ac7d3f; border-color: #ac7d3f; color: #fff; }
+.qp-btn.qp-primary:hover { background: #997038; }
+.qp-btn:disabled { opacity: .6; cursor: default; }
+.qp-wide { width: 100%; }
+.qp-link { background: none; border: 0; padding: 0; color: #8a6532; font: inherit; font-size: 13.5px; cursor: pointer; text-decoration: underline; box-shadow: none; }
+.qp-banner { padding: 14px 18px; border-radius: 12px; font-size: 14.5px; line-height: 1.5; background: #fff; border: 1px solid #ece7de; }
+.qp-banner.ok { background: #eaf6ee; border-color: #bfe3cb; color: #1f6b3e; }
+.qp-banner.bad { background: #fbeeec; border-color: #f0cdc8; color: #8f2f27; }
+.qp-banner .qp-contact { margin-top: 10px; }
+.qp-map { height: 380px; border-radius: 12px; overflow: hidden; border: 1px solid #ece7de; position: relative; z-index: 0; isolation: isolate; }
+.qp-map.qp-map-svg { height: auto; }
+.qp-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 13px; color: #555; }
+.qp-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.25); }
+.qp-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.qp-table th { background: #f4f0e8; color: #6b5228; text-align: left; padding: 9px 10px; font-size: 11px; letter-spacing: .6px; text-transform: uppercase; border: 0; font-weight: 600; }
+.qp-table th.r { text-align: right; }
+.qp-table td { padding: 10px; border-bottom: 1px solid #ece7de; vertical-align: top; color: #22201c; }
+.qp-table .r { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.qp-desc b { display: block; font-weight: 600; }
+.qp-desc span { display: block; margin-top: 2px; font-size: 12.5px; color: #6f685f; white-space: pre-line; }
+.qp-amt { font-weight: 600; }
+.qp-totals { margin: 12px 0 0 auto; max-width: 320px; display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
+.qp-totals > div { display: flex; justify-content: space-between; padding: 5px 10px; }
+.qp-totals > div span:first-child { color: #6f685f; }
+.qp-grand { border-top: 2px solid #22201c; margin-top: 4px; padding-top: 9px !important; font-size: 17px; font-weight: 800; }
+.qp-grand span:first-child { color: #22201c !important; }
+.qp-dep { background: #ac7d3f; color: #fff; border-radius: 8px; margin-top: 6px; font-weight: 700; }
+.qp-dep span:first-child { color: #fff !important; }
+.qp-notes { margin: 0; white-space: pre-wrap; font-size: 14px; color: #444; }
+.qp-sign label { display: block; margin: 14px 0 6px; font-size: 13.5px; font-weight: 600; color: #22201c; }
+.qp-sign input:not([type='checkbox']), .qp-sign textarea {
+  width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 16px; border-radius: 10px;
+  border: 1px solid #d9d1c4; background: #fbf8f2; color: #22201c; box-shadow: none; font-family: inherit;
+}
+.qp-pad-head { display: flex; align-items: baseline; justify-content: space-between; }
+.qp-pad {
+  display: block; width: 100%; height: 170px; border-radius: 10px; border: 1px dashed #c9bfae; touch-action: none; cursor: crosshair;
+  background: #fbf8f2 linear-gradient(to bottom, transparent calc(100% - 46px), #d9d1c4 calc(100% - 46px), #d9d1c4 calc(100% - 45px), transparent calc(100% - 45px));
+}
+.qp-agree { display: flex !important; align-items: flex-start; gap: 10px; font-weight: 400 !important; font-size: 14px !important; line-height: 1.45; cursor: pointer; }
+.qp-agree input { width: 20px; height: 20px; margin: 1px 0 0; flex: none; accent-color: #ac7d3f; }
+.qp-msg { min-height: 20px; margin: 10px 0 6px; color: #c0453b; font-size: 14px; }
+.qp-decline-toggle { display: block; margin: 14px auto 0; }
+.qp-decline { margin-top: 6px; }
+.qp-decline .qp-btn { margin-top: 10px; }
+.qp-signed { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px; }
+.qp-signed img { height: 90px; max-width: 320px; object-fit: contain; border-bottom: 1px solid #22201c; }
+.qp-signed p { margin: 0; font-size: 14px; color: #555; }
+.qp-contact { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
+.qp-contact a { padding: 8px 12px; border-radius: 10px; border: 1px solid #e0d8ca; background: #fff; color: #22201c; text-decoration: none; font-size: 13.5px; }
+.qp-foot { text-align: center; color: #8a8278; font-size: 12.5px; }
+.qp-foot p { margin: 12px 0 0; }
+@media (max-width: 640px) {
+  .qp-top { padding: 10px 14px; }
+  .qp-top-meta > span:first-child { display: none; }
+  .qp-card { padding: 18px 16px; }
+  .qp-hero { grid-template-columns: 1fr; gap: 16px; }
+  .qp-hero-r { padding: 16px 0 0; border-left: 0; border-top: 1px solid #ece7de; }
+  .qp-map { height: 300px; }
+  /* Line items stack: the description across the top, the numbers under it. */
+  .qp-table thead { display: none; }
+  .qp-table, .qp-table tbody, .qp-table tr { display: block; }
+  .qp-table tr { padding: 10px 0; border-bottom: 1px solid #ece7de; }
+  .qp-table td { display: flex; justify-content: space-between; padding: 2px 0; border: 0; }
+  .qp-table td.qp-desc { display: block; padding-bottom: 6px; }
+  .qp-table td[data-l]::before { content: attr(data-l); color: #8a8278; font-size: 12.5px; }
+  .qp-totals { max-width: none; }
+}
+
+.q-cat-table input.q-cat-bad, .q-cat-settings input.q-cat-bad { border-color: var(--red); box-shadow: 0 0 0 2px rgba(209, 91, 82, .25); }
+
+/* ==========================================================================
+   Snappy: instant feedback and quick motion (see snappy.js)
+   ==========================================================================
+   Things arriving take --dur-in on an ease that starts fast and settles.
+   Things leaving take the shorter --dur-out and accelerate away: a dismissed
+   sheet should be gone before the next tap lands. */
+:root {
+  --dur-in: 180ms;
+  --dur-out: 120ms;
+  --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --ease-in: cubic-bezier(.4, 0, 1, 1);
+  /* How long a wait must last before a skeleton or spinner is worth showing. */
+  --wait-delay: 180ms;
+}
+
+/* No double-tap-to-zoom wait on controls, and no grey flash from the
+   browser's own tap highlight: the press states below replace it. */
+html { -webkit-tap-highlight-color: transparent; }
+a, button, label, summary, select, input, textarea,
+.btn, .tab, .ptab, .link-btn, .clickable-row, [role='button'], [data-press] {
+  touch-action: manipulation;
+}
+
+/* ---- press states ----
+   Drawn the instant a finger or mouse lands, with no transition, so a control
+   answers before the app has done anything with the press. `scale` rather
+   than transform: it stacks on whatever transform a control already uses for
+   its own look (the gear's turn, a centring translate). */
+button:not(:disabled):active,
+.btn:not(:disabled):active,
+.tab:active,
+.ptab:active,
+[role='button']:active,
+[data-press]:active {
+  scale: .97;
+}
+/* A table row can't shrink without its cells pulling out of line with the
+   header; a pressed row shows it by its colour instead (below). */
+tr[data-press]:active { scale: none; }
+.btn.gold:not(:disabled):active,
+.btn.danger-solid:not(:disabled):active {
+  filter: brightness(.9);
+}
+.link-btn:not(:disabled):active { opacity: .6; }
+.clickable-row:active > td,
+tr[data-press]:active > td { background: color-mix(in srgb, var(--gold) 16%, var(--panel-2)); }
+/* Small round controls sink a little further, or the change can't be seen. */
+.gear-btn:active, .hamburger:active { scale: .9; }
+
+/* ---- waiting, only when there is something to wait for ----
+   A skeleton or "Loading…" line that a quick answer replaces within
+   --wait-delay is never seen at all. One still there after that fades in. */
+@keyframes snappy-reveal { from { opacity: 0; } to { opacity: 1; } }
+tr.skel-row,
+.wait {
+  animation: snappy-reveal 120ms var(--ease-out) var(--wait-delay) both;
+}
+/* A control busy with work. Snappy.busy() adds this only once the wait has
+   passed 150 ms. */
+.is-busy { cursor: progress; }
+.is-busy::after {
+  content: '';
+  display: inline-block;
+  width: .85em;
+  height: .85em;
+  margin-left: .5em;
+  vertical-align: -.1em;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  animation: q-spin .8s linear infinite;
+}
+button[aria-busy='true'], .btn[aria-busy='true'] { pointer-events: none; }
+
+/* The markers snappy.js uses to load more of a long list. */
+tr.snappy-more td { padding: 0; border: 0; height: 1px; }
+tr.snappy-more td:has(button) { padding: 14px 0; text-align: center; }
+div.snappy-more { min-height: 1px; text-align: center; }
+
+/* ---- modals ----
+   In: the veil fades up and the panel grows out of the point that was
+   pressed to open it (snappy.js aims transform-origin there). Out: the same
+   in reverse, quicker. `display` changes as a discrete step at the end, so a
+   modal stays on screen while its exit plays. A browser without that (before
+   Safari 17.4 or Chrome 117) opens and closes instantly, as it always did. */
+.modal-back {
+  opacity: 0;
+  transition: opacity var(--dur-out) var(--ease-in), display var(--dur-out) allow-discrete;
+}
+.modal-back:not(.open) { pointer-events: none; }
+.modal-back.open {
+  opacity: 1;
+  transition: opacity var(--dur-in) var(--ease-out), display var(--dur-in) allow-discrete;
+}
+.modal-back > .modal { transition: scale var(--dur-out) var(--ease-in); }
+.modal-back:not(.open) > .modal { scale: .96; }
+.modal-back.open > .modal { transition: scale var(--dur-in) var(--ease-out); }
+@starting-style {
+  .modal-back.open { opacity: 0; }
+  .modal-back.open > .modal { scale: .96; }
+}
+
+/* The settings panel opens out of the gear underneath it. */
+.settings-menu {
+  transform-origin: 85% 100%;
+  transition: opacity var(--dur-in) var(--ease-out), scale var(--dur-in) var(--ease-out);
+}
+@starting-style {
+  .settings-menu { opacity: 0; scale: .95; }
+}
+.settings-menu.is-leaving {
+  opacity: 0;
+  scale: .95;
+  transition-duration: var(--dur-out);
+  transition-timing-function: var(--ease-in);
+}
+
+/* The phone drawer slides out from the edge its menu button sits on: quick in,
+   quicker out. */
+@media (max-width: 680px) {
+  .sidebar { transition: transform var(--dur-out) var(--ease-in); }
+  .sidebar.open { transition: transform 200ms var(--ease-out); }
+  .sidebar-backdrop { transition: opacity var(--dur-out) var(--ease-in); }
+  .sidebar-backdrop.open { transition: opacity 200ms var(--ease-out); }
+}
+.hamburger span { transition-duration: 160ms; }
+.q-margin-bar i { transition-duration: 180ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-back > .modal,
+  .modal-back:not(.open) > .modal,
+  .settings-menu,
+  .settings-menu.is-leaving,
+  button:active, .btn:active, .tab:active, .ptab:active,
+  [role='button']:active, [data-press]:active,
+  .gear-btn:active, .hamburger:active { scale: none; }
+  @starting-style {
+    .modal-back.open > .modal,
+    .settings-menu { scale: none; }
+  }
+}
+
+/* ---- Snappy on the public pages: estimate.js, fence3d.js, quote-portal.js ----
+   A line in a map's own box: "Loading the map…" while Leaflet is on its way
+   (a .wait placeholder, so only seen if it is slow), or why it couldn't load. */
+.est-map-note,
+.qp-map-note {
+  height: 100%;
+  margin: 0;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  cursor: default;
+}
+/* The words over the 3D picture can run to a sentence ("…could not load"):
+   kept off the edges, and centred line by line. */
+.est-3d-note { padding: 0 20px; text-align: center; }
+/* The quote page's link-styled buttons answer a press the instant it lands,
+   as every <button> already does. */
+a.qp-btn:active { scale: .97; }
+.qp-btn.qp-primary:not(:disabled):active { filter: brightness(.9); }
+.qp-link:not(:disabled):active { opacity: .6; }
+/* A section that opens in place under the control that opened it — the map,
+   the 3D view, the decline form — comes out of that control: a quick fade and
+   a few pixels' drop. Closing is instant, quicker than any opening. */
+@keyframes pub-drop-in { from { opacity: 0; translate: 0 -6px; } }
+#mapPanel, #est3d, #qpDecline { animation: pub-drop-in var(--dur-in) var(--ease-out); }
+@media (prefers-reduced-motion: reduce) {
+  a.qp-btn:active { scale: none; }
+  #mapPanel, #est3d, #qpDecline { animation: none; }
+}
+
+/* ==========================================================================
+   Quotes list, the satellite estimator and the rate book
+   (quotes.js, fencemap.js, pricing.js)
+   ========================================================================== */
+/* A quote row opens on the press itself (data-press="fast"), and its press
+   state is the highlight rows already have. Shrinking the whole table row as
+   well, as a pressed button does, would pull its cells out of line with the
+   header for a moment. */
+#qBody > tr[data-press]:active { scale: none; }
+/* Panels that open in place under the button that opened them — the
+   satellite estimator, the rate book — come out of it: a quick fade and a few
+   pixels' drop. Closing is instant, quicker than any opening. */
+@keyframes q-open-under { from { opacity: 0; translate: 0 -6px; } }
+#qEstBody:not([hidden]), #pcRateCard { animation: q-open-under var(--dur-in) var(--ease-out); }
+@media (prefers-reduced-motion: reduce) {
+  #qEstBody:not([hidden]), #pcRateCard { animation: none; }
+}
+
+/* ==========================================================================
+   Invoices, estimate requests and the AI inbox
+   (invoices.js, estimates.js, inbox.js)
+   ========================================================================== */
+/* An invoice row, and the head of a request or email card, opens on the press
+   itself (data-press="fast"). Its press state is a highlight, the way list
+   rows already answer: shrinking a whole row or card head, as a pressed
+   button does, would pull it out of line with what is around it. */
+#invBody > tr[data-press]:active,
+.es-req-head[data-press]:active,
+.lead-head[data-press]:active { scale: none; }
+.es-req-head:active,
+.lead-head:active { background: color-mix(in srgb, var(--gold) 12%, var(--panel-2)); }
+/* Details that open in place under the head that was pressed, and the
+   settings panels under their buttons, come out of it: a quick fade and a few
+   pixels' drop. Closing is instant, quicker than any opening. */
+@keyframes card-open-under { from { opacity: 0; translate: 0 -6px; } }
+.es-req-body.is-opening,
+.lead-body.is-opening,
+#esSettings,
+#ibSettingsCard { animation: card-open-under var(--dur-in) var(--ease-out); }
+@media (prefers-reduced-motion: reduce) {
+  .es-req-body.is-opening,
+  .lead-body.is-opening,
+  #esSettings,
+  #ibSettingsCard { animation: none; }
+}
+
+/* ==========================================================================
+   Schedule board, tasks and messages (schedule.js, tasks.js, messages.js)
+   ========================================================================== */
+/* Schedule and task cards open on a click and start a drag on a press, so a
+   press lights the card's edge rather than shrinking it — a shrink would
+   shrink the drag image with it. On a touch screen, with no hover, this is
+   the only sign the press landed. */
+.sched-card:active,
+.task-card:active { border-color: var(--gold); }
+/* A bulletin row opens on the press itself (data-press="fast"); its press
+   state is the highlight rows already have. Shrinking the row too would pull
+   its cells out of line with the header for a moment. */
+#msgManageBody > tr[data-press]:active { scale: none; }
+/* A comment on its way shows at once, and fades only if the server takes long
+   enough for the wait to mean something (the same delay as .wait). */
+@keyframes tm-sending { to { opacity: .6; } }
+.tm-item.is-sending { animation: tm-sending 120ms var(--ease-out) var(--wait-delay) both; }
+/* One the server didn't take stays, marked, with Retry and Discard. */
+.tm-item.is-failed { border-color: var(--red); }
+.tm-item.is-failed .tm-item-meta { color: var(--red); }
+.tm-item-meta .link-btn { font-size: inherit; padding: 0 0 0 8px; }

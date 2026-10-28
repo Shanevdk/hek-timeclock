@@ -120,49 +120,89 @@ function makeProjector(originLat, originLng) {
 // The ground: satellite tiles stitched into one texture
 // ---------------------------------------------------------------------------
 
-const loadTile = (z, x, y) =>
-  new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    // A missing tile leaves a blank square rather than failing the whole view.
-    img.onerror = () => resolve(null);
-    img.src = `/api/estimate/tile/${z}/${x}/${y}`;
-  });
-
-// Build a texture covering the traced area, and report exactly what ground it
-// spans so the plane can be placed to match.
-async function buildGround(bounds, project) {
-  // Zoom 19 is the finest Esri holds almost everywhere; drop a level at a time
-  // if the property is big enough that 19 would need an unreasonable number of
-  // tiles to cover.
-  let z = 19;
-  let x0, x1, y0, y1;
-  for (; z >= 15; z--) {
-    x0 = Math.floor(lngToTileX(bounds.west, z));
-    x1 = Math.floor(lngToTileX(bounds.east, z));
-    y0 = Math.floor(latToTileY(bounds.north, z));
-    y1 = Math.floor(latToTileY(bounds.south, z));
-    if ((x1 - x0 + 1) * (y1 - y0 + 1) <= 25) break;
+// One tile, ready to draw, or null if it can't be had — a missing tile leaves a
+// blank square rather than failing the whole view. Fetched rather than loaded
+// as an <img> so that a refusal can be read: when the server is turning
+// requests away, what it said is handed to `refused` for the page to show.
+async function loadTile(z, x, y, refused) {
+  try {
+    const res = await fetch(`/api/estimate/tile/${z}/${x}/${y}`);
+    if (res.ok) return await createImageBitmap(await res.blob());
+    if (res.status === 429) {
+      const data = await res.json().catch(() => null);
+      refused((data && data.error) || 'Too many requests — wait a moment and try again.');
+    }
+  } catch (e) {
+    /* offline, or not a picture — leave the square blank */
   }
+  return null;
+}
 
-  const cols = x1 - x0 + 1;
-  const rows = y1 - y0 + 1;
+// The most tiles one ground may take. An area that needs more even at zoom 15
+// is too big for a photo of the yard to mean much, and fetching it would be a
+// flood of requests, so it gets plain ground instead.
+const MAX_TILES = 36;
+const GROUND_COLOUR = '#5d6b4e';
+
+// Stitch the tiles of one patch of ground — zoom z, columns x0–x1, rows y0–y1 —
+// into a single picture. `complete` is false if any tile couldn't be had: a
+// picture with holes in it is shown, but never kept for reuse.
+async function paintTiles({ z, x0, x1, y0, y1 }) {
   const canvas = document.createElement('canvas');
-  canvas.width = cols * 256;
-  canvas.height = rows * 256;
+  canvas.width = (x1 - x0 + 1) * 256;
+  canvas.height = (y1 - y0 + 1) * 256;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#5d6b4e';
+  ctx.fillStyle = GROUND_COLOUR;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  let notice = null;
+  let missing = 0;
+  const refused = (message) => { notice = notice || message; };
   const jobs = [];
   for (let x = x0; x <= x1; x++)
     for (let y = y0; y <= y1; y++)
       jobs.push(
-        loadTile(z, x, y).then((img) => {
-          if (img) ctx.drawImage(img, (x - x0) * 256, (y - y0) * 256, 256, 256);
+        loadTile(z, x, y, refused).then((img) => {
+          if (!img) {
+            missing++;
+            return;
+          }
+          ctx.drawImage(img, (x - x0) * 256, (y - y0) * 256, 256, 256);
+          img.close(); // on the canvas now; the decoded copy can go
         })
       );
   await Promise.all(jobs);
+  return { canvas, notice, complete: missing === 0 };
+}
+
+// Build a texture covering the traced area, and report exactly what ground it
+// spans so the plane can be placed to match. `texture` is null when the area
+// is too big to photograph; `notice` is the server's word if it turned the
+// imagery away. `photo(patch)` hands over the stitched tiles for a patch —
+// FencePreview keeps the last one, so a rebuild on the same ground reuses it.
+async function buildGround(bounds, project, photo) {
+  // Zoom 19 is the finest Esri holds almost everywhere; drop a level at a time
+  // if the property is big enough that 19 would need an unreasonable number of
+  // tiles to cover. Never below 15, so the tile numbers always belong to the
+  // zoom they are fetched at.
+  let z = 19;
+  let x0, x1, y0, y1, count;
+  for (;; z--) {
+    x0 = Math.floor(lngToTileX(bounds.west, z));
+    x1 = Math.floor(lngToTileX(bounds.east, z));
+    y0 = Math.floor(latToTileY(bounds.north, z));
+    y1 = Math.floor(latToTileY(bounds.south, z));
+    count = (x1 - x0 + 1) * (y1 - y0 + 1);
+    if (count <= 25 || z === 15) break;
+  }
+  if (count > MAX_TILES) {
+    // The same patch of ground, just without the photo — nothing is fetched.
+    const [west, north] = project.toLocal([bounds.north, bounds.west]);
+    const [east, south] = project.toLocal([bounds.south, bounds.east]);
+    return { texture: null, west, east, north, south, notice: null };
+  }
+
+  const { canvas, notice } = await photo({ z, x0, x1, y0, y1 });
 
   // The exact ground the canvas covers, in local metres.
   const [wx, nz] = project.toLocal([tileYToLat(y0, z), tileXToLng(x0, z)]);
@@ -171,7 +211,7 @@ async function buildGround(bounds, project) {
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = 8;
-  return { texture, west: wx, east: ex, north: nz, south: sz };
+  return { texture, west: wx, east: ex, north: nz, south: sz, notice };
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +228,22 @@ function instanced(count, geometry, material, shadows = true) {
 }
 
 const matte = (colour) => new THREE.MeshLambertMaterial({ color: colour });
+
+// Free what a finished-with group holds on the graphics card: its geometry,
+// materials and textures. Taking a mesh out of the scene never does that by
+// itself.
+function release(root) {
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    obj.geometry.dispose();
+    for (const m of [].concat(obj.material)) {
+      if (m.map) m.map.dispose();
+      m.dispose();
+    }
+    // An instanced mesh keeps its per-copy positions in a buffer of its own.
+    if (obj.isInstancedMesh) obj.dispose();
+  });
+}
 
 // Turn the traced runs into fence geometry. Everything repeated — posts,
 // boards, pickets — goes into an InstancedMesh, so a 300ft picket fence is a
@@ -396,11 +452,26 @@ export class FencePreview {
 
     this.world = new THREE.Group();
     this.scene.add(this.world);
+    this._loads = 0; // numbers each load(), so only the newest one lands
+    this._ground = null; // the last aerial photo stitched — see _photo()
 
+    // Frames are drawn when something changes — the camera moves, a fence
+    // loads, the canvas is resized — not sixty times a second. Nothing in the
+    // scene moves on its own, and a phone left on this page shouldn't run hot
+    // redrawing the same picture with a 2048² soft shadow.
+    this._frame = 0;
+    this._paused = false;
     this._bindControls();
-    this._loop = this._loop.bind(this);
-    this._running = true;
-    requestAnimationFrame(this._loop);
+    this._resized = new ResizeObserver(() => this.redraw());
+    this._resized.observe(canvas);
+    // Nothing is drawn in a background tab; coming back draws once.
+    this._onVisibility = () => {
+      if (!document.hidden) return this.redraw();
+      cancelAnimationFrame(this._frame);
+      this._frame = 0;
+    };
+    document.addEventListener('visibilitychange', this._onVisibility);
+    this.redraw();
   }
 
   // Drag to look around, wheel or pinch to move in. Written out rather than
@@ -424,6 +495,7 @@ export class FencePreview {
       );
       lastX = x;
       lastY = y;
+      this.redraw();
     };
     const end = () => { dragging = false; pinch = 0; };
 
@@ -460,13 +532,23 @@ export class FencePreview {
 
   zoom(factor) {
     this.orbit.distance = Math.min(this.maxDistance || 600, Math.max(4, this.orbit.distance * factor));
+    this.redraw();
   }
 
   // Load a traced fence. Everything before is thrown away, so changing style or
-  // height just calls this again.
+  // height just calls this again. Resolves to null if a newer load overtook
+  // this one, otherwise to { notice }: the server's word if it turned the
+  // aerial imagery away, so the page can say why the ground is blank.
   async load({ runs, styleKey, heightFt }) {
-    this.world.clear();
-    if (!runs || !runs.length) return;
+    // Building the ground waits on the network, and another load (a corner
+    // added, the height changed) can start meanwhile. Only the newest may
+    // touch the scene, or each would add its own fence and ground.
+    const seq = ++this._loads;
+    if (!runs || !runs.length) {
+      this._clearWorld();
+      this.redraw();
+      return { notice: null };
+    }
 
     const flat = runs.flat();
     const bounds = {
@@ -488,20 +570,36 @@ export class FencePreview {
       east: bounds.east + padLng, west: bounds.west - padLng,
     };
 
-    const ground = await buildGround(padded, project);
+    const ground = await buildGround(padded, project, (patch) => this._photo(patch));
+    if (seq !== this._loads) return null;
     const width = Math.abs(ground.east - ground.west);
     const depth = Math.abs(ground.south - ground.north);
     const plane = new THREE.Mesh(
       new THREE.PlaneGeometry(width, depth),
-      new THREE.MeshLambertMaterial({ map: ground.texture })
+      // Plain ground when the area was too big to photograph.
+      new THREE.MeshLambertMaterial(ground.texture ? { map: ground.texture } : { color: GROUND_COLOUR })
     );
     plane.rotation.x = -Math.PI / 2;
     plane.position.set((ground.west + ground.east) / 2, 0, (ground.north + ground.south) / 2);
     plane.receiveShadow = true;
-    this.world.add(plane);
 
     const heightM = (heightFt || STYLES[styleKey]?.defaultHeightFt || 6) * FT;
-    this.world.add(buildFence(runs, project, styleKey, heightM));
+    const fence = buildFence(runs, project, styleKey, heightM);
+
+    // Their shaders are compiled before they go on screen, while the old fence
+    // stays up — see _compile(). Overtaken meanwhile: let them go unseen.
+    const next = new THREE.Group();
+    next.add(plane, fence);
+    await this._compile(next);
+    if (seq !== this._loads) {
+      release(next);
+      return null;
+    }
+
+    // Swap them in for the old ones in one go, freeing what the old ones held
+    // on the GPU — taking a mesh out of the scene never does that by itself.
+    this._clearWorld();
+    this.world.add(next);
 
     // Frame the fence, not the whole aerial photo.
     const local = flat.map((p) => project.toLocal(p));
@@ -538,18 +636,97 @@ export class FencePreview {
     cam.left = -reach; cam.right = reach; cam.top = reach; cam.bottom = -reach;
     cam.near = 1; cam.far = reach * 3;
     cam.updateProjectionMatrix();
+
+    this.redraw();
+    return { notice: ground.notice };
+  }
+
+  // Take the fence and ground out of the scene and free their geometry,
+  // materials and textures on the GPU.
+  _clearWorld() {
+    release(this.world);
+    this.world.clear();
+  }
+
+  // The stitched aerial photo for one patch of ground, kept while the fence
+  // stays on that patch. A new style or height — or a corner that doesn't push
+  // the edges past a tile — rebuilds only the fence: the tiles aren't asked
+  // for again (each is a request against the visitor's allowance), decoded
+  // again or stitched again. A load wanting the patch while it is still being
+  // fetched waits on that fetch rather than starting a second.
+  _photo(patch) {
+    const key = `${patch.z}/${patch.x0}-${patch.x1}/${patch.y0}-${patch.y1}`;
+    const kept = this._ground;
+    if (kept && kept.key === key) return kept.ready;
+    const entry = { key, ready: paintTiles(patch) };
+    this._ground = entry;
+    // One with holes in it (tiles refused, or lost on the way) is used once
+    // and dropped, so the next build asks for what is missing.
+    const drop = () => {
+      if (this._ground === entry) this._ground = null;
+    };
+    entry.ready.then((photo) => {
+      if (!photo.complete) drop();
+    }, drop);
+    return entry.ready;
+  }
+
+  // Compiling a new material's shaders is the one slow step of a build that
+  // isn't network: done inside a frame, it holds the whole page still — on a
+  // phone, the first time, for long enough to feel. compileAsync() hands it to
+  // the graphics driver to work on alongside the page, where the browser
+  // supports that, and is no worse than before where it doesn't. Compiled
+  // programs are reused, so after the first build this returns almost at once.
+  // It never waits more than a few seconds: a driver that doesn't answer just
+  // leaves the work to the first frame, as it always was.
+  async _compile(object) {
+    if (typeof this.renderer.compileAsync !== 'function') return;
+    try {
+      await Promise.race([
+        this.renderer.compileAsync(object, this.camera, this.scene),
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]);
+    } catch (e) {
+      /* the first frame compiles whatever is left, as it always has */
+    }
   }
 
   resize() {
     const w = this.canvas.clientWidth || 1;
     const h = this.canvas.clientHeight || 1;
+    // Only when it has changed: resizing reallocates the drawing buffer.
+    if (w === this._w && h === this._h) return;
+    this._w = w;
+    this._h = h;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   }
 
-  _loop() {
-    if (!this._running) return;
+  // Ask for a frame. However many asks come in before it is drawn, it is one.
+  redraw() {
+    if (this._paused || this._frame || document.hidden) return;
+    this._frame = requestAnimationFrame(() => {
+      this._frame = 0;
+      this._render();
+    });
+  }
+
+  // Stop drawing while the view is out of sight. The scene is kept, so
+  // resume() puts the same picture back.
+  pause() {
+    this._paused = true;
+    cancelAnimationFrame(this._frame);
+    this._frame = 0;
+  }
+
+  resume() {
+    if (this._destroyed) return;
+    this._paused = false;
+    this.redraw();
+  }
+
+  _render() {
     this.resize();
     const { azimuth, polar, distance } = this.orbit;
     this.camera.position.set(
@@ -559,18 +736,24 @@ export class FencePreview {
     );
     this.camera.lookAt(this.target);
     this.renderer.render(this.scene, this.camera);
-    requestAnimationFrame(this._loop);
   }
 
   // A still of whatever is on screen. Works because every image in the scene
   // came from our own origin — see the note at the top of this file.
   snapshot() {
-    this.renderer.render(this.scene, this.camera);
+    this._render();
     return this.canvas.toDataURL('image/png');
   }
 
+  // Done with for good: stop drawing and give back the GPU memory.
   destroy() {
-    this._running = false;
+    this._destroyed = true;
+    this._loads++; // a load still waiting on imagery gives up when it wakes
+    this.pause();
+    this._resized.disconnect();
+    document.removeEventListener('visibilitychange', this._onVisibility);
+    this._clearWorld();
+    this._ground = null; // the kept photo goes too
     this.renderer.dispose();
   }
 }

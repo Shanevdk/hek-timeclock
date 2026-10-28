@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#0d0d0d" />
+    <meta name="theme-color" content="#0c0a09" />
     <!-- Set the saved theme and glass level before first paint so there is no
          flash. liquid.js owns both keys afterwards; this is only the head
          start, and it must not throw on a browser with storage switched off. -->
@@ -23,25 +23,17 @@
     <link rel="icon" type="image/png" href="/icon-192.png" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="HEK Admin" />
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-      crossorigin=""
-    />
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-      crossorigin=""
-    ></script>
+    <!-- Leaflet loads when a map is first opened (Snappy.leaflet()), not here,
+         where it held up every visit to the dashboard. -->
+    <link rel="preconnect" href="https://unpkg.com" crossorigin />
+    <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <!-- Login gate (shown by default; hidden by JS if already signed in) -->
     <div class="wrap" id="loginView">
       <div class="brand">
-        <div class="hek">HEK</div>
-        <div class="sub">FENCING</div>
+        <svg class="brand-logo" viewBox="79 76 434 298" role="img" aria-label="HEK Fencing Inc."><use href="/logo.svg#logo" /></svg>
       </div>
       <div class="card">
         <h2 style="text-align:center;margin-top:0">Admin sign-in</h2>
@@ -65,13 +57,13 @@
         <button class="hamburger tip" id="menuToggle" data-tip="Menu" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
           <span></span><span></span><span></span>
         </button>
-        <div class="mobile-brand">HEK <small>TIMECLOCK</small></div>
+        <div class="mobile-brand"><svg class="brand-mark" viewBox="79 76 434 152" role="img" aria-label="HEK"><use href="/logo.svg#hek" /></svg><small>TIMECLOCK</small></div>
       </header>
 
       <div class="admin-layout">
         <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
         <aside class="sidebar glass glass-lit" id="sidebar">
-          <div class="side-brand">HEK <small>TIMECLOCK</small></div>
+          <div class="side-brand"><svg class="brand-mark" viewBox="79 76 434 152" role="img" aria-label="HEK"><use href="/logo.svg#hek" /></svg><small>TIMECLOCK</small></div>
           <!--
             Grouped by what someone is actually doing: tracking time, selling a
             job, planning the week, or managing people. A group hides itself
@@ -166,6 +158,8 @@
                      spellcheck="false" placeholder="your email" style="width:100%;margin-bottom:8px" />
               <input id="acPass" type="password" autocomplete="new-password" placeholder="new password (optional)"
                      style="width:100%;margin-bottom:8px" />
+              <input id="acCurrent" type="password" autocomplete="current-password" placeholder="current password (required)"
+                     aria-label="Current password" style="width:100%;margin-bottom:8px" />
               <button class="btn gold sm" id="acSave" style="width:100%">Save login</button>
               <div class="msg" id="acMsg" style="min-height:0;margin:8px 0 0;font-size:13px"></div>
 
@@ -470,76 +464,9 @@
             </div>
           </div>
 
-          <!-- Quote builder -->
-          <div id="qEditor" style="display:none">
-            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
-              <h2 style="margin:0" id="qEditorTitle">New quote</h2>
-              <button class="btn ghost sm" id="qBack">← Back to list</button>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Customer</h3>
-              <div class="row">
-                <div class="field" style="flex:2 1 220px"><label>Name *</label><input id="qcName" placeholder="Jane Doe" /></div>
-                <div class="field" style="flex:1 1 160px"><label>Phone</label><input id="qcPhone" placeholder="(555) 123-4567" /></div>
-                <div class="field" style="flex:2 1 220px"><label>Email</label><input id="qcEmail" placeholder="jane@email.com" /></div>
-              </div>
-              <div class="row" style="margin-top:12px">
-                <div class="field" style="flex:3 1 320px"><label>Job site / address</label><input id="qcAddress" placeholder="123 Maple St" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Quote date</label><input type="date" id="qDate" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Status</label>
-                  <select id="qStatus">
-                    <option value="draft">Draft</option>
-                    <option value="sent">Sent</option>
-                    <option value="accepted">Accepted</option>
-                    <option value="declined">Declined</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Line items</h3>
-              <p class="status-sub" style="text-align:left;margin:-6px 0 12px">Quick add:</p>
-              <div class="quick-adds" id="qQuick"></div>
-              <div style="overflow-x:auto">
-                <table class="items-table">
-                  <thead><tr>
-                    <th style="min-width:200px">Description</th>
-                    <th style="width:80px">Qty</th>
-                    <th style="width:110px">Unit</th>
-                    <th style="width:120px">Unit price</th>
-                    <th style="width:110px">Line total</th>
-                    <th style="width:36px"></th>
-                  </tr></thead>
-                  <tbody id="qItems"></tbody>
-                </table>
-              </div>
-              <button class="btn ghost sm" id="qAddRow" style="margin-top:12px">+ Add line</button>
-            </div>
-
-            <div class="row" style="align-items:stretch">
-              <div class="card" style="flex:2 1 320px">
-                <label for="qNotes">Notes / terms (shown on the quote)</label>
-                <textarea id="qNotes" rows="5" placeholder="e.g. 50% deposit due on acceptance. Balance on completion. Quote valid for 30 days."></textarea>
-              </div>
-              <div class="card" style="flex:1 1 240px">
-                <div class="totals-line"><span>Subtotal</span><span id="qSubtotal">$0.00</span></div>
-                <div class="totals-line">
-                  <span>Tax <input id="qTax" class="tax-input" inputmode="decimal" value="0" /> %</span>
-                  <span id="qTaxAmt">$0.00</span>
-                </div>
-                <div class="totals-line grand"><span>Total</span><span id="qTotal">$0.00</span></div>
-              </div>
-            </div>
-
-            <div class="msg err" id="qMsg"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:12px">
-              <button class="btn ghost sm" id="qPrint">Print / PDF</button>
-              <button class="btn ghost sm" id="qToInvoice" style="display:none">Convert to invoice →</button>
-              <button class="btn gold sm" id="qSave">Save quote</button>
-            </div>
-          </div>
+          <!-- Quote builder. quotes.js draws the sheet into it, so the admin
+               dashboard and the employee portal share one editor. -->
+          <div id="qEditor" style="display:none"></div>
         </section>
 
         <!-- INVOICES -->
@@ -581,118 +508,9 @@
             </div>
           </div>
 
-          <!-- Invoice editor -->
-          <div id="invEditor" style="display:none">
-            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
-              <h2 style="margin:0" id="invEditorTitle">New invoice</h2>
-              <button class="btn ghost sm" id="invBack">← Back to list</button>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Bill to</h3>
-              <div class="row">
-                <div class="field" style="flex:2 1 220px"><label>Name *</label><input id="icName" placeholder="Jane Doe" /></div>
-                <div class="field" style="flex:1 1 160px"><label>Phone</label><input id="icPhone" /></div>
-                <div class="field" style="flex:2 1 220px"><label>Email</label><input id="icEmail" /></div>
-              </div>
-              <div class="row" style="margin-top:12px">
-                <div class="field" style="flex:3 1 300px"><label>Job site / address</label><input id="icAddress" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Issued</label><input type="date" id="invIssue" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Due</label><input type="date" id="invDue" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Status</label>
-                  <select id="invStatus">
-                    <option value="draft">Draft</option>
-                    <option value="sent">Sent</option>
-                    <option value="void">Void</option>
-                  </select></div>
-              </div>
-              <p class="status-sub qb-lead" id="invDerived"></p>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Line items</h3>
-              <p class="status-sub" style="text-align:left;margin:-6px 0 12px">Quick add:</p>
-              <div class="quick-adds" id="invQuick"></div>
-              <div style="overflow-x:auto">
-                <table class="items-table">
-                  <thead><tr>
-                    <th style="min-width:200px">Description</th>
-                    <th style="width:80px">Qty</th>
-                    <th style="width:110px">Unit</th>
-                    <th style="width:120px">Unit price</th>
-                    <th style="width:110px">Line total</th>
-                    <th style="width:36px"></th>
-                  </tr></thead>
-                  <tbody id="invItems"></tbody>
-                </table>
-              </div>
-              <button class="btn ghost sm" id="invAddRow" style="margin-top:12px">+ Add line</button>
-            </div>
-
-            <div class="row" style="align-items:stretch">
-              <div class="card" style="flex:2 1 320px">
-                <label for="invNotes">Notes / terms (shown on the invoice)</label>
-                <textarea id="invNotes" rows="5" placeholder="e.g. Payment due within 30 days. Cheques payable to HEK Fencing Inc."></textarea>
-              </div>
-              <div class="card" style="flex:1 1 240px">
-                <div class="totals-line"><span>Subtotal</span><span id="invSubtotal">$0.00</span></div>
-                <div class="totals-line">
-                  <span>Tax <input id="invTax" class="tax-input" inputmode="decimal" value="0" /> %</span>
-                  <span id="invTaxAmt">$0.00</span>
-                </div>
-                <div class="totals-line grand"><span>Total</span><span id="invTotal">$0.00</span></div>
-                <div class="totals-line"><span>Paid</span><span id="invPaid">$0.00</span></div>
-                <div class="totals-line grand"><span>Balance</span><span id="invBalance">$0.00</span></div>
-              </div>
-            </div>
-
-            <!-- Payments -->
-            <div class="card" id="invPayCard" style="margin-top:16px">
-              <h3 style="margin-top:0">Payments</h3>
-              <table>
-                <thead><tr><th>Date</th><th>Method</th><th>Note</th><th>Amount</th><th></th></tr></thead>
-                <tbody id="invPayBody"></tbody>
-              </table>
-              <p class="status-sub" id="invPayEmpty" style="display:none">Nothing received yet.</p>
-              <div class="row" style="margin-top:12px">
-                <div class="field" style="flex:1 1 120px"><label>Amount</label><input id="invPayAmount" inputmode="decimal" placeholder="0.00" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Date</label><input type="date" id="invPayDate" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Method</label>
-                  <select id="invPayMethod">
-                    <option value="">—</option><option>Cheque</option><option>E-transfer</option>
-                    <option>Cash</option><option>Credit card</option><option>Bank transfer</option>
-                  </select></div>
-                <div class="field" style="flex:2 1 180px"><label>Note</label><input id="invPayNote" placeholder="e.g. cheque #204" /></div>
-                <button class="btn gold sm" id="invPayAdd">Record payment</button>
-              </div>
-              <div class="msg" id="invPayMsg"></div>
-            </div>
-
-            <!-- Sending goes through QuickBooks: it holds the customer, the
-                 branding and the payment link, so this app never emails one. -->
-            <div class="card qb-send" id="invQbBox" style="display:none;margin-top:16px">
-              <div class="qb-send-head">
-                <h3 style="margin:0">Send with QuickBooks</h3>
-                <span class="qb-send-state" id="invQbState"></span>
-              </div>
-              <p class="status-sub" style="text-align:left;margin:6px 0 12px" id="invQbHint"></p>
-              <div class="row">
-                <button class="btn ghost sm" id="invQbPush">Send to QuickBooks</button>
-                <button class="btn gold sm" id="invQbSend" disabled>Email it to the customer</button>
-                <a class="btn ghost sm" id="invQbOpen" target="_blank" rel="noopener" style="display:none">Open in QuickBooks</a>
-              </div>
-              <div class="msg" id="invQbMsg"></div>
-            </div>
-
-            <div class="msg err" id="invMsg"></div>
-            <div class="row" style="justify-content:space-between;margin-top:12px">
-              <button class="link-btn danger" id="invDelete" style="display:none">Delete</button>
-              <div>
-                <button class="btn ghost sm" id="invPrint">Print / PDF</button>
-                <button class="btn gold sm" id="invSave">Save invoice</button>
-              </div>
-            </div>
-          </div>
+          <!-- Invoice editor. invoices.js draws the sheet, payments and
+               QuickBooks panel into it. -->
+          <div id="invEditor" style="display:none"></div>
         </section>
 
         <!-- AI INBOX -->
@@ -765,7 +583,7 @@
                   <option value="new">Needs review</option>
                   <option value="approved">Approved</option>
                   <option value="dismissed">Dismissed</option>
-                  <option value="not_quote">Not a quote request</option>
+                  <option value="not_quote">Not a quote, skipped or unreadable</option>
                   <option value="all">Everything</option>
                 </select>
               </div>
@@ -782,10 +600,10 @@
                between columns to move or unschedule a job. -->
           <div class="sched-toolbar">
             <div class="sched-week">
-              <button class="btn ghost sm" id="schedPrev" type="button" title="Back one week">←</button>
+              <button class="btn ghost sm" id="schedPrev" type="button" title="Back one week" data-press="fast">←</button>
               <div class="sched-range" id="schedRange"></div>
-              <button class="btn ghost sm" id="schedNext" type="button" title="Forward one week">→</button>
-              <button class="btn ghost sm" id="schedToday" type="button">Back to today</button>
+              <button class="btn ghost sm" id="schedNext" type="button" title="Forward one week" data-press="fast">→</button>
+              <button class="btn ghost sm" id="schedToday" type="button" data-press="fast">Back to today</button>
             </div>
             <div class="sched-tools">
               <input type="search" id="schedSearch" placeholder="Search address or job…" />
@@ -1060,7 +878,7 @@
           <div id="msgReadView">
             <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
               <h2 style="margin:0">Messages</h2>
-              <button class="btn gold sm" id="msgManageBtn">Manage</button>
+              <button class="btn gold sm" id="msgManageBtn" data-press="fast">Manage</button>
             </div>
             <div id="msgReadList"></div>
             <p class="status-sub" id="msgReadEmpty" style="display:none">No published messages yet.</p>
@@ -1072,7 +890,7 @@
               <h2 style="margin:0">Manage Messages</h2>
               <div>
                 <button class="btn gold sm" id="msgNewBtn">New message</button>
-                <button class="btn ghost sm" id="msgBackBtn">Back to messages</button>
+                <button class="btn ghost sm" id="msgBackBtn" data-press="fast">Back to messages</button>
               </div>
             </div>
             <div class="card" style="margin-bottom:16px">
@@ -1350,9 +1168,9 @@
             <div class="tm-attach-list" id="tmAttach"></div>
 
             <div class="tm-tabs">
-              <button type="button" class="tm-tab active" data-tmtab="comments">Comments</button>
-              <button type="button" class="tm-tab" data-tmtab="time">Time</button>
-              <button type="button" class="tm-tab" data-tmtab="history">History</button>
+              <button type="button" class="tm-tab active" data-tmtab="comments" data-press="fast">Comments</button>
+              <button type="button" class="tm-tab" data-tmtab="time" data-press="fast">Time</button>
+              <button type="button" class="tm-tab" data-tmtab="history" data-press="fast">History</button>
             </div>
 
             <div class="tm-panel active" id="tmtab-comments">
@@ -1413,8 +1231,14 @@
       </div>
     </div>
 
+    <!-- snappy.js first: everything after it may use window.Snappy. -->
+    <script src="/snappy.js"></script>
     <script src="/md.js"></script>
     <script src="/admin.js"></script>
+    <script src="/totals.js"></script>
+    <script src="/paper.js"></script>
+    <script src="/takeoff.js"></script>
+    <script src="/fencemap.js"></script>
     <script src="/quotes.js"></script>
     <script src="/pricing.js"></script>
     <!-- Direct-to-storage uploads; must load before its callers. -->

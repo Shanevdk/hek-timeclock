@@ -19,7 +19,11 @@
 
   let data = null;
   let days = 30;
-  let wired = false;
+
+  // The ranges the picker offers, and the path each is read (and kept) under.
+  const RANGES = [7, 30, 90];
+  const statsPath = (n) => '/api/dev/stats?days=' + n;
+  const rangePath = () => statsPath(days);
 
   const nf = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
   const dayLabel = (d) => {
@@ -106,12 +110,14 @@
       .join('');
 
     // One hit target per day, wider than the mark, so the tooltip is easy to
-    // catch on a dense series.
+    // catch on a dense series. Each carries the height of the line on its day
+    // (data-y), worked out here once rather than hunted for along the path on
+    // every move of the mouse.
     const bandW = (W - padL - padR) / Math.max(series.length, 1);
     const hits = series
       .map(
         (d, i) =>
-          `<rect class="dv-hit" x="${(x(i) - bandW / 2).toFixed(1)}" y="${padT}" width="${bandW.toFixed(1)}" height="${HGT - padT - padB}" data-i="${i}" />`
+          `<rect class="dv-hit" x="${(x(i) - bandW / 2).toFixed(1)}" y="${padT}" width="${bandW.toFixed(1)}" height="${HGT - padT - padB}" data-i="${i}" data-y="${y(values[i]).toFixed(1)}" />`
       )
       .join('');
 
@@ -359,13 +365,37 @@
       days = Number($('dvDays').value) || 30;
       load().catch((e) => alert(e.message));
     });
-    $('dvRefresh').addEventListener('click', () => load().catch((e) => alert(e.message)));
+    // Asked for on purpose, so it skips the kept copy; busy until the newest
+    // numbers are in (a spinner only if that takes a moment).
+    $('dvRefresh').addEventListener('click', () =>
+      Snappy.busy($('dvRefresh'), refresh).catch((e) => alert(e.message))
+    );
     const clear = $('dvClearErrors');
     if (clear)
-      clear.addEventListener('click', async () => {
+      clear.addEventListener('click', () => {
         if (!confirm('Clear the recorded errors? The daily counts stay.')) return;
-        await api('/api/dev/stats/errors', { method: 'DELETE' }).catch((e) => alert(e.message));
-        load().catch((e) => alert(e.message));
+        // Gone from the screen at once — only the list; the daily counts stay
+        // — and back if the server refuses.
+        const p = rangePath();
+        Snappy.optimistic(
+          () => {
+            const was = data.errors;
+            data = { ...data, errors: [] };
+            Snappy.cache.update(p, (d) => ({ ...d, errors: [] }));
+            render();
+            return () => {
+              data = { ...data, errors: was };
+              Snappy.cache.update(p, (d) => ({ ...d, errors: was }));
+              render();
+            };
+          },
+          () => api('/api/dev/stats/errors', { method: 'DELETE' })
+        )
+          .then(() => {
+            // The same list is kept with every range: cleared in all of them.
+            RANGES.forEach((n) => Snappy.cache.update(statsPath(n), (d) => ({ ...d, errors: [] })));
+          })
+          .catch((e) => alert(e.message));
       });
 
     wireHover('dvVisitors', s, 'visitors', 'visitor');
@@ -391,14 +421,8 @@
       const pts = svg.querySelectorAll('.dv-hit');
       const r = pts[i].getBoundingClientRect();
       const cx = Number(pts[i].getAttribute('x')) + Number(pts[i].getAttribute('width')) / 2;
-      // The line path holds the y for this point; read it back off the path.
-      const path = svg.querySelector('.dv-line');
-      const len = path.getTotalLength();
-      let py = 0;
-      for (let t = 0; t <= len; t += Math.max(len / 400, 0.5)) {
-        const p = path.getPointAtLength(t);
-        if (p.x >= cx) { py = p.y; break; }
-      }
+      // Where the line crosses this day, noted when the chart was drawn.
+      const py = Number(pts[i].dataset.y) || 0;
       cursor.style.display = '';
       line.setAttribute('x1', cx);
       line.setAttribute('x2', cx);
@@ -420,16 +444,50 @@
     });
   }
 
-  async function load() {
+  // Paints the copy kept from earlier in this visit at once (in memory only:
+  // the error list carries stack traces), then the server's answer if it
+  // differs. An answer for a range no longer picked is never painted.
+  function load() {
     const box = $('tab-health');
-    if (!box) return;
-    if (!wired) {
-      box.innerHTML = '<p class="status-sub">Loading…</p>';
-      wired = true;
-    }
-    data = await api('/api/dev/stats?days=' + days);
+    if (!box) return Promise.resolve();
+    const p = rangePath();
+    let painted = false;
+    const reading = Snappy.swr(api, p, (d) => {
+      painted = true;
+      if (p !== rangePath()) return;
+      data = d;
+      render();
+    });
+    // Nothing on screen yet: say it's loading — but only once the wait is
+    // long enough to notice (styles.css, .wait).
+    if (!painted && !data) box.innerHTML = '<p class="status-sub wait">Loading…</p>';
+    return reading;
+  }
+
+  // The newest numbers, asked for afresh rather than painted from the kept copy.
+  async function refresh() {
+    const p = rangePath();
+    const d = await api(p);
+    Snappy.cache.put(p, d);
+    if (p !== rangePath()) return;
+    data = d;
     render();
   }
 
-  window.DevStats = { load };
+  // Signed in as the dev account, with its App health tab showing: nobody
+  // else may read these numbers, so nobody else's page asks for them.
+  function canOpen() {
+    const app = $('app');
+    const tab = $('devHealthTab');
+    return !!app && app.style.display !== 'none' && !!tab && tab.style.display !== 'none';
+  }
+
+  // Warms the range load() would paint, for the dev on their way to the tab
+  // (the shell calls this on tab hover, focus or touch, and when idle).
+  function prefetch() {
+    if (!canOpen()) return;
+    Snappy.prefetch(api, rangePath());
+  }
+
+  window.DevStats = { load, prefetch };
 })();

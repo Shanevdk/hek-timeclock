@@ -13,6 +13,29 @@
   const esc = (s) => (H().esc ? H().esc(s) : String(s));
   const $ = (id) => document.getElementById(id);
 
+  // What this file reads through window.Snappy (snappy.js). Its copies are
+  // filed under the exact path, so every read of one uses the same constant.
+  // The admin paths are only ever read on the dashboard: from the portal they
+  // answer 401, and the portal takes a 401 as "signed out".
+  const SCHED = '/api/admin/schedules';
+  const MY_SCHED = '/api/my/schedules';
+  // The employee list carries pay and personal details, so it is kept in
+  // memory for the page's life like any read, and never on disk.
+  const EMPS = '/api/admin/employees';
+  // The board kept on the device for a quick next visit leaves out the
+  // office's internal notes (billing contacts, sometimes): no card shows them,
+  // and the job form always reads the job fresh.
+  const BOARD_ON_DISK = (d) => ({
+    ...d,
+    jobs: (d.jobs || []).map((j) => {
+      const { notes_internal, ...rest } = j;
+      return rest;
+    }),
+  });
+  // How far back the board's usual read goes, in days — what the server sends
+  // when it isn't given a ?since= (GET /api/admin/schedules).
+  const BACK_DAYS = 400;
+
   // A directions link that opens the map app straight to the destination.
   // Prefer exact coordinates (from geocoding); fall back to the typed address.
   function mapsUrl(job) {
@@ -93,22 +116,59 @@
   // ======================= EMPLOYEE (portal) view ==========================
   let myJobs = [];
   let myFolder = ''; // folder open on the job page
+  let mineShown = false; // the list on screen is real jobs, not a placeholder
+  let mineAt = 0; // when the server's list last arrived (Date.now())
 
+  // The list paints at once from the copy kept last time — on this device,
+  // for this employee only, and gone when they sign out — and again from the
+  // server's answer if anything changed. Never throws: the portal calls this
+  // without waiting on it.
   async function loadMine() {
     const list = $('mySchedList');
     if (!list) return;
+    // Nothing to show yet: a line that only appears if the wait is long
+    // enough to notice (.wait in styles.css). A kept copy replaces it at once.
+    if (!mineShown) list.innerHTML = '<p class="status-sub wait">Loading your jobs…</p>';
     try {
-      const d = await api('/api/my/schedules');
-      myJobs = d.jobs || [];
+      await Snappy.swr(api, MY_SCHED, takeMine, { persist: true });
     } catch (e) {
-      list.innerHTML = `<div class="card">${esc(e.message)}</div>`;
-      return;
+      if (!mineShown) {
+        list.innerHTML = `<div class="card">${esc(e.message)}</div>`;
+        return;
+      }
+      // A copy is already on screen. Keep it — offline, it's the one thing
+      // they can use — and say it may be behind.
+      const old = list.querySelector('[data-stale]');
+      if (old) old.remove();
+      list.insertAdjacentHTML(
+        'afterbegin',
+        '<p class="status-sub" data-stale>Couldn’t refresh just now — this is the last copy on this device, so it may be out of date.</p>'
+      );
     }
+  }
+
+  // A list for the screen: the kept copy (fresh = false) or the server's. The
+  // job page, if it's open, follows along when its job has changed.
+  function takeMine(d, fresh) {
+    const openId = openMyJobId();
+    const before = openId ? JSON.stringify(myJobs.find((x) => x.id === openId) || null) : '';
+    myJobs = d.jobs || [];
+    mineShown = true;
+    if (fresh) mineAt = Date.now();
+    paintMine();
+    const now = openId ? myJobs.find((x) => x.id === openId) : null;
+    if (now && JSON.stringify(now) !== before) renderMyJob(now);
+  }
+
+  function paintMine() {
+    const list = $('mySchedList');
     if ($('mySchedEmpty')) $('mySchedEmpty').style.display = myJobs.length ? 'none' : 'block';
+    // data-press="fast": a card only opens the job page, so a mouse press
+    // opens it on the way down (snappy.js). A finger still opens it on lift.
     list.innerHTML = myJobs
       .map((j) => {
         const n = fileCount(j);
-        return `<div class="job-card" data-job="${j.id}" role="button" tabindex="0">
+        return `<div class="job-card" data-job="${j.id}" role="button" tabindex="0" data-press="fast">
           <div class="job-when">${esc(fmtWhen(j))}</div>
           ${j.description ? `<div class="job-desc">${esc(j.description)}</div>` : ''}
           <div class="job-addr-line">📍 ${esc(j.address)}</div>
@@ -131,7 +191,45 @@
     myFolder = '';
     $('myJobBack').classList.add('open');
     renderMyJob(j);
+    refreshMyJob(id);
   }
+
+  // The job the job page is showing, or null while it's closed.
+  function openMyJobId() {
+    if (!$('myJobBack') || !$('myJobBack').classList.contains('open')) return null;
+    return Number($('myJobBody').dataset.job) || null;
+  }
+
+  // The list's copy of the job is on screen the moment it's tapped; this
+  // brings it up to date behind it — new files from the office, a changed
+  // note. Usually the answer is already here: it was asked for when the finger
+  // landed on the card (see the wiring below). A copy older than the list
+  // itself is no use, so it's only taken if it arrived after the list did.
+  function refreshMyJob(id) {
+    const path = MY_SCHED + '/' + id;
+    const got = Snappy.cache.fresh(path, Math.min(30000, Date.now() - mineAt))
+      ? Promise.resolve(Snappy.cache.peek(path))
+      : Snappy.load(api, path);
+    got
+      .then((job) => {
+        const i = myJobs.findIndex((x) => x.id === id);
+        if (!job || i < 0 || JSON.stringify(myJobs[i]) === JSON.stringify(job)) return;
+        myJobs[i] = job;
+        // The kept list learns it too, so the next visit doesn't paint the
+        // old one first.
+        Snappy.cache.update(MY_SCHED, (d) => {
+          const k = (d.jobs || []).findIndex((x) => x.id === id);
+          if (k >= 0) d.jobs[k] = job;
+          return d;
+        });
+        paintMine();
+        if (openMyJobId() === id) renderMyJob(job);
+      })
+      .catch(() => {
+        /* the list's copy stays on screen; the list is read again next visit */
+      });
+  }
+
   function closeMyJob() {
     if ($('myJobBack')) $('myJobBack').classList.remove('open');
   }
@@ -147,12 +245,14 @@
     const folders = childFolders(j, myFolder);
     const files = filesIn(j, myFolder);
     const crumbs = myFolder.split('/').filter(Boolean);
+    // Walking the folders only shows something, so a mouse press acts on the
+    // way down (data-press="fast", snappy.js).
     const crumbHtml =
-      `<button type="button" class="jf-crumb" data-my-crumb="">All files</button>` +
+      `<button type="button" class="jf-crumb" data-my-crumb="" data-press="fast">All files</button>` +
       crumbs
         .map((seg, i) => {
           const path = crumbs.slice(0, i + 1).join('/');
-          return ` / <button type="button" class="jf-crumb" data-my-crumb="${esc(path)}">${esc(seg)}</button>`;
+          return ` / <button type="button" class="jf-crumb" data-my-crumb="${esc(path)}" data-press="fast">${esc(seg)}</button>`;
         })
         .join('');
 
@@ -161,7 +261,7 @@
         .map(
           (name) => `<div class="jf-row folder" data-my-folder="${esc(
             myFolder ? myFolder + '/' + name : name
-          )}"><span class="jf-name">📁 ${esc(name)}</span></div>`
+          )}" data-press="fast"><span class="jf-name">📁 ${esc(name)}</span></div>`
         )
         .join('') +
       files
@@ -208,6 +308,12 @@
         open(e);
       }
     });
+    // A finger landing on a job — or a mouse resting on one, or the keyboard
+    // reaching it — asks for that job, so the job page has its freshest copy
+    // by the time the tap lands (refreshMyJob).
+    Snappy.intent($('mySchedList'), '[data-job]', (el) =>
+      Snappy.prefetch(api, MY_SCHED + '/' + el.dataset.job)
+    );
     if ($('myJobBack')) {
       $('myJobClose').addEventListener('click', closeMyJob);
       $('myJobBack').addEventListener('click', (e) => {
@@ -236,11 +342,40 @@
   let allEmployees = [];
   let jobsCache = [];
   let weekStart = null; // Monday of the week on screen (YYYY-MM-DD)
+  // How far back the loaded jobs go: the server sends about a year (plus every
+  // undated job), and paging back further asks again from that week. Declared
+  // up here because initAdmin() runs before the code further down.
+  let loadedSince = null;
   let dragId = null; // job being dragged between columns
   let jfFolder = ''; // folder open in the job's file panel
   // Jobs ticked on the board. The bulk bar acts on this whole set, and
   // dragging any one of them drags every job in it.
   const selected = new Set();
+  // True while the stylesheet stacks a week's days into one column (a phone).
+  // A Sunday column is laid out inline, which would beat that rule as well, so
+  // renderBoard checks this first. Declared up here: initAdmin runs right below.
+  const stacked = window.matchMedia('(max-width: 680px)');
+
+  // ---- reading the board, and changing it ----
+  // The board's usual read — the year or so the server sends unasked, and
+  // everything ahead — goes through Snappy.swr: the copy kept from last time
+  // paints at once, and the server's answer follows. Paging back past it
+  // switches to ?since= reads from that week on (pagedSince), which aren't
+  // kept.
+  //
+  // A change is drawn the moment it's made and sent in the background. A read
+  // that crosses paths with one may describe the board from before it: drawn,
+  // it would undo the change on screen; kept, it would paint it again next
+  // visit. So such a read is refused (readJobs), and once nothing is on its
+  // way any more the board is read again (settle).
+  let pagedSince = null; // the week paged back to, once past the usual read
+  let jobsKnown = false; // jobsCache holds real jobs, kept or fresh
+  let crewKnown = false; // allEmployees likewise
+  let jobsGen = 0; // the newest read; an older one that lands late is dropped
+  let writes = 0; // changes still on their way to the server
+  let writeSeq = 0; // goes up as each change starts and as it ends
+  let lostRead = false; // a read was refused, so the board owes itself one
+  let redrawAfterDrag = false; // jobs arrived mid-drag; drawn when it ends
 
   // Wire the admin form once, if we're on the admin page.
   // The board only exists on the dashboard, so it's what tells the two pages
@@ -310,35 +445,45 @@
     });
 
     // Takes the date off without touching anything else — the job drops back
-    // into "To be scheduled" rather than being lost.
-    $('schedUnschedule').addEventListener('click', async () => {
+    // into "To be scheduled" rather than being lost. It lands there the moment
+    // it's pressed; if the server says no, it goes back and the reason shows.
+    $('schedUnschedule').addEventListener('click', () => {
       if (editingId == null) return;
-      try {
-        await api('/api/admin/schedules/' + editingId, {
-          method: 'PATCH',
-          body: JSON.stringify({ date: '', end_date: '', time: '' }),
-        });
-        closeForm();
-        await refreshJobs();
-      } catch (e) {
-        $('schedMsg').textContent = e.message;
-      }
+      const id = editingId;
+      const job = currentJob();
+      closeForm();
+      editJobs(
+        job ? [job] : [],
+        (j) => Object.assign(j, { date: null, end_date: null, time: null }),
+        () =>
+          api(SCHED + '/' + id, {
+            method: 'PATCH',
+            body: JSON.stringify({ date: '', end_date: '', time: '' }),
+          })
+      ).catch((e) => alert(e.message));
     });
 
-    $('schedDelete').addEventListener('click', async () => {
+    // Gone from the board as soon as it's confirmed, and deleted behind it.
+    $('schedDelete').addEventListener('click', () => {
       if (editingId == null) return;
       if (!confirm('Delete this job? This cannot be undone.')) return;
-      try {
-        await api('/api/admin/schedules/' + editingId, { method: 'DELETE' });
-        closeForm();
-        await refreshJobs();
-      } catch (e) {
-        $('schedMsg').textContent = e.message;
-      }
+      const id = editingId;
+      closeForm();
+      removeJobs([id]).catch((e) => alert(e.message));
     });
 
     // ---- board ----
-    $('schedPrev').addEventListener('click', () => { weekStart = addDays(weekStart, -7); renderBoard(); });
+    // Paging the board only shows something, so a mouse press acts on the way
+    // down (data-press="fast", snappy.js).
+    ['schedPrev', 'schedNext', 'schedToday'].forEach((id) =>
+      $(id).setAttribute('data-press', 'fast')
+    );
+    $('schedPrev').addEventListener('click', () => {
+      weekStart = addDays(weekStart, -7);
+      // Past what was loaded: fetch from this week back, then draw.
+      if (loadedSince && weekStart < loadedSince) refreshJobs().catch((e) => alert(e.message));
+      else renderBoard();
+    });
     $('schedNext').addEventListener('click', () => { weekStart = addDays(weekStart, 7); renderBoard(); });
     $('schedToday').addEventListener('click', () => {
       weekStart = mondayOf(todayStr());
@@ -347,6 +492,11 @@
       $('schedBoard').scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
     $('schedSearch').addEventListener('input', renderBoard);
+    // Crossing the phone breakpoint changes how a Sunday column is laid out —
+    // redraw, once there is a board to redraw.
+    stacked.addEventListener('change', () => {
+      if (weekStart) renderBoard();
+    });
     $('schedNew').addEventListener('click', () => openForm(null));
     initFiles();
     initScrollPad();
@@ -375,12 +525,7 @@
       e.dataTransfer.setData('text/plain', String(dragId));
       showScrollPad(true);
     });
-    board.addEventListener('dragend', () => {
-      dragId = null;
-      showScrollPad(false);
-      board.querySelectorAll('.dragging').forEach((c) => c.classList.remove('dragging'));
-      board.querySelectorAll('.drop-over').forEach((c) => c.classList.remove('drop-over'));
-    });
+    board.addEventListener('dragend', endDrag);
     board.addEventListener('dragover', (e) => {
       const zone = e.target.closest('[data-drop]');
       if (!zone || dragId == null) return;
@@ -392,40 +537,58 @@
       const zone = e.target.closest('[data-drop]');
       if (zone && !zone.contains(e.relatedTarget)) zone.classList.remove('drop-over');
     });
-    board.addEventListener('drop', async (e) => {
+    board.addEventListener('drop', (e) => {
       const zone = e.target.closest('[data-drop]');
       if (!zone || dragId == null) return;
       e.preventDefault();
-      zone.classList.remove('drop-over');
       const id = dragId;
-      dragId = null;
       const to = zone.dataset.drop; // '' means back to the backlog
+      // The move redraws the board straight away, which takes the dragged card
+      // — and the dragend it would have fired — with it. Tidy up here instead.
+      endDrag();
       // Dragging a ticked card drags every ticked card — a week gets planned
       // a stack at a time instead of a card at a time.
       const ids = selected.has(id) ? [...selected] : [id];
       const movers = ids
         .map((x) => jobsCache.find((j) => j.id === x))
         .filter((j) => j && (j.date || '') !== to);
-      if (!movers.length) return;
-      try {
-        // An empty string clears the date server-side; null would be ignored,
-        // because the route treats "not sent" and null the same way.
-        if (movers.length === 1) {
-          await api('/api/admin/schedules/' + movers[0].id, {
-            method: 'PATCH',
-            body: JSON.stringify({ date: to }),
-          });
-        } else {
-          await api('/api/admin/schedules/bulk', {
-            method: 'PATCH',
-            body: JSON.stringify({ ids: movers.map((j) => j.id), date: to }),
-          });
-        }
-        await refreshJobs();
-      } catch (err) {
-        alert(err.message);
-      }
+      if (movers.length) moveJobs(movers, to);
     });
+  }
+
+  // A drag is over, dropped or not. dragend calls this, and so does drop (see
+  // above). Jobs that arrived while the card was in the air are drawn now.
+  function endDrag() {
+    dragId = null;
+    showScrollPad(false);
+    const board = $('schedBoard');
+    board.querySelectorAll('.dragging').forEach((c) => c.classList.remove('dragging'));
+    board.querySelectorAll('.drop-over').forEach((c) => c.classList.remove('drop-over'));
+    if (redrawAfterDrag) {
+      redrawAfterDrag = false;
+      drawJobs();
+    }
+  }
+
+  // Moves jobs to the day they were dropped on ('' = back to the backlog): on
+  // the board at once, sent in the background, put back if the server says no.
+  function moveJobs(movers, to) {
+    editJobs(
+      movers,
+      (j) => slide(j, to),
+      // An empty string clears the date server-side; null would be ignored,
+      // because the route treats "not sent" and null the same way.
+      () =>
+        movers.length === 1
+          ? api(SCHED + '/' + movers[0].id, {
+              method: 'PATCH',
+              body: JSON.stringify({ date: to }),
+            })
+          : api(SCHED + '/bulk', {
+              method: 'PATCH',
+              body: JSON.stringify({ ids: movers.map((j) => j.id), date: to }),
+            })
+    ).catch((err) => alert(err.message));
   }
 
   // ---- drag scroll pad ----
@@ -507,61 +670,235 @@
     return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString([], { timeZone: 'UTC', ...opts });
   };
 
+  // Only active employees can be booked — the server drops anyone else from a
+  // crew when a job is saved. Someone inactive who is still on a job stays on
+  // its card and in its form, marked, so the office notices and reassigns it.
+  // An id missing from the list altogether keeps its old "(removed)" handling.
+  const activeEmployees = () => allEmployees.filter((e) => e.active);
+  const isInactive = (id) => {
+    const e = allEmployees.find((x) => x.id === id);
+    return !!e && !e.active;
+  };
+
   function renderEmpChecks(assigned) {
     const sel = new Set(assigned || []);
-    $('schedEmps').innerHTML = allEmployees.length
-      ? allEmployees
-          .map(
-            (e) => `<label class="perm"><input type="checkbox" value="${e.id}"${
-              sel.has(e.id) ? ' checked' : ''
-            } /> ${esc(e.name)}</label>`
-          )
-          .join('')
-      : '<span style="color:var(--muted);font-size:13px">No employees yet.</span>';
+    const active = activeEmployees();
+    // Anyone inactive still on this job is listed first, ticked but locked:
+    // collectEmps leaves them out, so saving takes them off, and the row says so.
+    const gone = allEmployees.filter((e) => !e.active && sel.has(e.id));
+    $('schedEmps').innerHTML =
+      gone
+        .map(
+          (e) => `<label class="perm" style="cursor:default">
+            <input type="checkbox" value="${e.id}" checked disabled />
+            <span>
+              <span class="perm-label" style="color:var(--red)">${esc(e.name)} (inactive)</span>
+              <span class="perm-note">Saving this job takes them off it — tick someone else to cover.</span>
+            </span>
+          </label>`
+        )
+        .join('') +
+      (active.length
+        ? active
+            .map(
+              (e) => `<label class="perm"><input type="checkbox" value="${e.id}"${
+                sel.has(e.id) ? ' checked' : ''
+              } /> ${esc(e.name)}</label>`
+            )
+            .join('')
+        : '<span style="color:var(--muted);font-size:13px">No active employees.</span>');
   }
   // The bulk bar's own copy of the crew list — it starts empty every time, so
-  // nothing reaches a batch of jobs unless it was ticked here.
-  function renderBulkEmps() {
+  // nothing reaches a batch of jobs unless it was ticked here. `keepTicks`
+  // is for a crew list that changed mid-visit: what was ticked stays ticked.
+  function renderBulkEmps(keepTicks) {
     const box = $('schedBulkEmps');
     if (!box) return;
-    box.innerHTML = allEmployees.length
-      ? allEmployees
+    const ticked = new Set(
+      keepTicks ? [...box.querySelectorAll('input:checked')].map((c) => Number(c.value)) : []
+    );
+    const active = activeEmployees();
+    box.innerHTML = active.length
+      ? active
           .map(
             (e) =>
-              `<label class="perm"><input type="checkbox" value="${e.id}" /> ${esc(
-                e.name
-              )}</label>`
+              `<label class="perm"><input type="checkbox" value="${e.id}"${
+                ticked.has(e.id) ? ' checked' : ''
+              } /> ${esc(e.name)}</label>`
           )
           .join('')
-      : '<span style="color:var(--muted);font-size:13px">No employees yet.</span>';
+      : '<span style="color:var(--muted);font-size:13px">No active employees.</span>';
   }
 
+  // A locked (inactive) row is skipped, so saving takes them off as promised.
   const collectEmps = () =>
-    [...$('schedEmps').querySelectorAll('input[type="checkbox"]:checked')].map((c) =>
-      Number(c.value)
+    [...$('schedEmps').querySelectorAll('input[type="checkbox"]:checked:not(:disabled)')].map(
+      (c) => Number(c.value)
     );
 
   async function loadAdmin() {
     if (!$('schedBoard')) return;
     if (!weekStart) weekStart = mondayOf(todayStr());
-    try {
-      allEmployees = await api('/api/admin/employees');
-    } catch (e) {
-      allEmployees = [];
-    }
-    if (editingId == null) renderEmpChecks([]);
-    renderBulkEmps();
-    await refreshJobs();
+    // The bulk bar's crew ticks start empty on every visit, as they always have.
+    if (crewKnown) renderBulkEmps();
+    // Nothing on screen yet: a line that only appears if the wait is long
+    // enough to notice (.wait). A kept copy replaces it at once.
+    if (!jobsKnown) $('schedBoard').innerHTML = '<p class="status-sub wait">Loading the board…</p>';
+    await Promise.all([loadCrew(), refreshJobs()]);
   }
 
+  // The crew the board is drawn against. A copy read earlier in this visit,
+  // or warmed by prefetch(), is used at once; the server's answer replaces it
+  // only if something changed.
+  async function loadCrew() {
+    const kept = Snappy.cache.peek(EMPS);
+    if (!crewKnown && Array.isArray(kept)) takeCrew(kept);
+    try {
+      takeCrew(await Snappy.load(api, EMPS));
+    } catch (e) {
+      // As before: without the list the board still draws, just without names.
+      if (!crewKnown) takeCrew([]);
+    }
+  }
+
+  function takeCrew(list) {
+    if (crewKnown && JSON.stringify(list) === JSON.stringify(allEmployees)) return;
+    const again = crewKnown;
+    allEmployees = list;
+    crewKnown = true;
+    // A new job's form keeps whatever has been ticked in it so far. A job being
+    // edited keeps its crew list as it was opened, as it always has.
+    if (editingId == null)
+      renderEmpChecks($('jobModalBack').classList.contains('open') ? collectEmps() : []);
+    renderBulkEmps(again);
+    if (jobsKnown) drawJobs();
+  }
+
+  // Reads the board: the usual window through Snappy.swr (kept copy first,
+  // then the server's), or — once paged back past it — from that week.
   async function refreshJobs() {
-    const d = await api('/api/admin/schedules');
+    const gen = ++jobsGen;
+    // Paging back past what's loaded asks from that week, and every read after
+    // keeps asking from there, so the older weeks don't drop off again.
+    if (loadedSince && weekStart && weekStart < loadedSince) pagedSince = weekStart;
+    try {
+      if (pagedSince) {
+        const since = pagedSince;
+        const d = await readJobs(SCHED + '?since=' + since);
+        if (gen !== jobsGen) return;
+        loadedSince = since;
+        applyJobs(d, true);
+        return;
+      }
+      await Snappy.swr(
+        readJobs,
+        SCHED,
+        (d, fresh) => {
+          // A newer read has started, or a change is on its way: the board on
+          // screen is newer than this copy.
+          if (gen !== jobsGen || writes) return;
+          loadedSince = addDays(todayStr(), -BACK_DAYS);
+          applyJobs(d, fresh);
+        },
+        { persist: BOARD_ON_DISK }
+      );
+    } catch (e) {
+      if (e.stale) return; // crossed a change; the read after it brings the board
+      if (!jobsKnown) $('schedBoard').innerHTML = '';
+      throw e;
+    }
+  }
+
+  // Reads whatever the board has loaded straight from the server — never by
+  // joining a read that set off before a change — and keeps the copy.
+  async function syncJobs() {
+    const gen = ++jobsGen;
+    const since = pagedSince;
+    let d;
+    try {
+      d = await readJobs(since ? SCHED + '?since=' + since : SCHED);
+    } catch (e) {
+      if (e.stale) return; // another change came in; the read after it follows
+      throw e;
+    }
+    if (gen !== jobsGen) return;
+    loadedSince = since || addDays(todayStr(), -BACK_DAYS);
+    if (!since) Snappy.cache.put(SCHED, d, BOARD_ON_DISK);
+    applyJobs(d, true);
+  }
+
+  // Every read of the board goes through here. One that crossed paths with a
+  // change on its way may describe the board from before that change, so it
+  // is refused — nothing keeps it, nothing draws it — and the board owes
+  // itself a fresh read.
+  async function readJobs(path) {
+    const seq = writeSeq;
+    const calm = !writes;
+    const d = await api(path);
+    if (calm && seq === writeSeq) return d;
+    lostRead = true;
+    settle();
+    const err = new Error('The board changed while it was being read.');
+    err.stale = true;
+    throw err;
+  }
+
+  // Sends one change to the server. The board already shows it (or, for a
+  // save, will once it's in). Once the last change in flight is done, the
+  // board is read again, quietly — the refresh that has always followed a
+  // change, which also picks up anything the server worked out for itself.
+  async function change(request) {
+    writes++;
+    writeSeq++;
+    // The kept copy is from before this change: nothing should paint it now.
+    Snappy.cache.drop(SCHED);
+    try {
+      return await request();
+    } finally {
+      writes--;
+      writeSeq++;
+      lostRead = true;
+      settle();
+    }
+  }
+
+  // Owed a read, and nothing is on its way any more: read now. (Before the
+  // board has ever loaded there is nothing on screen to bring up to date.)
+  function settle() {
+    if (writes || !lostRead || !jobsKnown) return;
+    lostRead = false;
+    syncJobs().catch((e) => console.warn('Schedule: could not re-read the board.', e));
+  }
+
+  // Takes a list of jobs for the board: a kept copy (fresh = false) or the
+  // server's answer.
+  function applyJobs(d, fresh) {
     jobsCache = d.jobs || [];
-    // A deleted job must not linger in the selection and get written to again.
-    const live = new Set(jobsCache.map((j) => j.id));
-    [...selected].forEach((id) => live.has(id) || selected.delete(id));
+    jobsKnown = true;
+    // A deleted job must not linger in the selection and get written to
+    // again. Only the server's answer says what's gone; a kept copy may lag.
+    if (fresh) {
+      const live = new Set(jobsCache.map((j) => j.id));
+      [...selected].forEach((id) => live.has(id) || selected.delete(id));
+    }
+    drawJobs();
+  }
+
+  // Draws the board from jobsCache. Held back until the crew list is in —
+  // without it every lane would read "(removed)" — and while a card is being
+  // dragged, since a redraw would pull it out of the person's hand (endDrag
+  // draws when it lands). Where the board was scrolled to stays put.
+  function drawJobs() {
+    if (!crewKnown) return;
+    if (dragId != null) {
+      redrawAfterDrag = true;
+      return;
+    }
     renderBoard();
     renderBulkBar();
+    // An open job's files follow the board. Its form is the person's own work
+    // in progress and is left exactly as it is.
+    if (editingId != null && $('jobModalBack').classList.contains('open')) renderFiles();
   }
 
   // Initials for the crew chips on a card. Falls back to the first letters of
@@ -578,13 +915,28 @@
       .toUpperCase();
   }
 
+  // One crew chip on a card. Someone inactive keeps theirs until the job is
+  // saved without them — outlined rather than filled, and spelled out, so it
+  // can't pass for crew.
+  function chipHtml(id) {
+    const name = (allEmployees.find((e) => e.id === id) || {}).name || '';
+    const ini = esc(initialsFor(id));
+    if (!isInactive(id)) return `<span class="sched-chip" title="${esc(name)}">${ini}</span>`;
+    const ring = 'background:none;color:var(--red);box-shadow:inset 0 0 0 1px var(--red)';
+    return `<span class="sched-chip" style="${ring}"
+      title="${esc(name)} is inactive — open the job to reassign it">${ini} (inactive)</span>`;
+  }
+
   // `day` is the column the card is being drawn in. A multi-day job is drawn
   // once per day it covers; only the card on its first day can be dragged, so
   // "where does this job move to" always has one obvious answer.
   function cardHtml(job, day) {
     const crew = job.employee_ids || [];
+    // Someone inactive is shown but doesn't staff the job: with nobody active
+    // on it, it is flagged like a job with nobody at all.
+    const live = crew.filter((id) => !isInactive(id));
     const late = job.date && job.date < todayStr();
-    const state = !crew.length ? 'nocrew' : late ? 'past' : 'ok';
+    const state = !live.length ? 'nocrew' : late ? 'past' : 'ok';
     // The first line of the description names the job; the rest is detail that
     // belongs on the card too — a card you have to open to recognise is no use
     // on a board you are meant to read at a glance.
@@ -614,7 +966,7 @@
         <div class="sched-card-icons">
           ${job.notes_driver ? '<span title="Notes for the crew">📄</span>' : ''}
           ${fileCount(job) ? `<span title="${fileCount(job)} file(s)">📎</span>` : ''}
-          ${crew.length > 1 ? `<span class="sched-x">× ${crew.length}</span>` : ''}
+          ${live.length > 1 ? `<span class="sched-x">× ${live.length}</span>` : ''}
         </div>
       </div>
       ${lines.map((l) => `<div class="sched-card-line">${esc(l)}</div>`).join('')}
@@ -633,18 +985,8 @@
         ${job.job_type && job.job_type !== 'Delivery' ? `<span class="sched-tag">${esc(job.job_type)}</span>` : ''}
         ${job.confirmed ? '<span class="sched-tag ok">Confirmed</span>' : ''}
       </div>
-      ${
-        crew.length
-          ? `<div class="sched-card-crew">${crew
-              .map(
-                (id) =>
-                  `<span class="sched-chip" title="${esc(
-                    (allEmployees.find((e) => e.id === id) || {}).name || ''
-                  )}">${esc(initialsFor(id))}</span>`
-              )
-              .join('')}</div>`
-          : '<div class="sched-unassigned">Unassigned</div>'
-      }
+      ${crew.length ? `<div class="sched-card-crew">${crew.map(chipHtml).join('')}</div>` : ''}
+      ${live.length ? '' : '<div class="sched-unassigned">Unassigned</div>'}
       <button class="link-btn danger sched-del" data-del="${job.id}" title="Delete">✕</button>
       <span class="sched-card-open" aria-hidden="true">↗</span>
     </article>`;
@@ -659,7 +1001,9 @@
     const byEmp = new Map();
     const loose = [];
     for (const j of dayJobs) {
-      const crew = j.employee_ids || [];
+      // Lanes are only for people who can be booked: a job with nobody active
+      // left on it waits under Unassigned.
+      const crew = (j.employee_ids || []).filter((id) => !isInactive(id));
       if (!crew.length) {
         loose.push(j);
         continue;
@@ -707,8 +1051,9 @@
   // from.
   const WEEKS_SHOWN = 8;
 
-  // Mon–Sat. Sunday is deliberately not a column: nothing is booked on it, and
-  // dropping it makes every other day wider.
+  // Mon–Sat. Sunday is not normally a column: nothing is booked on it, and
+  // dropping it makes every other day wider. A week with something on its
+  // Sunday gets the column back (see renderBoard).
   const DAYS_PER_WEEK = 6;
 
   // "Dec 14", but "Jan 1, 2027" once the date leaves the current year — the
@@ -731,7 +1076,8 @@
     const busy = new Set();
     for (const j of jobs)
       if (jobCoversDay(j, day)) for (const id of j.employee_ids || []) busy.add(id);
-    return allEmployees
+    // Someone inactive can't be booked, however empty their day looks.
+    return activeEmployees()
       .filter((e) => !busy.has(e.id))
       .map((e) => initialsFor(e.id))
       .sort((a, b) => a.localeCompare(b));
@@ -739,7 +1085,9 @@
 
   function dayCellHtml(day, jobs, today) {
     const dayJobs = jobs.filter((j) => jobCoversDay(j, day));
-    const free = unbookedOn(jobs, day);
+    // Against every job, not just those the search shows: someone booked on a
+    // job the search hides is still booked.
+    const free = unbookedOn(jobsCache, day);
     const cls =
       'sched-day' +
       (day === today ? ' is-today' : '') +
@@ -784,11 +1132,6 @@
 
     const jobs = jobsCache.filter(match);
     const today = todayStr();
-    const lastDay = addDays(weekStart, WEEKS_SHOWN * 7 - (7 - DAYS_PER_WEEK) - 1);
-    $('schedRange').textContent =
-      dayLabel(weekStart, { month: 'short', day: 'numeric' }) +
-      ' – ' +
-      dayLabel(lastDay, { month: 'short', day: 'numeric', year: 'numeric' });
     $('schedEmpty').style.display = jobsCache.length ? 'none' : 'block';
 
     // Jobs with no date at all live above the calendar rather than in a column
@@ -818,15 +1161,59 @@
     </div>`;
 
     let weeks = '';
+    let lastDay = weekStart;
     for (let w = 0; w < WEEKS_SHOWN; w++) {
       const monday = addDays(weekStart, w * 7);
+      // A Sunday with anything on it (a date-picker slip, a run over the
+      // weekend) gets its column, or the job would sit on no column at all and
+      // a run starting that Sunday would have no card to drag. `jobs` is
+      // post-search, so searching for such a job brings its Sunday up too.
+      const days = jobs.some((j) => jobCoversDay(j, addDays(monday, 6))) ? 7 : DAYS_PER_WEEK;
       let cells = '';
-      for (let d = 0; d < DAYS_PER_WEEK; d++)
+      for (let d = 0; d < days; d++)
         cells += dayCellHtml(addDays(monday, d), jobs, today);
-      weeks += `<div class="sched-week-row">${cells}</div>`;
+      lastDay = addDays(monday, days - 1);
+      // The stylesheet only knows six columns; see `stacked` for the phone.
+      const wide = days > DAYS_PER_WEEK && !stacked.matches;
+      weeks += `<div class="sched-week-row"${
+        wide ? ` style="grid-template-columns:repeat(${days}, 1fr)"` : ''
+      }>${cells}</div>`;
     }
+    $('schedRange').textContent =
+      dayLabel(weekStart, { month: 'short', day: 'numeric' }) +
+      ' – ' +
+      dayLabel(lastDay, { month: 'short', day: 'numeric', year: 'numeric' });
 
+    // Redrawn in place, so nothing moves under the person: the backlog keeps
+    // its sideways scroll, and a focused tick box or "All" keeps the focus.
+    const back = board.querySelector('.sched-backlog-body');
+    const left = back ? back.scrollLeft : 0;
+    const refocus = focusAgain(board);
     board.innerHTML = backlog + '<div class="sched-weeks">' + weeks + '</div>';
+    if (left) board.querySelector('.sched-backlog-body').scrollLeft = left;
+    if (refocus) refocus();
+  }
+
+  // The control inside the board that has the keyboard focus, as a way to
+  // find it again after a redraw: the same tick box, or the same day's "All",
+  // wherever the redraw put them. Null when the focus is anywhere else.
+  function focusAgain(board) {
+    const el = document.activeElement;
+    if (!el || el === board || !board.contains(el)) return null;
+    const what = el.dataset.pick
+      ? `[data-pick="${el.dataset.pick}"]`
+      : el.dataset.selcol
+        ? '[data-selcol]'
+        : null;
+    const box = el.closest('.sched-day, .sched-backlog');
+    const zone = box && box.querySelector('[data-drop]');
+    if (!what || !zone) return null;
+    const day = zone.dataset.drop;
+    return () => {
+      const z = board.querySelector(`[data-drop="${day}"]`);
+      const again = z && z.parentElement.querySelector(what);
+      if (again) again.focus({ preventScroll: true });
+    };
   }
 
   // ---- selecting jobs ----
@@ -857,19 +1244,108 @@
       selected.size + (selected.size === 1 ? ' job selected' : ' jobs selected');
   }
 
-  // One request for the whole selection instead of one per card.
+  // ---- changing jobs on the board ----
+  // Changes jobs on the board at once and sends the change in the background.
+  // If the server refuses, what the edit changed goes back as it was, and the
+  // error is the caller's to show.
+  function editJobs(jobs, edit, request) {
+    return change(() =>
+      Snappy.optimistic(() => {
+        const was = jobs.map((j) => [j, { ...j }]);
+        jobs.forEach(edit);
+        // Only the fields this edit touched go back, so undoing it can't also
+        // undo another change made to the same job meanwhile.
+        const touched = was.map(([j, old]) => [j, old, Object.keys(j).filter((k) => j[k] !== old[k])]);
+        drawJobs();
+        return () => {
+          touched.forEach(([j, old, keys]) => keys.forEach((k) => (j[k] = old[k])));
+          drawJobs();
+        };
+      }, request)
+    );
+  }
+
+  // Takes jobs off the board at once and deletes them in the background, one
+  // request each. If the server refuses, they come back (ticked, if they
+  // were), and the read that follows sorts out any that went before it did.
+  function removeJobs(ids) {
+    const gone = new Set(ids);
+    return change(() =>
+      Snappy.optimistic(
+        () => {
+          // Where each one sat, so it can go back to the same place in its
+          // crew's lane rather than to the end of it.
+          const removed = [];
+          jobsCache.forEach((j, i) => gone.has(j.id) && removed.push([i, j]));
+          const ticked = ids.filter((id) => selected.has(id));
+          jobsCache = jobsCache.filter((j) => !gone.has(j.id));
+          ticked.forEach((id) => selected.delete(id));
+          drawJobs();
+          return () => {
+            for (const [i, j] of removed)
+              if (!jobsCache.includes(j)) jobsCache.splice(Math.min(i, jobsCache.length), 0, j);
+            ticked.forEach((id) => selected.add(id));
+            drawJobs();
+          };
+        },
+        async () => {
+          for (const id of ids) await api(SCHED + '/' + id, { method: 'DELETE' });
+        }
+      )
+    );
+  }
+
+  // Where a job lands when its first day moves to `to` ('' = no date): a run
+  // keeps its length, the way the server slides it (shiftedEnd in server.js),
+  // so the board doesn't jump when the server's own copy arrives.
+  function slide(job, to) {
+    const span = job.date && job.end_date ? daysBetween(job.date, job.end_date) : 0;
+    job.date = to || null;
+    job.end_date = to && span > 0 ? addDays(to, span) : null;
+  }
+
+  // What PATCH /api/admin/schedules/bulk does to each job, done here first so
+  // the board shows it straight away.
+  function bulkEdit(job, body) {
+    if (body.date != null) {
+      if (body.end_date != null) {
+        // The whole selection given the same run. An end that isn't after the
+        // start means a single day.
+        job.date = body.date || null;
+        job.end_date = job.date && body.end_date > job.date ? body.end_date : null;
+      } else slide(job, body.date);
+    }
+    if (body.time != null) job.time = body.time || null;
+    if (body.employee_ids != null) {
+      // Only active employees can be booked; the server drops anyone else.
+      const crew = body.employee_ids.filter((id) => activeEmployees().some((e) => e.id === id));
+      const had = job.employee_ids || [];
+      const mode = body.crew_mode || 'replace';
+      if (mode === 'add') job.employee_ids = [...new Set([...had, ...crew])];
+      else if (mode === 'remove') job.employee_ids = had.filter((id) => !crew.includes(id));
+      else if (mode === 'replace') job.employee_ids = crew;
+    }
+  }
+
+  // One request for the whole selection instead of one per card. The cards
+  // change at once; if the server says no, they change back and it says why.
   async function bulkPatch(body) {
     if (!selected.size) return;
     const msg = $('schedBulkMsg');
-    msg.textContent = 'Saving…';
+    msg.textContent = '';
+    const ids = [...selected];
+    const jobs = ids.map((id) => jobsCache.find((j) => j.id === id)).filter(Boolean);
+    $('schedBulkCrewMenu').open = false;
     try {
-      await api('/api/admin/schedules/bulk', {
-        method: 'PATCH',
-        body: JSON.stringify({ ids: [...selected], ...body }),
-      });
-      msg.textContent = '';
-      $('schedBulkCrewMenu').open = false;
-      await refreshJobs();
+      await editJobs(
+        jobs,
+        (j) => bulkEdit(j, body),
+        () =>
+          api(SCHED + '/bulk', {
+            method: 'PATCH',
+            body: JSON.stringify({ ids, ...body }),
+          })
+      );
     } catch (e) {
       msg.textContent = e.message;
     }
@@ -911,23 +1387,20 @@
     await bulkPatch(body);
   }
 
+  // Off the board as soon as it's confirmed, deleted behind it.
   async function deleteSelected() {
     if (!selected.size) return;
     if (!confirm(`Delete ${selected.size} job(s)? This cannot be undone.`)) return;
-    const msg = $('schedBulkMsg');
-    msg.textContent = 'Deleting…';
+    $('schedBulkMsg').textContent = '';
     try {
-      for (const id of [...selected])
-        await api('/api/admin/schedules/' + id, { method: 'DELETE' });
-      selected.clear();
-      msg.textContent = '';
+      await removeJobs([...selected]);
     } catch (e) {
-      msg.textContent = e.message;
+      // Whatever didn't go is back on the board and ticked, so this shows.
+      $('schedBulkMsg').textContent = e.message;
     }
-    await refreshJobs();
   }
 
-  async function onBoardClick(ev) {
+  function onBoardClick(ev) {
     if (ev.target.closest('a')) return; // let the address link open the map
 
     const pick = ev.target.closest('input[data-pick]');
@@ -946,12 +1419,7 @@
       ev.stopPropagation();
       const id = Number(del.dataset.del);
       if (!confirm('Delete this job?')) return;
-      try {
-        await api('/api/admin/schedules/' + id, { method: 'DELETE' });
-        await refreshJobs();
-      } catch (e) {
-        alert(e.message);
-      }
+      removeJobs([id]).catch((e) => alert(e.message));
       return;
     }
     const card = ev.target.closest('.sched-card');
@@ -1080,25 +1548,26 @@
       lng: picked.lng,
       employee_ids: collectEmps(),
     };
-    $('schedSave').disabled = true;
+    const id = editingId;
     try {
-      if (editingId != null) {
-        await api('/api/admin/schedules/' + editingId, {
-          method: 'PATCH',
-          body: JSON.stringify(payload),
-        });
-      } else {
-        await api('/api/admin/schedules', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        });
-      }
-      closeForm();
-      await refreshJobs();
+      // Disabled the moment it's pressed, so it can't go twice; "Saving…" only
+      // if the wait is long enough to notice (Snappy.busy). The board picks the
+      // job up from the read that follows every change.
+      await Snappy.busy(
+        $('schedSave'),
+        () =>
+          change(() =>
+            id != null
+              ? api(SCHED + '/' + id, { method: 'PATCH', body: JSON.stringify(payload) })
+              : api(SCHED, { method: 'POST', body: JSON.stringify(payload) })
+          ),
+        { label: 'Saving…' }
+      );
+      // Unless they've moved on to another job meanwhile — that form is theirs.
+      if (editingId === id) closeForm();
     } catch (e) {
-      msg.textContent = e.message;
-    } finally {
-      $('schedSave').disabled = false;
+      if (editingId === id) msg.textContent = e.message;
+      else alert(e.message);
     }
   }
 
@@ -1123,13 +1592,15 @@
     $('jfLocked').style.display = job ? 'none' : '';
     if (!job) return;
 
+    // Walking the folders only shows something, so a mouse press acts on the
+    // way down (data-press="fast", snappy.js). A folder's own ✕ is left alone.
     const crumbs = jfFolder.split('/').filter(Boolean);
     $('jfCrumbs').innerHTML =
-      '<button type="button" class="jf-crumb" data-jf-crumb="">All files</button>' +
+      '<button type="button" class="jf-crumb" data-jf-crumb="" data-press="fast">All files</button>' +
       crumbs
         .map((seg, i) => {
           const path = crumbs.slice(0, i + 1).join('/');
-          return ` / <button type="button" class="jf-crumb" data-jf-crumb="${esc(path)}">${esc(seg)}</button>`;
+          return ` / <button type="button" class="jf-crumb" data-jf-crumb="${esc(path)}" data-press="fast">${esc(seg)}</button>`;
         })
         .join('');
 
@@ -1139,7 +1610,7 @@
       folders
         .map((name) => {
           const path = jfFolder ? jfFolder + '/' + name : name;
-          return `<div class="jf-row folder" data-jf-folder="${esc(path)}" title="Open folder">
+          return `<div class="jf-row folder" data-jf-folder="${esc(path)}" data-press="fast" title="Open folder">
             <span class="jf-name">📁 ${esc(name)}</span>
             <button type="button" class="jf-del" data-jf-folder-del="${esc(path)}" title="Delete folder">✕</button>
           </div>`;
@@ -1161,10 +1632,20 @@
       rows || '<div class="jf-empty">Nothing here yet — drop files in, or make a folder.</div>';
   }
 
-  // Every change re-reads the job, so the board, the card's file count and the
-  // panel can never disagree about what is filed where.
+  // After uploads: re-read the job, so the board, the card's file count and
+  // the panel can never disagree about what is filed where. An upload doesn't
+  // go through change() — it can run for minutes, and the board has to stay
+  // readable meanwhile — so it is marked here instead: a read that set off
+  // before it finished is refused (readJobs), and the old copy is dropped.
   async function reloadFiles() {
-    await refreshJobs();
+    writeSeq++;
+    Snappy.cache.drop(SCHED);
+    try {
+      await syncJobs();
+    } catch (e) {
+      // An upload's own error matters more than a refresh that didn't happen.
+      if (!$('jfMsg').textContent) $('jfMsg').textContent = e.message;
+    }
     renderFiles();
   }
 
@@ -1251,56 +1732,81 @@
     const name = prompt('Folder name', 'Photos');
     if (!name) return;
     try {
-      await api('/api/admin/schedules/' + job.id + '/folders', {
-        method: 'POST',
-        body: JSON.stringify({ path: [jfFolder, name].filter(Boolean).join('/') }),
-      });
-      await reloadFiles();
+      // The server tidies the name and files its parents too, so the folder
+      // appears from the read that follows the change rather than guessed here.
+      await change(() =>
+        api(SCHED + '/' + job.id + '/folders', {
+          method: 'POST',
+          body: JSON.stringify({ path: [jfFolder, name].filter(Boolean).join('/') }),
+        })
+      );
     } catch (e) {
       $('jfMsg').textContent = e.message;
     }
   }
 
+  // The folder and everything in it go from the panel as soon as it's
+  // confirmed; if the server refuses, they come back and the reason shows.
   async function deleteJobFolder(path) {
     const job = currentJob();
     if (!job) return;
-    const n = (job.files || []).filter(
-      (f) => (f.folder || '') === path || (f.folder || '').startsWith(path + '/')
-    ).length;
+    const inside = (p) => p === path || p.startsWith(path + '/');
+    const n = (job.files || []).filter((f) => inside(f.folder || '')).length;
     if (!confirm(n ? `Delete this folder and the ${n} file(s) in it?` : 'Delete this folder?'))
       return;
+    // Standing inside a folder that just went away would show nothing.
+    if (inside(jfFolder)) jfFolder = '';
     try {
-      await api('/api/admin/schedules/' + job.id + '/folders?path=' + encodeURIComponent(path), {
-        method: 'DELETE',
-      });
-      // Standing inside a folder that just went away would show nothing.
-      if (jfFolder === path || jfFolder.startsWith(path + '/')) jfFolder = '';
-      await reloadFiles();
+      await editJobs(
+        [job],
+        (j) => {
+          j.folders = (j.folders || []).filter((p) => !inside(p));
+          j.files = (j.files || []).filter((f) => !inside(f.folder || ''));
+        },
+        () =>
+          api(SCHED + '/' + job.id + '/folders?path=' + encodeURIComponent(path), {
+            method: 'DELETE',
+          })
+      );
     } catch (e) {
       $('jfMsg').textContent = e.message;
     }
   }
 
+  // Off the list as soon as it's confirmed; back if the server refuses.
   async function deleteJobFile(fileId) {
     const job = currentJob();
     if (!job || !confirm('Remove this file?')) return;
     try {
-      await api('/api/admin/schedules/' + job.id + '/files/' + fileId, { method: 'DELETE' });
-      await reloadFiles();
+      await editJobs(
+        [job],
+        (j) => {
+          j.files = (j.files || []).filter((f) => f.id !== fileId);
+        },
+        () => api(SCHED + '/' + job.id + '/files/' + fileId, { method: 'DELETE' })
+      );
     } catch (e) {
       $('jfMsg').textContent = e.message;
     }
   }
 
+  // A file dropped on a folder is in it at once; back where it was if the
+  // server refuses.
   async function moveJobFile(fileId, folder) {
     const job = currentJob();
     if (!job) return;
     try {
-      await api('/api/admin/schedules/' + job.id + '/files/' + fileId, {
-        method: 'PATCH',
-        body: JSON.stringify({ folder }),
-      });
-      await reloadFiles();
+      await editJobs(
+        [job],
+        (j) => {
+          j.files = (j.files || []).map((f) => (f.id === fileId ? { ...f, folder } : f));
+        },
+        () =>
+          api(SCHED + '/' + job.id + '/files/' + fileId, {
+            method: 'PATCH',
+            body: JSON.stringify({ folder }),
+          })
+      );
     } catch (e) {
       $('jfMsg').textContent = e.message;
     }
@@ -1388,5 +1894,31 @@
     });
   }
 
-  window.Schedule = { loadAdmin, loadMine };
+  // Open one job's detail from elsewhere in the dashboard — an invoice hands
+  // over the shipment it just put on the board. That screen has usually just
+  // changed the job, so it's read fresh from the server, never from a kept
+  // copy: a form opened on an old copy would save the old values back.
+  async function openJob(id) {
+    if (!$('schedBoard')) return;
+    if (!weekStart) weekStart = mondayOf(todayStr());
+    await Promise.all([loadCrew(), syncJobs()]);
+    startEdit(Number(id));
+  }
+
+  // Asks ahead for what this page's schedule will read when it's opened. The
+  // shell calls it when a pointer rests on the Schedule tab, and when idle.
+  // Each page warms only its own paths: the portal never asks for an admin
+  // one, which would answer 401 and sign the employee out.
+  function prefetch() {
+    if ($('schedBoard')) {
+      // Paged back, the board reads with ?since=, which isn't kept; and while
+      // a change is on its way, a read would only be refused.
+      if (!pagedSince && !writes) Snappy.prefetch(readJobs, SCHED, { persist: BOARD_ON_DISK });
+      Snappy.prefetch(api, EMPS);
+    } else if ($('mySchedList')) {
+      Snappy.prefetch(api, MY_SCHED, { persist: true });
+    }
+  }
+
+  window.Schedule = { loadAdmin, loadMine, openJob, prefetch };
 })();

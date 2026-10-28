@@ -10,3 +10,8 @@ dist/
 !.env.example
 .DS_Store
 .storage/
+
+# A bare copy of this repository was once committed here; its history holds the
+# old .env. Never track a nested repository.
+hek-timeclock.git/
+*.git/

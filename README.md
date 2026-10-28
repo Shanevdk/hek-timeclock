@@ -22,7 +22,7 @@ A simple employee time clock:
 - **On the clock** — live list of who is currently clocked in.
 - **Timesheets** — filter by employee and date range, see total hours, edit any entry, add a manual entry, **Export CSV**.
 - **Employees** — add employees (name + login email + password), edit their profile, deactivate, or delete. An employee needs an email and password to sign in and clock in.
-- **Quotes** — build a customer quote, print it as a PDF, and convert an accepted one into an invoice.
+- **Quotes** — trace the fence on a satellite map and get the materials, labor and price worked out; send the customer a link to approve and e-sign; AI review before it goes out; print it as a PDF, and convert an accepted one into an invoice. See [Satellite estimator](#satellite-estimator).
 - **Invoices** — line items, tax, due dates, recorded payments and a running balance. Paid / overdue work themselves out. Send one to the customer through QuickBooks — see [Sending invoices through QuickBooks](#sending-invoices-through-quickbooks).
 - **Inbox** — an AI agent reads the mailbox and drafts quotes from customer emails for you to review. See [AI inbox](#ai-inbox).
 - **QuickBooks** — push each pay period's hours into QuickBooks so payroll runs there with the numbers already filled in. See [QuickBooks payroll sync](#quickbooks-payroll-sync).
@@ -46,7 +46,9 @@ Put it in the `DATABASE_URL` environment variable. The collections
 
 ```bash
 npm install
-# copy .env.example to .env and fill in DATABASE_URL + ADMIN_EMAIL + ADMIN_PASSWORD
+# copy .env.example to .env and fill in DATABASE_URL, ADMIN_EMAIL, ADMIN_PASSWORD
+# and SESSION_SECRET (generate one — the app will not start without it):
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 npm start
 ```
 
@@ -54,9 +56,25 @@ On Windows PowerShell (without a .env file):
 
 ```powershell
 $env:DATABASE_URL="mongodb+srv://user:pass@cluster.mongodb.net/?appName=yourapp"
-$env:ADMIN_PASSWORD="yourpassword"
+$env:ADMIN_PASSWORD="at-least-8-characters"
+$env:SESSION_SECRET=(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")
 npm start
 ```
+
+> **Never commit `.env`.** It holds the database password and the key that signs
+> every login. If it is ever pushed, treat everything in it as public: change the
+> database user's password in Atlas, change the admin password, and set a new
+> `SESSION_SECRET` (which signs everyone out). Then, on the QuickBooks tab, click
+> **Reconnect**: the QuickBooks sign-in is stored in the database, so anyone who
+> read the database could use it until it is renewed. Deleting the file in a later
+> commit does not remove it from the repository's history.
+>
+> **Changing `SESSION_SECRET` also changes the key the saved credentials are
+> encrypted with** (the QuickBooks client secret and sign-in, the mailbox
+> password, the Google Maps key) unless `CREDENTIAL_ENCRYPTION_KEY` is set. Either
+> re-enter them afterwards, or — to keep them — first set
+> `CREDENTIAL_ENCRYPTION_KEY` to the *old* `SESSION_SECRET` value, then change
+> `SESSION_SECRET`. (After a leak, re-entering them is the safer choice.)
 
 Open http://localhost:3000 (sign in) — admins are taken to the dashboard.
 The first thing to do after signing in is add your employees under the **Employees** tab.
@@ -72,8 +90,9 @@ and the API runs as a serverless function.
 3. In **Site settings → Environment variables**, add:
    - `DATABASE_URL` — your MongoDB connection string
    - `ADMIN_EMAIL` — admin sign-in email
-   - `ADMIN_PASSWORD` — admin sign-in password
-   - `SESSION_SECRET` — a long random string
+   - `ADMIN_PASSWORD` — admin sign-in password (8+ characters)
+   - `SESSION_SECRET` — **required**: a long random string (32+ characters). The
+     API refuses to start without one, so set it before the first deploy.
    - `ADMIN_PATH` — the admin page path (default `/admin`; also sets the page filename)
    - `TIMEZONE` — e.g. `America/New_York`
 4. Deploy. Netlify gives you a public `https://…netlify.app` URL — share `/` with
@@ -97,8 +116,9 @@ Render pick **New + → Blueprint** and set the same environment variables above
 | `DB_NAME` | Database name inside the cluster (default `hektimeclock`). |
 | `DB_STORAGE_LIMIT_MB` | Storage the plan allows, in MB — what "storage left" is measured against (default `512`, the Atlas free tier). Ignored on a server that reports a real disk. |
 | `ADMIN_EMAIL` | Email admins sign in with (default `admin@hekfencing.com`). |
-| `ADMIN_PASSWORD` | Password for the admin dashboard. **Set this.** |
-| `SESSION_SECRET` | Random string signing the login cookie. |
+| `ADMIN_PASSWORD` | Password for the admin dashboard, 8+ characters. **Set this.** Only used to create the admin login on first start; after that it's changed from the dashboard. |
+| `SESSION_SECRET` | **Required.** Random string (32+ characters) signing the login cookie. The app refuses to start without one, or with the `.env.example` placeholder. |
+| `DEV_EMAIL` / `DEV_PASSWORD` | Optional. The built-in "dev" account — a limited admin for whoever maintains the app. It only exists while `DEV_PASSWORD` (12+ characters) is set; change it and restart to change the dev's password. |
 | `ADMIN_PATH` | URL path for the admin dashboard (default `/admin`). |
 | `TIMEZONE` | IANA timezone for the workday boundary (default `America/New_York`). |
 | `PORT` | Port to listen on (host usually sets this). |
@@ -106,12 +126,17 @@ Render pick **New + → Blueprint** and set the same environment variables above
 | `QBO_CLIENT_SECRET` | Intuit app client secret. Optional, same. |
 | `QBO_ENVIRONMENT` | `sandbox` (default) or `production`. Optional, same. |
 | `QBO_REDIRECT_URI` | Must match a Redirect URI on the Intuit app exactly. Optional, same. |
-| `CREDENTIAL_ENCRYPTION_KEY` | Optional. Keys the stored-credential encryption off its own secret instead of `SESSION_SECRET`. |
+| `CREDENTIAL_ENCRYPTION_KEY` | Optional. Keys the stored-credential encryption off its own secret instead of `SESSION_SECRET` — set it to keep saved credentials readable when `SESSION_SECRET` changes. |
 | `CRON_SECRET` | Lets the scheduled QuickBooks sync and inbox scan run on Vercel. Without it those endpoints stay closed. |
 | `ANTHROPIC_API_KEY` | Lets the AI inbox agent read email. Optional — leave blank to switch it off. |
 | `MAIL_ENCRYPTION_KEY` | Optional. Keys the mail-password encryption off its own secret instead of `SESSION_SECRET`. |
 | `S3_BUCKET` / `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | The bucket file attachments are uploaded to. Blank locally = files kept on disk under `.storage/`. See **File attachments** below. |
 | `ATTACH_MAX_BYTES` | Largest attachment accepted, in bytes. Default 1 GB. |
+| `CLIENT_IP_HEADER` | Optional. On a host other than Netlify or Vercel, the request header your proxy guarantees holds the visitor's address (e.g. `cf-connecting-ip` behind Cloudflare). Used for per-address rate limits; per-account sign-in limits don't depend on it. |
+| `STREETVIEW_DAILY_CAP` | Most road-level photos the public estimate page fetches per day, all visitors together (each is billed to the Google key). Default 500. |
+| `ESTIMATE_REQUEST_DAILY_CAP` | Most quote requests the public estimate page accepts per day. Default 200. |
+| `INBOX_SCAN_BUDGET_MS` | How long the dashboard's "Scan now" may run, in ms (default 45 s). Set lower on a host with a shorter limit — Netlify's is 10 s unless raised. |
+| `QBO_SYNC_BUDGET_MS` | How long a manual QuickBooks sync may run before stopping to finish on the next click (default 45 s). |
 
 ## File attachments (up to 1 GB)
 
@@ -128,6 +153,13 @@ the document, which capped them near 4 MB and produced
 
 How a file moves now:
 
+0. A photo over 700 KB (JPEG, WebP or HEIC) is first redrawn in the browser —
+   in a background worker, so the page doesn't freeze — at most 2560 px on its
+   long side and saved as WebP (JPEG where the browser can't write WebP). A
+   phone photo usually comes out a tenth of the size. It is turned upright
+   first, and re-saving drops the camera's EXIF data, including where the photo
+   was taken. PNGs, GIFs, documents, small photos, and anything that wouldn't
+   come out at least 10% smaller go up exactly as they are (`public/imgworker.js`).
 1. The browser asks the app for permission: `POST …/files/upload-url` with the
    name, type and size. The app checks who is asking, records a `pending` row,
    and returns one presigned `PUT` URL per 10 MB part.
@@ -191,9 +223,11 @@ pointing `S3_ENDPOINT` elsewhere.
 Leave the `S3_*` variables blank when running locally and files are kept on disk
 under `.storage/` instead, served through signed app routes — the same three-step
 flow, no cloud account needed. That driver is never used once deployed: a
-serverless filesystem is read-only and wiped between invocations, so a deployed
-site with no bucket configured refuses uploads with a clear message rather than
-pretending to store something.
+serverless filesystem is read-only and wiped between invocations, and a hosted
+server's disk (Render, Railway, Fly) is wiped on every deploy and restart. So a
+deployed site with no bucket configured refuses uploads with a clear message
+rather than pretending to store something. (`STORAGE_DRIVER=local` overrides
+this, for a host with a persistent disk mounted at `STORAGE_DIR`.)
 
 `ATTACH_MAX_BYTES` sets the ceiling (default 1 GB) and is enforced twice: before
 the upload starts, and against the object's true size once it lands.
@@ -216,9 +250,81 @@ never disagree with the numbers underneath it. You set *draft*, *sent* or
 An invoice with payments recorded against it cannot be deleted — void it
 instead. Deleting would erase the record of money that actually came in.
 
+**Create shipment** on an invoice puts the job on the Schedule board under
+**To be scheduled**, with no date, so it is booked on the board like any other
+job. It carries the job site (or billing address), the customer's name and
+phone, what's going, and — when the invoice came from a quote with a drawing —
+the load list and the exact spot on the property. The money (total, paid,
+balance, due date) goes in the internal notes only, which the crew never sees.
+After that the button opens the shipment; **+ Another shipment** covers a split
+delivery.
+
 Line prices come from the **rate book**, which now lives in the database rather
 than in one browser. Rates saved on a device before that change are pushed up
 automatically the first time the Pricing tab loads.
+
+### Satellite estimator
+
+Every quote opens with a **satellite estimator** above the sheet. Type the job
+address, then trace the fence on the aerial photo:
+
+- **Draw a run** with a fence type and height, clicking each corner. Double-click
+  (or press Finish) to end it; clicking back on the first corner closes a loop.
+  Every leg shows its length as you go. Runs of the same fence and height that
+  meet end to end share a post.
+- **+ Gate** drops a walk or double drive gate onto the nearest stretch of fence.
+- Select a run to change its fence or height, mark it **Remove old fence**, drag
+  its corners, or right-click a corner to delete it.
+
+As you draw, the **materials & labor** list builds itself — posts by size,
+rails, pickets, panels, fabric, wire, braces, concrete, hardware and gates, each
+fence type with its own recipe — along with your cost, the price at your
+markups, the price per foot and the margin. Runs on a slope steeper than the
+threshold get extra labor; slope comes from Natural Resources Canada's free
+elevation service (Canada only, no key needed).
+
+**Put on quote** turns it into lines, either one price per foot per fence plus
+one per gate, or every material itemized. Lines it made are tagged, so
+redrawing and putting it on again replaces them without touching lines typed
+by hand. The drawing prints on the quote as a to-scale layout.
+
+What things cost you lives under **Prices…** in the estimator (admin only —
+everyone else can look): material costs, labor per foot and per gate, post
+spacing and depth, concrete per post, markups, waste, target margin, slope and
+tear-out rules. The recipes and starting prices are in `public/takeoff.js`; the
+office's edits are stored over them (`catalog.js`). The server recomputes the
+takeoff on every save, so the cost and margin a quote shows were never just
+what a browser claimed. A request from the public estimate page brings the
+customer's traced line across as the quote's layout.
+
+### Sending, approving and signing
+
+The rail beside the quote shows the **cost, profit and margin** against your
+target, and the customer's side of it:
+
+- **Email quote to customer** opens your email app with a message and the
+  quote's link, and marks the quote sent. **Text link** does the same by SMS;
+  **Copy link** copies it. **Preview customer page** opens what they will see.
+- The link (`/quote?k=…`) is a long random token — no login. The customer sees
+  the quote, the fence drawn on their own property, the totals and deposit, and
+  can download it as a PDF, **approve and sign** it with a finger or mouse, or
+  decline it with a reason. They never see your cost, margin or review.
+- The rail shows when it was **sent, viewed** (office previews don't count) and
+  **signed**. A signed quote shows the signature on the sheet and on the PDF.
+  What they signed for is kept, and the rail warns if the total changes after.
+- A wrong link counts as a failed attempt, so guessing is rate-limited like a
+  bad password. Expired quotes can't be signed. Turning off the Quotes feature
+  closes the links too.
+
+### AI review
+
+**Analyze with AI** checks a quote before it goes out. The arithmetic always
+runs: margin against your target, price against your own rate book, quoted
+footage against the drawing, gates or tear-out drawn but not charged for,
+missing tax or deposit. With `ANTHROPIC_API_KEY` set, Claude then reads the
+whole quote and adds what an estimator would catch, plus up to four sensible
+add-ons you can put on the quote in one click. Without the key, the checks
+still run.
 
 ## Seeing the fence before it's built
 
@@ -445,6 +551,40 @@ the company's whole history.
 
 Turning the switch off in the dashboard leaves the button working and stops the
 scheduled push.
+
+## Speed
+
+The shared pieces live in `public/snappy.js`; each screen uses them.
+
+- **Presses answer at once.** Every button shows it was pressed the moment a
+  finger or mouse lands. With a mouse, navigation (the sidebar tabs, rows that
+  open a record) acts on the press itself rather than the release. A finger
+  still acts on release — on a phone a press is also how a scroll starts.
+  Spinners and "Saving…" labels only appear if a wait passes 150 ms.
+- **Changes show before the server confirms them** where they are easy to undo
+  — moving a job or a task, approving time off, deleting a draft — and are put
+  back, with the reason, if the server says no. Anything to do with money, pay,
+  clocking in and out, or a customer's signature waits for the server.
+- **Copies kept on the device.** Each list is painted from the last copy straight
+  away and replaced if the server's answer differs, so tabs open instantly and a
+  return visit opens on the last known state. The schedule, the quotes and
+  invoices lists, the rate book, tasks and the message board are also kept in the browser's
+  local storage between visits — tagged with the signed-in account and deleted
+  on sign-out, when anyone else signs in, and when the login expires (12 hours).
+  Pay, hours, timesheets, clock-in locations, employee details, QuickBooks and
+  the inbox's emails are only ever held in memory, and the schedule's copy on
+  disk leaves out the office's internal notes.
+- **Fetched ahead.** Resting the pointer on a tab (or touching it) starts
+  loading it, and once the first screen is up the likely next tabs are fetched
+  in the background — never on a phone in data-saver mode or on 2G.
+- **Long lists** come a page at a time (quotes) or draw a screenful at a time
+  (invoices, estimate requests, tasks, bulletins).
+- **Assets.** The map library (Leaflet) and the 3D viewer (three.js) load only
+  on the screens that use them. Pages refer to their scripts and stylesheet as
+  `/v/<content hash>/<file>` (`assets.js`), which browsers keep for a year — a
+  new deploy changes the address of anything that changed. On Netlify the build
+  writes those copies and a `_headers` file; a plain Node server (Render, a
+  laptop) does it on the fly and also compresses responses.
 
 ## Notes
 

@@ -9,6 +9,9 @@
 //   2. PUT each part straight to storage (never through the app)
 //   3. POST <base>/<fileId>/complete with the parts and their ETags
 //
+// If anything after step 1 fails, POST <base>/<fileId>/abort deletes the
+// pending row and whatever parts had already landed.
+//
 // Parts mean a dropped connection on a phone costs one 10 MB part, not the whole
 // gigabyte — which is the difference between "retry" and "give up".
 (function () {
@@ -46,13 +49,91 @@
     });
   }
 
+  // ---- photos are made smaller before they go ----
+  //
+  // A phone photo is 3–12 MB. Anything over SHRINK_OVER is redrawn at most
+  // MAX_EDGE pixels on its long side and saved as WebP (JPEG on a browser that
+  // can't write WebP), usually a tenth of the size: a job's photos go up in
+  // seconds on a crew's mobile data instead of minutes, and open faster for
+  // everyone afterwards. The work happens in a worker (imgworker.js), so the
+  // page never freezes while a 12-megapixel picture is decoded.
+  //
+  // Left exactly as they are: anything that isn't a JPEG, WebP or HEIC photo
+  // (a PNG screenshot keeps its crisp text, a GIF its animation; documents are
+  // never touched), photos that are already small, and anything that fails to
+  // decode or doesn't come out at least a tenth smaller. Re-saving drops the
+  // camera's EXIF data — including where the photo was taken — but never the
+  // way up: see imgworker.js.
+  const SHRINK_OVER = 700 * 1024;
+  const MAX_EDGE = 2560;
+  const QUALITY = 0.82;
+  const PHOTO = /^image\/(jpeg|pjpeg|webp|heic|heif)$/i;
+
+  let worker = null;
+  let workerFailed = false;
+  let asked = 0;
+  const replies = new Map();
+  // Whether this browser turns photos upright while decoding them — learnt
+  // from the first sideways photo, and needed for mirrored/upside-down ones.
+  let turnsUpright;
+
+  function shrinker() {
+    if (worker || workerFailed || typeof Worker !== 'function') return worker;
+    try {
+      worker = new Worker('/imgworker.js');
+      worker.onmessage = (e) => {
+        const done = replies.get(e.data.id);
+        if (done) done(e.data);
+      };
+      worker.onerror = () => {
+        // The worker itself is broken (not one photo): send everything as is.
+        workerFailed = true;
+        worker = null;
+        for (const done of replies.values()) done({ error: 'worker' });
+      };
+    } catch (e) {
+      workerFailed = true;
+      worker = null;
+    }
+    return worker;
+  }
+
+  async function shrink(file) {
+    if (!file || !PHOTO.test(file.type || '') || file.size <= SHRINK_OVER) return file;
+    const w = shrinker();
+    if (!w) return file;
+    const reply = await new Promise((resolve) => {
+      const id = ++asked;
+      // A photo that takes this long to redraw goes up as it is.
+      const timer = setTimeout(() => finish({ error: 'timeout' }), 20000);
+      function finish(msg) {
+        clearTimeout(timer);
+        replies.delete(id);
+        resolve(msg);
+      }
+      replies.set(id, finish);
+      w.postMessage({ id, file, maxEdge: MAX_EDGE, quality: QUALITY, applied: turnsUpright });
+    });
+    if (typeof reply.oriented === 'boolean') turnsUpright = reply.oriented;
+    const blob = reply.blob;
+    if (!blob || blob.size >= file.size * 0.9) return file;
+    const ext = blob.type === 'image/webp' ? '.webp' : '.jpg';
+    const name = (file.name || 'photo').replace(/\.(jpe?g|jfif|pjpeg|webp|heic|heif)$/i, '') + ext;
+    try {
+      return new File([blob], name, { type: blob.type, lastModified: file.lastModified });
+    } catch (e) {
+      return file; // a browser without the File constructor
+    }
+  }
+
   // Upload one File. `base` is the collection endpoint, e.g.
   // "/api/admin/schedules/12/files" or "/api/admin/tasks/3/attachments".
   //
   // onProgress(fraction) is called as bytes land, 0..1.
-  async function upload({ base, file, extra, onProgress }) {
+  async function upload({ base, file: picked, extra, onProgress }) {
     const api = H().api;
     const report = typeof onProgress === 'function' ? onProgress : () => {};
+    const file = await shrink(picked);
 
     // Step 1 — ask permission and get the URLs. The server decides the cap, so a
     // file that is too large is refused here, before a byte moves.
@@ -66,6 +147,25 @@
       }),
     });
 
+    // From here on a pending row exists, maybe with parts in the bucket, and
+    // nothing lists a pending row — so nobody could remove it by hand. Any way
+    // out short of a finished upload (a part that won't go, a completion that
+    // fails or never answers) takes it back down. Abort skips a row that is no
+    // longer pending, so a completion that landed despite the error is kept.
+    try {
+      return await transfer(api, base, file, plan, report);
+    } catch (err) {
+      try {
+        await api(base + '/' + plan.fileId + '/abort', { method: 'POST' });
+      } catch (e) {
+        /* the row is already orphaned; the error that matters is the upload's */
+      }
+      throw err;
+    }
+  }
+
+  // Steps 2 and 3. Throws on any failure and leaves the cleanup to upload().
+  async function transfer(api, base, file, plan, report) {
     const { fileId, partSize, parts } = plan;
     // Bytes confirmed per part, so overall progress stays honest when parts
     // finish out of order.
@@ -121,15 +221,9 @@
       Array.from({ length: Math.min(CONCURRENCY, parts.length) }, () => worker())
     );
 
-    if (failure) {
-      // Don't leave a half-written object behind on the way out.
-      try {
-        await api(base + '/' + fileId + '/abort', { method: 'POST' });
-      } catch (err) {
-        /* the row is already orphaned; the error that matters is the upload's */
-      }
-      throw failure;
-    }
+    // Every worker has stopped by now, so no part is still in flight when
+    // upload() aborts — one landing after the abort would be left behind.
+    if (failure) throw failure;
 
     // Step 3 — the app files the metadata and the attachment becomes visible.
     const meta = await api(base + '/' + fileId + '/complete', {

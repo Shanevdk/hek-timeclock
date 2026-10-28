@@ -17,11 +17,19 @@
   // Auth-aware API helper. A 401 (session expired) bounces back to the login
   // gate; the login request itself surfaces its own error message.
   async function api(path, opts = {}) {
+    // `background` marks a prefetch from snappy.js — a guess at what someone
+    // might open next. It means something here, not to fetch().
+    const { background, ...init } = opts;
     const res = await fetch(path, {
       headers: { 'Content-Type': 'application/json' },
-      ...opts,
+      ...init,
     });
     if (res.status === 401 && path !== '/api/login') {
+      // A guess at the next tab never signs anyone out: their next real
+      // request deals with an expired login the usual way.
+      if (background) throw new Error('Please sign in.');
+      // Everything this device kept for that session goes with it.
+      Snappy.cache.clear();
       showLogin();
       throw new Error('Please sign in.');
     }
@@ -36,8 +44,20 @@
       data = null;
     }
     if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status}).`);
+    // A change went through. Forget every copy read from the same resource, so
+    // no screen paints the state from before it (snappy.js).
+    if ((init.method || 'GET').toUpperCase() !== 'GET') Snappy.cache.dropFor(path);
     if (data === null)
       throw new Error('The server returned an unexpected response. Please refresh the page and sign in again.');
+    return data;
+  }
+
+  // Read `path` again after a change, with a request of its own. Snappy.load()
+  // would join a read already on its way — one sent before the change — and
+  // paint the state the change replaced.
+  async function reread(path, persist) {
+    const data = await api(path);
+    Snappy.cache.put(path, data, persist);
     return data;
   }
 
@@ -52,11 +72,36 @@
       : '—';
 
   // ---- auth / views ----
+  // What /api/me said about who is signed in. This device keeps that answer
+  // (snappy.js), so the next visit opens straight onto their portal while the
+  // server confirms it; meKey() names whose kept copies these are.
+  const ME = '/api/me';
+  const meKey = (d) => 'employee:' + d.id;
+  let appShown = false; // the portal is up for `me`
+  // Sign-ins and sign-outs on this page, so a slower answer to an earlier
+  // "who is signed in?" can't undo one.
+  let authChanges = 0;
+  let tabLoad = null; // the opening tab's load; warming the others waits for it
+  let warmed = false; // the next tabs have been warmed for this sign-in
+
+  // quotes.js, schedule.js and the rest load after this file. The portal can
+  // open before they're in; whatever needs one of them waits for this.
+  const ready = new Promise((resolve) => {
+    if (document.readyState === 'loading')
+      document.addEventListener('DOMContentLoaded', () => resolve(), { once: true });
+    else resolve();
+  });
+
   function showLogin() {
+    appShown = false;
+    me = null;
+    warmed = false;
+    closeClockModal(); // never left open over the sign-in form
     $('app').style.display = 'none';
     $('loginView').style.display = 'block';
   }
   function showApp() {
+    appShown = true;
     $('loginView').style.display = 'none';
     $('app').style.display = 'block';
     applyPermissions();
@@ -68,10 +113,13 @@
       back.click();
     } else {
       showTab('hours');
-      loadMyHours().catch((e) => alert(e.message));
+      tabLoad = loadMyHours().catch(report);
     }
     refreshMessageCount();
-    refreshClock();
+    // Asked of the server every time, never painted from a kept copy: what the
+    // clock button says has to be true now.
+    refreshClock(true);
+    warmNextTabs();
   }
 
   // Show/hide feature nav based on the granted permissions. Hours, messages,
@@ -84,8 +132,11 @@
     pricing: 'navPricing',
     map: 'navMap',
   };
+  // Returns true when the tab on screen was one of those taken away, and they
+  // have been moved to their hours.
   function applyPermissions() {
     const perms = (me && me.permissions) || [];
+    let moved = false;
     Object.entries(GATED_TABS).forEach(([perm, navId]) => {
       const nav = $(navId);
       if (!nav) return;
@@ -102,10 +153,12 @@
           if (hours) hours.classList.add('active');
           const hoursSec = $('tab-hours');
           if (hoursSec) hoursSec.classList.add('active');
+          moved = true;
         }
       }
     });
     syncNavGroups();
+    return moved;
   }
 
   // A heading with nothing under it is worse than no heading, so a group whose
@@ -130,30 +183,109 @@
   $('email').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 
   async function doLogin() {
+    const btn = $('loginBtn');
+    if (btn.disabled) return; // Enter pressed again while the first try is on its way
     $('loginMsg').textContent = '';
+    let r;
     try {
-      const r = await api('/api/login', {
-        method: 'POST',
-        body: JSON.stringify({ email: $('email').value, password: $('pw').value }),
-      });
-      $('pw').value = '';
-      if (r.role === 'admin') {
-        window.location = r.redirect || '/';
-        return;
-      }
-      me = r;
-      showApp();
+      // The button answers the press at once; "Signing in…" and its spinner
+      // only appear if the server is slow to.
+      r = await Snappy.busy(
+        btn,
+        () =>
+          api('/api/login', {
+            method: 'POST',
+            body: JSON.stringify({ email: $('email').value, password: $('pw').value }),
+          }),
+        { label: 'Signing in…' }
+      );
     } catch (e) {
       $('loginMsg').textContent = e.message;
+      return;
     }
+    // A shared device: whoever was signed in here before, everything kept for
+    // them goes before anything of this person's is shown.
+    Snappy.cache.clear();
+    const turn = ++authChanges;
+    $('pw').value = '';
+    if (r.role === 'admin') {
+      window.location = r.redirect || '/';
+      return;
+    }
+    // The sign-in answer says who this is and when the login runs out, just as
+    // /api/me would: take it as that, and open the portal on it.
+    if (r.session_expires) {
+      me = null;
+      confirmMe(r);
+      return;
+    }
+    // A server that doesn't say when the login ends: copies can only be kept on
+    // this device until then, so ask /api/me, which does.
+    me = r;
+    showApp();
+    api(ME)
+      .then((d) => {
+        if (turn === authChanges) confirmMe(d);
+      })
+      .catch(() => {});
   }
 
-
   $('logoutBtn').addEventListener('click', async () => {
+    authChanges++;
+    // Nothing kept on this device outlives the session it was kept for.
+    Snappy.cache.clear();
     await api('/api/logout', { method: 'POST' }).catch(() => {});
     me = null;
     showLogin();
   });
+
+  // The server's word on who is signed in: at boot, and after a sign-in.
+  function confirmMe(d) {
+    if (d.role === 'admin') {
+      // This browser is signed in to the dashboard instead; nothing an
+      // employee left on it belongs there.
+      Snappy.cache.clear();
+      window.location = d.redirect || '/';
+      return;
+    }
+    if (d.role !== 'employee') {
+      // Signed out, or never signed in: nothing kept may outlive that.
+      Snappy.cache.clear();
+      showLogin();
+      return;
+    }
+    if (me && meKey(me) !== meKey(d)) {
+      // Someone else has signed in on this device since that copy was kept —
+      // in another tab, say. Start over rather than leave their screens up.
+      me = null;
+      appShown = false;
+      Snappy.cache.clear();
+      window.location.reload();
+      return;
+    }
+    Snappy.cache.identify(meKey(d), d.session_expires);
+    Snappy.cache.put(ME, d, true);
+    const before = me;
+    me = d;
+    if (!appShown) return showApp();
+    // Already open on the kept copy: re-apply only what changed.
+    if (shapeOf(before) !== shapeOf(d)) reapply();
+  }
+
+  // What about the signed-in employee shapes the screen.
+  const shapeOf = (m) =>
+    JSON.stringify([m.name, m.email, [...(m.permissions || [])].sort(), m.can_clock]);
+
+  // A permission granted or taken away, or a new name, since the kept copy the
+  // portal opened on.
+  function reapply() {
+    $('sideUser').textContent = me && me.name ? me.name : '';
+    if (applyPermissions()) {
+      // The tab on screen went away with it; they're on their hours now.
+      rememberTab('hours');
+      loadMyHours().catch(report);
+    }
+  }
 
   // ---- mobile popout menu ----
   // On a phone the sidebar slides off-canvas; the top bar's hamburger brings it
@@ -206,49 +338,182 @@
     if (tab && !tab.classList.contains('active')) tab.click();
   });
 
+  // The switch itself — which tab is lit, which section shows, the phone menu
+  // closing — happens first and all at once, before anything is asked of the
+  // server. Then the tab loads, painting a kept copy straight away if there
+  // is one.
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => {
-      rememberTab(t.dataset.tab);
-      showTab(t.dataset.tab);
-      if (t.dataset.tab === 'hours') loadMyHours().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'messages') openMessages().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'schedule' && window.Schedule) window.Schedule.loadMine();
-      if (t.dataset.tab === 'timeoff') loadMyVacations().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'quotes' && window.Quotes) window.Quotes.load();
-      if (t.dataset.tab === 'tasks') loadMyTasks().catch((e) => alert(e.message));
-      if (t.dataset.tab === 'map') openMap().catch((e) => alert(e.message));
+      const name = t.dataset.tab;
+      rememberTab(name);
+      showTab(name);
       setMenu(false); // close the popout after choosing a tab
+      tabLoad = loadTab(name);
     });
   });
+
+  // A tab that failed to load says so, the way each tab always has — except
+  // once they've been signed out, which can now happen while a tab opened from
+  // a kept copy is still loading.
+  function report(e) {
+    if (appShown) alert(e.message);
+  }
+
+  // What opening a tab loads. Resolves once its data is in.
+  function loadTab(name) {
+    if (name === 'hours') return loadMyHours().catch(report);
+    if (name === 'messages') return openMessages().catch(report);
+    if (name === 'timeoff') return loadMyVacations().catch(report);
+    if (name === 'tasks') return loadMyTasks().catch(report);
+    if (name === 'map') return openMap().catch(report);
+    if (name === 'schedule' || name === 'quotes') {
+      const mod = name === 'schedule' ? window.Schedule : window.Quotes;
+      if (!mod) {
+        // Opened from a kept copy before that tab's file is in: load it as
+        // soon as it is, if the tab is still the one on screen.
+        if (document.readyState === 'loading')
+          return ready.then(() => (isOpen(name) ? loadTab(name) : null));
+        return null;
+      }
+      return name === 'schedule' ? mod.loadMine() : mod.load();
+    }
+    return null;
+  }
+
+  // ---- getting ahead of the next tab ----
+  // A tab's data is asked for the moment someone shows interest in it — a
+  // mouse resting on it, keyboard focus, a finger landing — so it's usually
+  // here by the time the tab opens. Reads only, and a warm-up that meets an
+  // expired login never signs anyone out (see `background` in api()).
+  function prefetchTab(name) {
+    if (!me) return;
+    if (name === 'hours') Snappy.prefetch(api, hoursPath());
+    else if (name === 'messages') Snappy.prefetch(api, BULLETINS, { persist: true });
+    else if (name === 'timeoff') Snappy.prefetch(api, MY_VACATIONS);
+    else if (name === 'tasks') {
+      if (can('tasks')) Snappy.prefetch(api, MY_TASKS, { persist: true });
+    } else if (name === 'map') {
+      if (!can('map')) return;
+      Snappy.prefetch(api, myMapPath());
+      Snappy.leaflet().catch(() => {});
+    } else if (name === 'quotes') {
+      if (can('quotes') && window.Quotes && window.Quotes.prefetch) window.Quotes.prefetch();
+    } else if (name === 'schedule') {
+      // The read schedule.js's loadMine() makes, warmed from here rather than
+      // through Schedule.prefetch(): an admin-only read is always refused on
+      // this page, so nothing here should risk asking for one.
+      Snappy.prefetch(api, '/api/my/schedules');
+    }
+    // Pricing: nothing to warm. Its rate book is an admin-only read.
+  }
+  Snappy.intent(document.querySelector('.side-nav'), '.tab', (t) => prefetchTab(t.dataset.tab));
+
+  const tabShown = (name) => {
+    const t = document.querySelector('.side-nav .tab[data-tab="' + name + '"]');
+    return !!t && t.style.display !== 'none';
+  };
+  const isOpen = (name) => {
+    const sec = $('tab-' + name);
+    return !!sec && sec.classList.contains('active');
+  };
+
+  // Once the first tab has its data, warm the likeliest next few while the
+  // portal sits idle: one at a time, a second apart, so they never crowd the
+  // screen being looked at. Then the map library, when there's a map or a
+  // quote site plan to draw.
+  function warmNextTabs() {
+    if (warmed) return;
+    warmed = true;
+    const steps = ['schedule', 'messages', 'timeoff', 'tasks', 'quotes', 'hours']
+      .filter((name) => tabShown(name) && !isOpen(name))
+      .slice(0, 4)
+      .map((name) => () => prefetchTab(name));
+    // The map library ahead of time, unless the device is saving data.
+    if ((can('map') || can('quotes')) && !Snappy.quiet())
+      steps.push(() => Snappy.leaflet().catch(() => {}));
+    const next = () => {
+      const step = steps.shift();
+      if (!step || !me) return; // done, or they've signed out meanwhile
+      step();
+      setTimeout(() => Snappy.idle(next), 1000);
+    };
+    Promise.resolve(tabLoad)
+      .catch(() => {})
+      .then(() => Snappy.idle(next));
+  }
 
   // ---- map ("map" permission): their own clock-in pins ----
   let map = null;
   let mapMarkers = [];
+  let mapBuilding = null; // the map on its way while Leaflet loads
+  let mapSeq = 0;
 
+  // Create the Leaflet map the first time it's needed. Leaflet itself arrives
+  // with the first map opened (snappy.js), not with the sign-in page. Rejects
+  // when it can't load — offline, say — and the next call tries again.
   function ensureMap() {
-    if (map) return map;
-    if (!window.L) return null; // Leaflet didn't load (offline) — handled by the caller
-    map = L.map('map').setView([43.65, -79.38], 8); // default view: southern Ontario
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '© OpenStreetMap contributors',
-    }).addTo(map);
-    return map;
+    if (map) return Promise.resolve(map);
+    if (!mapBuilding)
+      mapBuilding = Snappy.leaflet()
+        .then((L) => {
+          $('map').innerHTML = ''; // a "couldn't load" note from an earlier try
+          map = L.map('map').setView([43.65, -79.38], 8); // default view: southern Ontario
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors',
+          }).addTo(map);
+          return map;
+        })
+        .finally(() => {
+          mapBuilding = null;
+        });
+    return mapBuilding;
+  }
+
+  // Said where the map should be, so the empty box explains itself.
+  function mapUnavailable() {
+    if (!map && $('map'))
+      $('map').innerHTML =
+        '<p class="status-sub" style="padding:22px;margin:0">The map couldn’t load — check ' +
+        'the internet connection, then open this tab again.</p>';
   }
 
   async function openMap() {
     if (!can('map')) return;
-    if (!ensureMap()) return alert('Map could not load (no internet?).');
-    setTimeout(() => map.invalidateSize(), 0); // the section was hidden until now
+    try {
+      await ensureMap();
+    } catch (e) {
+      return mapUnavailable();
+    }
+    // Leaflet can take a moment the first time. Carry on only if the map is
+    // still the tab on screen; opening it again picks up from here.
+    if (!isOpen('map')) return;
+    // The section was hidden until now: size the map before anything is
+    // drawn, and once more after this frame in case the layout was settling.
+    map.invalidateSize();
+    setTimeout(() => map.invalidateSize(), 0);
     await loadMap();
   }
 
-  async function loadMap() {
-    if (!map) return;
+  function myMapPath() {
     const p = new URLSearchParams();
     if ($('mapFrom').value) p.set('from', $('mapFrom').value);
     if ($('mapTo').value) p.set('to', $('mapTo').value);
-    const rows = await api('/api/my/locations?' + p.toString());
+    return '/api/my/locations?' + p.toString();
+  }
+
+  // Their pins for the range picked: the last copy at once, then the server's
+  // answer if it differs. Kept in memory only — where someone clocked in never
+  // goes to disk.
+  async function loadMap() {
+    if (!map) return;
+    const seq = ++mapSeq;
+    await Snappy.swr(api, myMapPath(), (rows) => {
+      if (seq === mapSeq) drawMyMap(rows); // not over a range picked since
+    });
+  }
+
+  function drawMyMap(rows) {
     mapMarkers.forEach((m) => map.removeLayer(m));
     mapMarkers = [];
     $('mapEmpty').style.display = rows.length ? 'none' : 'block';
@@ -256,7 +521,7 @@
     const bounds = [];
     rows.forEach((r) => {
       const mk = L.circleMarker([r.lat, r.lng], {
-        radius: 8, color: '#a97f43', fillColor: '#c89b5c', fillOpacity: 0.9, weight: 2,
+        radius: 8, color: '#ac7d3f', fillColor: '#c3965a', fillOpacity: 0.9, weight: 2,
       }).addTo(map);
       mk.bindPopup('<b>' + esc(r.name) + '</b><br>' + fmtDateTime(r.clock_in));
       mapMarkers.push(mk);
@@ -264,24 +529,63 @@
     });
     map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
   }
-  $('mapLoad').addEventListener('click', () => loadMap().catch((e) => alert(e.message)));
+  $('mapLoad').addEventListener('click', () =>
+    Snappy.busy($('mapLoad'), async () => {
+      // Also the way to try again after the map library failed to load.
+      try {
+        await ensureMap();
+      } catch (e) {
+        return mapUnavailable();
+      }
+      await loadMap();
+    }).catch((e) => alert(e.message))
+  );
 
   // ---- my tasks ("tasks" permission) ----
   // A plain list of what's assigned to them rather than the admin's kanban:
   // they can move a card along and comment, but not reshape the board.
   const TASK_COLS = { todo: 'To Do', in_progress: 'In Progress', done: 'Done' };
   const TASK_PRIOS = { low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent' };
+  const MY_TASKS = '/api/my/tasks';
+  let tasksSeq = 0;
+  let taskMoves = 0; // status changes still on their way to the server
 
-  async function loadMyTasks() {
+  // The last copy at once — kept on this device too, so the next visit opens
+  // with their tasks already there — then the server's answer if it differs.
+  // `afterChange` reads afresh once a change has gone through.
+  async function loadMyTasks(afterChange) {
     if (!can('tasks')) return;
-    const d = await api('/api/my/tasks');
+    const seq = ++tasksSeq;
+    const draw = (d) => {
+      if (seq === tasksSeq) renderMyTasks(d); // not over a newer read
+    };
+    if (afterChange) return draw(await reread(MY_TASKS, true));
+    await Snappy.swr(api, MY_TASKS, draw, { persist: true });
+  }
+
+  // "3 open · 5 total", from the cards as they stand.
+  function countMyTasks() {
+    const sels = [...$('mtList').querySelectorAll('.mt-status')];
+    const open = sels.filter((s) => s.value !== 'done').length;
+    $('mtCount').textContent = sels.length ? open + ' open · ' + sels.length + ' total' : '';
+  }
+
+  function renderMyTasks(d) {
     const tasks = d.tasks || [];
-    const open = tasks.filter((t) => t.status !== 'done').length;
-    $('mtCount').textContent = tasks.length
-      ? open + ' open · ' + tasks.length + ' total'
-      : '';
+    const box = $('mtList');
+    // A newer copy can arrive while they're writing a comment: what they've
+    // typed, and where the cursor was, survive the redraw.
+    const typed = {};
+    box.querySelectorAll('.mt-comment-in').forEach((el) => {
+      if (el.value) typed[el.dataset.task] = el.value;
+    });
+    const a = document.activeElement;
+    const focus =
+      a && box.contains(a) && a.classList.contains('mt-comment-in')
+        ? { task: a.dataset.task, from: a.selectionStart, to: a.selectionEnd }
+        : null;
     $('mtEmpty').style.display = tasks.length ? 'none' : 'block';
-    $('mtList').innerHTML = tasks
+    box.innerHTML = tasks
       .map(
         (t) => `<div class="card mt-card${t.status === 'done' ? ' mt-done' : ''}" data-task="${t.id}">
           <div class="mt-head">
@@ -296,7 +600,7 @@
           </div>
           <div class="mt-actions">
             <label>Status</label>
-            <select class="mt-status" data-task="${t.id}">
+            <select class="mt-status" data-task="${t.id}" data-status="${esc(t.status)}">
               ${Object.entries(TASK_COLS)
                 .map(
                   ([k, name]) =>
@@ -322,21 +626,60 @@
         </div>`
       )
       .join('');
+    countMyTasks();
+    const input = (task) => box.querySelector('.mt-comment-in[data-task="' + task + '"]');
+    Object.keys(typed).forEach((task) => {
+      const el = input(task);
+      if (el) el.value = typed[task];
+    });
+    const el = focus && input(focus.task);
+    if (el) {
+      el.focus();
+      try {
+        el.setSelectionRange(focus.from, focus.to);
+      } catch (e) {
+        /* the caret simply lands at the end */
+      }
+    }
   }
 
+  // Moving a card along shows at once: it fades when done, and the count
+  // above changes. If the server refuses, it goes back where it was.
   $('mtList').addEventListener('change', async (e) => {
     const sel = e.target.closest('.mt-status');
     if (!sel) return;
+    const card = sel.closest('.mt-card');
+    const was = sel.dataset.status;
+    const now = sel.value;
+    const show = (status) => {
+      sel.value = status;
+      sel.dataset.status = status;
+      if (card) card.classList.toggle('mt-done', status === 'done');
+      countMyTasks();
+    };
+    taskMoves++;
     try {
-      await api('/api/my/tasks/' + sel.dataset.task, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: sel.value }),
-      });
-      await loadMyTasks();
+      await Snappy.optimistic(
+        () => {
+          show(now);
+          // No kept copy may paint the old status meanwhile.
+          Snappy.cache.drop(MY_TASKS);
+          return () => show(was);
+        },
+        () =>
+          api('/api/my/tasks/' + sel.dataset.task, {
+            method: 'PATCH',
+            body: JSON.stringify({ status: now }),
+          })
+      );
     } catch (err) {
       alert(err.message);
-      await loadMyTasks(); // put the dropdown back where it was
+    } finally {
+      taskMoves--;
     }
+    // Then the server's own list, kept for next time — once every move made
+    // meanwhile has landed too, so none of them is drawn as it was.
+    if (!taskMoves) loadMyTasks(true).catch(() => {});
   });
 
   $('mtList').addEventListener('click', async (e) => {
@@ -344,18 +687,20 @@
     if (!btn) return;
     const input = $('mtList').querySelector('.mt-comment-in[data-task="' + btn.dataset.task + '"]');
     if (!input || !input.value.trim()) return;
-    btn.disabled = true;
     try {
-      await api('/api/my/tasks/' + btn.dataset.task + '/comment', {
-        method: 'POST',
-        body: JSON.stringify({ text: input.value }),
-      });
-      await loadMyTasks();
+      // Disabled at once so it can't post twice; the spinner only if it's slow.
+      await Snappy.busy(btn, () =>
+        api('/api/my/tasks/' + btn.dataset.task + '/comment', {
+          method: 'POST',
+          body: JSON.stringify({ text: input.value }),
+        })
+      );
     } catch (err) {
       alert(err.message);
-    } finally {
-      btn.disabled = false;
+      return;
     }
+    input.value = ''; // posted, so not something to carry through the redraw
+    await loadMyTasks(true).catch((err) => alert(err.message));
   });
 
   // ---- my hours ----
@@ -388,8 +733,25 @@
       : '';
   };
 
-  async function loadMyHours() {
-    const data = await api('/api/my/timesheet?' + buildQuery());
+  function hoursPath() {
+    return '/api/my/timesheet?' + buildQuery();
+  }
+  let hoursSeq = 0;
+
+  // Their hours for the range picked: a range read before paints at once, then
+  // again if the server's answer differs. Kept in memory only — hours are pay,
+  // and never go to disk. `afterChange` reads afresh after a punch.
+  async function loadMyHours(afterChange) {
+    const seq = ++hoursSeq;
+    const path = hoursPath();
+    const draw = (data) => {
+      if (seq === hoursSeq) renderMyHours(data); // not over a range picked since
+    };
+    if (afterChange) return draw(await reread(path));
+    await Snappy.swr(api, path, draw);
+  }
+
+  function renderMyHours(data) {
     const entries = data.entries || [];
     $('myTotal').textContent = (data.totalHours || 0).toFixed(2);
     $('myEntries').textContent = entries.length;
@@ -416,7 +778,9 @@
       .join('');
   }
 
-  $('myLoad').addEventListener('click', () => loadMyHours().catch((e) => alert(e.message)));
+  $('myLoad').addEventListener('click', () =>
+    Snappy.busy($('myLoad'), () => loadMyHours()).catch((e) => alert(e.message))
+  );
 
   // ---- messages (bulletin board) ----
   const md = (s) => (window.mdToHtml ? window.mdToHtml(s) : esc(s));
@@ -438,18 +802,28 @@
       .join('');
   }
 
+  // The board is kept on this device as well as in memory, so the next visit
+  // opens with the unread badge, and the messages, already there.
+  const BULLETINS = '/api/my/bulletins';
+
+  function showMessageCount(data) {
+    const nav = $('navMessages');
+    if (nav) nav.style.display = '';
+    const badge = $('msgNavCount');
+    if (!badge) return;
+    // Whatever is on the board counts as read once it's open on screen.
+    const n = isOpen('messages') ? 0 : data.unread || 0;
+    badge.textContent = n;
+    badge.style.display = n ? 'inline-block' : 'none';
+  }
+
   // Update the unread badge (and hide the tab entirely if the board feature is
   // switched off for this org). Runs on load without opening the tab.
-  async function refreshMessageCount() {
+  // `afterChange` reads afresh once read marks have gone through.
+  async function refreshMessageCount(afterChange) {
     try {
-      const data = await api('/api/my/bulletins');
-      const nav = $('navMessages');
-      if (nav) nav.style.display = '';
-      const badge = $('msgNavCount');
-      if (badge) {
-        badge.textContent = data.unread || 0;
-        badge.style.display = data.unread ? 'inline-block' : 'none';
-      }
+      if (afterChange) showMessageCount(await reread(BULLETINS, true));
+      else await Snappy.swr(api, BULLETINS, showMessageCount, { persist: true });
     } catch (e) {
       // Feature turned off (403) or another error — hide the tab quietly.
       const nav = $('navMessages');
@@ -457,18 +831,31 @@
     }
   }
 
-  // Open the board: show the messages and mark any unread ones as read.
+  // Open the board: show the messages and mark any unread ones as read. The
+  // badge clears the moment the board is on screen; the read marks go to the
+  // server in the background, and nothing waits for them.
   async function openMessages() {
-    const data = await api('/api/my/bulletins');
-    const list = data.bulletins || [];
-    renderMessages(list);
-    const unread = list.filter((b) => !b.read);
-    if (unread.length) {
-      await Promise.all(
-        unread.map((b) => api('/api/my/bulletins/' + b.id + '/read', { method: 'POST' }).catch(() => {}))
-      );
-      await refreshMessageCount();
-    }
+    const data = await Snappy.swr(
+      api,
+      BULLETINS,
+      (d) => {
+        renderMessages(d.bulletins || []);
+        showMessageCount(d);
+      },
+      { persist: true }
+    );
+    const unread = (data.bulletins || []).filter((b) => !b.read);
+    if (!unread.length) return;
+    // No kept copy may bring the badge back before the marks land.
+    Snappy.cache.update(BULLETINS, (d) => {
+      (d.bulletins || []).forEach((b) => {
+        b.read = true;
+      });
+      d.unread = 0;
+    });
+    Promise.all(
+      unread.map((b) => api('/api/my/bulletins/' + b.id + '/read', { method: 'POST' }).catch(() => {}))
+    ).then(() => refreshMessageCount(true));
   }
 
   // ---- in-app clock (Clock in / Clock out) ----
@@ -478,7 +865,13 @@
   // `jobs` are the scheduled jobs for `day` (the day a clock-out would be
   // recorded against). The server decides that day, so the browser's own
   // timezone can't disagree about which one it is.
-  let clock = { canClock: true, clockedIn: false, since: null, missed: null, day: null, jobs: [] };
+  const CLOCK_UNKNOWN = { canClock: true, clockedIn: false, since: null, missed: null, day: null, jobs: [] };
+  let clock = { ...CLOCK_UNKNOWN };
+  // Whether `clock` is the server's answer for whoever is signed in now, and
+  // that answer while it's on its way.
+  let clockKnown = false;
+  let clockCheck = null;
+  let clockSeq = 0;
   let nowTimer = null;
   let lastOutBoundary = null; // quarter-hour the clock-out picker was built for
 
@@ -503,6 +896,9 @@
     if ($('cmShopWrap').style.display === 'none') return 0;
     return (Number($('cmShop').value) || 0) - (Number($('cmLunch').value) || 0);
   }
+
+  // The longest shift a missed clock-out can record (the server enforces it too).
+  const MAX_SHIFT_MS = 24 * 60 * 60 * 1000;
 
   // 'YYYY-MM-DDTHH:mm' in local time — the format <input type="datetime-local">
   // expects (toISOString would shift the value into UTC).
@@ -557,21 +953,37 @@
         : 'Not clocked in';
   }
 
-  async function refreshClock() {
-    try {
-      const s = await api('/api/my/clock-status');
-      clock = {
-        canClock: s.canClock !== false,
-        clockedIn: !!s.clockedIn,
-        since: s.since || null,
-        missed: s.missed || null,
-        day: s.day || null,
-        jobs: Array.isArray(s.jobs) ? s.jobs : [],
-      };
+  // What the clock buttons say comes from the server every time, never from a
+  // kept copy. `fresh` (at sign-in) starts from not knowing: the buttons take
+  // their plain "Clock In" look, and the line under them says it's checking —
+  // shown only if the answer takes long enough to be worth saying (.wait).
+  function refreshClock(fresh) {
+    const seq = ++clockSeq;
+    if (fresh) {
+      clockKnown = false;
+      clock = { ...CLOCK_UNKNOWN };
       renderClockWidget();
-    } catch (e) {
-      $('clockStatus').textContent = '';
+      $('clockStatus').innerHTML = '<span class="wait">Checking the clock…</span>';
     }
+    clockCheck = (async () => {
+      try {
+        const s = await api('/api/my/clock-status');
+        if (seq !== clockSeq) return; // a newer check (another sign-in, say) has the say
+        clock = {
+          canClock: s.canClock !== false,
+          clockedIn: !!s.clockedIn,
+          since: s.since || null,
+          missed: s.missed || null,
+          day: s.day || null,
+          jobs: Array.isArray(s.jobs) ? s.jobs : [],
+        };
+        clockKnown = true;
+        renderClockWidget();
+      } catch (e) {
+        if (seq === clockSeq) $('clockStatus').textContent = '';
+      }
+    })();
+    return clockCheck;
   }
 
   // 'HH:MM' in the browser's local time.
@@ -690,8 +1102,13 @@
     return [...document.querySelectorAll('.cm-job-cb:checked')].map((cb) => Number(cb.value));
   }
 
-  function openClockModal() {
+  async function openClockModal() {
     setMenu(false); // the button lives in the drawer on a phone — get it out of the way
+    // Which form this is depends on whether they're on the clock. That answer
+    // is normally long in, and then the modal opens on the press itself; just
+    // after signing in it can still be on its way, and the form waits for it
+    // rather than guess.
+    if (!clockKnown && clockCheck) await clockCheck;
     const missed = clock.missed;
     const inNow = clock.clockedIn;
     $('cmTitle').textContent = missed ? 'Missed Clock Out' : inNow ? 'Clock Out' : 'Clock In';
@@ -711,8 +1128,12 @@
       const start = new Date(missed.clockIn);
       const end = new Date(start);
       end.setHours(17, 0, 0, 0); // a sensible default: 5pm that day
+      // A shift can't run past a day, nor finish in the future (the server
+      // says the same).
+      const latest = new Date(Math.min(start.getTime() + MAX_SHIFT_MS, Date.now()));
       $('cmMissedOut').min = toLocalInput(start);
-      $('cmMissedOut').value = toLocalInput(end > start ? end : start);
+      $('cmMissedOut').max = toLocalInput(latest);
+      $('cmMissedOut').value = toLocalInput(end > start ? (end < latest ? end : latest) : start);
       $('cmMissedReason').value = '';
     }
     $('cmRemarksLabel').textContent = missed
@@ -781,53 +1202,66 @@
     };
   }
 
+  // A punch is pay, so it is never shown as done before the server confirms
+  // it. The button is disabled the moment it's pressed, so it can't punch
+  // twice; its spinner shows only if the wait passes 150 ms — finding their
+  // location on the way in can take a few seconds.
   async function confirmClock() {
     $('cmMsg').textContent = '';
-    const btn = $('cmConfirm');
-    btn.disabled = true;
     try {
-      if (clock.missed) {
-        await api('/api/my/resolve-missed', {
-          method: 'POST',
-          body: JSON.stringify({
-            punchId: clock.missed.punchId,
-            clockOut: $('cmMissedOut').value,
-            workDone: $('cmRemarks').value,
-            reason: $('cmMissedReason').value,
-            jobIds: selectedJobIds(),
-            ...extraFields(),
-          }),
-        });
-      } else if (clock.clockedIn) {
-        const out = chosenOut();
-        await api('/api/my/clock-out', {
-          method: 'POST',
-          body: JSON.stringify({
-            remarks: $('cmRemarks').value,
-            jobIds: selectedJobIds(),
-            clockOut: out ? out.toISOString() : null,
-            ...extraFields(),
-          }),
-        });
-      } else {
-        const loc = await getLocation();
-        await api('/api/my/clock-in', {
-          method: 'POST',
-          body: JSON.stringify({
-            remarks: $('cmRemarks').value,
-            lat: loc ? loc.lat : null,
-            lng: loc ? loc.lng : null,
-          }),
-        });
-      }
-      closeClockModal();
-      await refreshClock();
-      // Keep the hours view current if they're looking at it.
-      loadMyHours().catch(() => {});
+      await Snappy.busy($('cmConfirm'), punch);
     } catch (e) {
       $('cmMsg').textContent = e.message;
-    } finally {
-      btn.disabled = false;
+      return;
+    }
+    closeClockModal();
+    // The punch changed their hours, and clocking in may have added a pin.
+    Snappy.cache.drop('/api/my/timesheet');
+    Snappy.cache.drop('/api/my/locations');
+    await refreshClock();
+    // Keep the hours view current if they're looking at it.
+    loadMyHours(true).catch(() => {});
+  }
+
+  // The request itself, whichever of the three forms is open.
+  async function punch() {
+    if (clock.missed) {
+      // The box holds a time on this phone's clock with no zone attached;
+      // send the instant it means, as the regular clock-out does.
+      const finish = new Date($('cmMissedOut').value);
+      if (!$('cmMissedOut').value || isNaN(finish)) throw new Error('Enter the time you finished.');
+      await api('/api/my/resolve-missed', {
+        method: 'POST',
+        body: JSON.stringify({
+          punchId: clock.missed.punchId,
+          clockOut: finish.toISOString(),
+          workDone: $('cmRemarks').value,
+          reason: $('cmMissedReason').value,
+          jobIds: selectedJobIds(),
+          ...extraFields(),
+        }),
+      });
+    } else if (clock.clockedIn) {
+      const out = chosenOut();
+      await api('/api/my/clock-out', {
+        method: 'POST',
+        body: JSON.stringify({
+          remarks: $('cmRemarks').value,
+          jobIds: selectedJobIds(),
+          clockOut: out ? out.toISOString() : null,
+          ...extraFields(),
+        }),
+      });
+    } else {
+      const loc = await getLocation();
+      await api('/api/my/clock-in', {
+        method: 'POST',
+        body: JSON.stringify({
+          remarks: $('cmRemarks').value,
+          lat: loc ? loc.lat : null,
+          lng: loc ? loc.lng : null,
+        }),
+      });
     }
   }
 
@@ -858,8 +1292,21 @@
   const voStatusBadge = (st) =>
     `<span class="badge status-${st}">${st}</span>`;
 
-  async function loadMyVacations() {
-    const data = await api('/api/my/vacations');
+  // Their requests: the last copy at once, then the server's answer if it
+  // differs. Kept in memory only. `afterChange` reads afresh once a request
+  // has been sent or cancelled.
+  const MY_VACATIONS = '/api/my/vacations';
+  let voSeq = 0;
+  async function loadMyVacations(afterChange) {
+    const seq = ++voSeq;
+    const draw = (data) => {
+      if (seq === voSeq) renderMyVacations(data); // not over a newer read
+    };
+    if (afterChange) return draw(await reread(MY_VACATIONS));
+    await Snappy.swr(api, MY_VACATIONS, draw);
+  }
+
+  function renderMyVacations(data) {
     const rows = data.requests || [];
     $('voEmpty').style.display = rows.length ? 'none' : 'block';
     $('voBody').innerHTML = rows
@@ -886,32 +1333,66 @@
   $('voSubmit').addEventListener('click', async () => {
     $('voMsg').textContent = '';
     try {
-      await api('/api/my/vacations', {
-        method: 'POST',
-        body: JSON.stringify({
-          start_date: $('voFrom').value,
-          end_date: $('voTo').value,
-          reason: $('voReason').value,
-        }),
-      });
-      $('voReason').value = '';
-      await loadMyVacations();
+      // Disabled at once so it can't be sent twice; "Sending…" and a spinner
+      // only if the server is slow. It comes back with the new request listed.
+      await Snappy.busy(
+        $('voSubmit'),
+        async () => {
+          await api('/api/my/vacations', {
+            method: 'POST',
+            body: JSON.stringify({
+              start_date: $('voFrom').value,
+              end_date: $('voTo').value,
+              reason: $('voReason').value,
+            }),
+          });
+          $('voReason').value = '';
+          await loadMyVacations(true);
+        },
+        { label: 'Sending…' }
+      );
     } catch (e) {
       $('voMsg').textContent = e.message;
     }
   });
 
+  // Cancelling takes the request off the list at once. If the server refuses
+  // (it was decided meanwhile, say), it comes back and they're told why.
   $('voBody').addEventListener('click', async (ev) => {
     const btn = ev.target.closest('.vo-cancel');
     if (!btn) return;
     if (!confirm('Cancel this vacation request?')) return;
+    const id = btn.dataset.id;
     try {
-      await api('/api/my/vacations/' + btn.dataset.id, { method: 'DELETE' });
-      await loadMyVacations();
+      await Snappy.optimistic(
+        () => dropVacationRow(btn.closest('tr'), id),
+        () => api('/api/my/vacations/' + id, { method: 'DELETE' })
+      );
     } catch (e) {
       alert(e.message);
     }
+    // Then the server's own list, either way.
+    loadMyVacations(true).catch(() => {});
   });
+
+  // The row leaves the list, and the kept copy with it, so a quick return to
+  // this tab can't bring it back. Returns what puts it back.
+  function dropVacationRow(row, id) {
+    const body = $('voBody');
+    const next = row.nextElementSibling;
+    const empty = $('voEmpty').style.display;
+    row.remove();
+    if (!body.children.length) $('voEmpty').style.display = 'block';
+    Snappy.cache.update(MY_VACATIONS, (d) => {
+      d.requests = (d.requests || []).filter((r) => String(r.id) !== String(id));
+    });
+    return () => {
+      body.insertBefore(row, next && next.parentNode === body ? next : null);
+      $('voEmpty').style.display = empty;
+      // That edited copy is wrong now: read it afresh next time.
+      Snappy.cache.drop(MY_VACATIONS);
+    };
+  }
 
   // ---- boot: default date range = this week, then restore session ----
   (function initDates() {
@@ -919,7 +1400,10 @@
     const monday = new Date(now);
     const day = (now.getDay() + 6) % 7; // 0 = Monday
     monday.setDate(now.getDate() - day);
-    const toStr = (d) => d.toISOString().slice(0, 10);
+    // This device's calendar day. toISOString would give the UTC day, which is
+    // already tomorrow every evening in Ontario.
+    const p2 = (n) => String(n).padStart(2, '0');
+    const toStr = (d) => d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
     $('myFrom').value = toStr(monday);
     $('myTo').value = toStr(now);
     // Time-off pickers default to today.
@@ -927,18 +1411,30 @@
     $('voTo').value = toStr(now);
   })();
 
-  api('/api/me')
+  // Ask who is signed in straight away — on a cold server this is also the
+  // request that wakes it.
+  const meCall = api(ME);
+
+  // When this device kept the answer for an employee login that hasn't run
+  // out, open on it now, before the rest of the page has even loaded: no
+  // sign-in form in between, the right tab straight away, each tab painting
+  // from its own kept copy. The server's answer then confirms it, adjusts it,
+  // or ends it (confirmMe). Their clock status is never among the kept copies.
+  const resumed = Snappy.cache.resume();
+  const kept = resumed && resumed.startsWith('employee:') ? Snappy.cache.peek(ME) : undefined;
+  const fromCopy = !!(kept && kept.role === 'employee' && meKey(kept) === resumed);
+  if (fromCopy) {
+    me = kept;
+    showApp();
+  }
+
+  meCall
     .then((d) => {
-      if (d.role === 'admin') {
-        window.location = d.redirect || '/';
-        return;
-      }
-      if (d.role === 'employee') {
-        me = d;
-        showApp();
-      } else {
-        showLogin();
-      }
+      if (!authChanges) confirmMe(d); // a sign-in or sign-out since has the say
     })
-    .catch(showLogin);
+    .catch(() => {
+      // No answer at all — offline, or the server is down. With the kept copy
+      // on screen, stay on it; without one, the sign-in form is all there is.
+      if (!fromCopy && !authChanges) showLogin();
+    });
 })();

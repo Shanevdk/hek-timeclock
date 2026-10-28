@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#0d0d0d" />
+    <meta name="theme-color" content="#0c0a09" />
     <!-- Set the saved theme and glass level before first paint so there is no
          flash. liquid.js owns both keys afterwards; this is only the head
          start, and it must not throw on a browser with storage switched off. -->
@@ -26,18 +26,11 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="HEK" />
-    <!-- Leaflet, for the "map" permission's clock-in pins -->
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-      crossorigin=""
-    />
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-      crossorigin=""
-    ></script>
+    <!-- Leaflet (the clock-in map, the quote estimator) loads only when a map is
+         opened — Snappy.leaflet() — rather than holding up the sign-in page.
+         These just open the connections early. -->
+    <link rel="preconnect" href="https://unpkg.com" crossorigin />
+    <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
 
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -45,9 +38,7 @@
     <!-- Login gate (shown by default; hidden by JS if already signed in) -->
     <div class="wrap" id="loginView">
       <div class="brand">
-        <div class="hek">HEK</div>
-        <div class="sub">FENCING</div>
-        <div class="inc">Inc.</div>
+        <svg class="brand-logo" viewBox="79 76 434 298" role="img" aria-label="HEK Fencing Inc."><use href="/logo.svg#logo" /></svg>
       </div>
       <div class="card">
         <h2 style="text-align:center;margin-top:0">Sign in</h2>
@@ -81,7 +72,7 @@
         <button class="hamburger" id="menuToggle" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
           <span></span><span></span><span></span>
         </button>
-        <div class="mobile-brand">HEK <small>PORTAL</small></div>
+        <div class="mobile-brand"><svg class="brand-mark" viewBox="79 76 434 152" role="img" aria-label="HEK"><use href="/logo.svg#hek" /></svg><small>PORTAL</small></div>
         <!-- Same action as the sidebar clock button, so a phone can punch in
              without opening the menu. Only one of the two is ever visible. -->
         <button class="clock-btn bar-clock" id="clockBtnBar" type="button" aria-label="Clock in">
@@ -93,7 +84,7 @@
       <div class="admin-layout">
         <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
         <aside class="sidebar" id="sidebar">
-          <div class="side-brand">HEK <small>PORTAL</small></div>
+          <div class="side-brand"><svg class="brand-mark" viewBox="79 76 434 152" role="img" aria-label="HEK"><use href="/logo.svg#hek" /></svg><small>PORTAL</small></div>
           <!-- In-app clock — how every employee punches in and out -->
           <div class="clock-widget" id="clockWidget">
             <button class="clock-btn" id="clockBtn" type="button" aria-label="Clock in">
@@ -251,75 +242,9 @@
             </div>
           </div>
 
-          <!-- Quote builder -->
-          <div id="qEditor" style="display:none">
-            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px">
-              <h2 style="margin:0" id="qEditorTitle">New quote</h2>
-              <button class="btn ghost sm" id="qBack">← Back to list</button>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Customer</h3>
-              <div class="row">
-                <div class="field" style="flex:2 1 220px"><label>Name *</label><input id="qcName" placeholder="Jane Doe" /></div>
-                <div class="field" style="flex:1 1 160px"><label>Phone</label><input id="qcPhone" placeholder="(555) 123-4567" /></div>
-                <div class="field" style="flex:2 1 220px"><label>Email</label><input id="qcEmail" placeholder="jane@email.com" /></div>
-              </div>
-              <div class="row" style="margin-top:12px">
-                <div class="field" style="flex:3 1 320px"><label>Job site / address</label><input id="qcAddress" placeholder="123 Maple St" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Quote date</label><input type="date" id="qDate" /></div>
-                <div class="field" style="flex:1 1 140px"><label>Status</label>
-                  <select id="qStatus">
-                    <option value="draft">Draft</option>
-                    <option value="sent">Sent</option>
-                    <option value="accepted">Accepted</option>
-                    <option value="declined">Declined</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            <div class="card" style="margin-bottom:16px">
-              <h3 style="margin-top:0">Line items</h3>
-              <p class="status-sub" style="text-align:left;margin:-6px 0 12px">Quick add:</p>
-              <div class="quick-adds" id="qQuick"></div>
-              <div style="overflow-x:auto">
-                <table class="items-table">
-                  <thead><tr>
-                    <th style="min-width:200px">Description</th>
-                    <th style="width:80px">Qty</th>
-                    <th style="width:110px">Unit</th>
-                    <th style="width:120px">Unit price</th>
-                    <th style="width:110px">Line total</th>
-                    <th style="width:36px"></th>
-                  </tr></thead>
-                  <tbody id="qItems"></tbody>
-                </table>
-              </div>
-              <button class="btn ghost sm" id="qAddRow" style="margin-top:12px">+ Add line</button>
-            </div>
-
-            <div class="row" style="align-items:stretch">
-              <div class="card" style="flex:2 1 320px">
-                <label for="qNotes">Notes / terms (shown on the quote)</label>
-                <textarea id="qNotes" rows="5" placeholder="e.g. 50% deposit due on acceptance. Balance on completion. Quote valid for 30 days."></textarea>
-              </div>
-              <div class="card" style="flex:1 1 240px">
-                <div class="totals-line"><span>Subtotal</span><span id="qSubtotal">$0.00</span></div>
-                <div class="totals-line">
-                  <span>Tax <input id="qTax" class="tax-input" inputmode="decimal" value="0" /> %</span>
-                  <span id="qTaxAmt">$0.00</span>
-                </div>
-                <div class="totals-line grand"><span>Total</span><span id="qTotal">$0.00</span></div>
-              </div>
-            </div>
-
-            <div class="msg err" id="qMsg"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:12px">
-              <button class="btn ghost sm" id="qPrint">Print / PDF</button>
-              <button class="btn gold sm" id="qSave">Save quote</button>
-            </div>
-          </div>
+          <!-- Quote builder. quotes.js draws the sheet into it, so the admin
+               dashboard and the employee portal share one editor. -->
+          <div id="qEditor" style="display:none"></div>
         </section>
 
         <!-- MY TASKS ("tasks" permission) — the cards assigned to them. They can
@@ -453,10 +378,16 @@
       </div>
     </div>
 
-    <!-- portal.js must load before quotes.js: it exposes window.HEKAdmin, the
+    <!-- snappy.js first: everything after it may use window.Snappy.
+         portal.js must load before quotes.js: it exposes window.HEKAdmin, the
          shared auth-aware API helper that quotes.js expects. -->
+    <script src="/snappy.js"></script>
     <script src="/md.js"></script>
     <script src="/portal.js"></script>
+    <script src="/totals.js"></script>
+    <script src="/paper.js"></script>
+    <script src="/takeoff.js"></script>
+    <script src="/fencemap.js"></script>
     <script src="/quotes.js"></script>
     <script src="/uploader.js"></script>
     <script src="/schedule.js"></script>
